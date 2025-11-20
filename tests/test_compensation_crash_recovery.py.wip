@@ -1,0 +1,347 @@
+"""
+Test suite for compensation crash recovery.
+
+This module tests the crash recovery mechanism for workflows that fail
+during compensation execution.
+"""
+
+import pytest
+
+from kairo.activity import activity
+from kairo.compensation import execute_compensations, register_compensation
+from kairo.context import WorkflowContext
+from kairo.replay import ReplayEngine
+from kairo.workflow import saga, set_replay_engine
+
+
+@pytest.mark.asyncio
+class TestCompensationCrashRecovery:
+    """Test suite for compensation crash recovery scenarios."""
+
+    @pytest.fixture
+    def replay_engine(self, sqlite_storage):
+        """Create and configure ReplayEngine."""
+        engine = ReplayEngine(
+            storage=sqlite_storage,
+            service_name="test-service",
+            worker_id="worker-compensation-crash-test",
+        )
+        set_replay_engine(engine)
+        return engine
+
+    @pytest.fixture
+    async def create_test_instance(self, sqlite_storage):
+        """Helper to create test workflow instances."""
+        import uuid
+
+        async def _create(workflow_name: str, input_data: dict) -> str:
+            # First, ensure workflow definition exists
+            try:
+                await sqlite_storage.create_or_update_workflow_definition(
+                    workflow_name=workflow_name,
+                    source_code="# test code",
+                    source_hash="test-hash",
+                )
+            except Exception:
+                # May already exist, ignore
+                pass
+
+            instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
+            await sqlite_storage.create_instance(
+                instance_id=instance_id,
+                workflow_name=workflow_name,
+                source_hash="test-hash",
+                owner_service="test-service",
+                input_data=input_data,
+            )
+            return instance_id
+
+        return _create
+
+    async def test_compensating_status_set_during_execution(
+        self, replay_engine, sqlite_storage, create_test_instance
+    ):
+        """Test that status is set to 'compensating' during compensation execution."""
+        compensation_log = []
+
+        @activity
+        async def step1(ctx: WorkflowContext, value: int) -> dict:
+            await register_compensation(
+                ctx,
+                compensation1,
+                value=value,
+            )
+            return {"step": 1, "value": value}
+
+        async def compensation1(ctx: WorkflowContext, value: int) -> None:
+            compensation_log.append(f"compensation1: {value}")
+
+        @activity
+        async def failing_step(ctx: WorkflowContext) -> dict:
+            raise ValueError("This step fails")
+
+        @saga
+        async def test_workflow(ctx: WorkflowContext, input_value: int) -> dict:
+            result1 = await step1(ctx, input_value)
+            result2 = await failing_step(ctx)  # This will fail
+            return {"result": result2}
+
+        # Start workflow (will fail)
+        with pytest.raises(ValueError):
+            instance_id = await replay_engine.start_workflow(
+                workflow_name="test_workflow",
+                workflow_func=test_workflow,
+                input_data={"input_value": 42}
+            )
+
+        # Find the created instance
+        # Since start_workflow raises, we need to find the instance ID another way
+        # We can search by workflow_name in the database
+        conn = sqlite_storage._get_connection()
+        async with conn.execute(
+            "SELECT instance_id FROM workflow_instances WHERE workflow_name = ? ORDER BY started_at DESC LIMIT 1",
+            ("test_workflow",)
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            instance_id = row[0]
+
+        # Check status is 'failed' after compensation
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "failed"
+
+        # Check compensation was executed
+        assert len(compensation_log) == 1
+        assert compensation_log[0] == "compensation1: 42"
+
+    async def test_compensation_crash_recovery_from_failed_workflow(
+        self, replay_engine, sqlite_storage, create_test_instance
+    ):
+        """Test recovery of workflow that crashed during compensation after failure."""
+        from kairo.compensation import compensation as compensation_decorator
+
+        compensation_log = []
+
+        @activity
+        async def step1(ctx: WorkflowContext, value: int) -> dict:
+            await register_compensation(
+                ctx,
+                compensation1,
+                value=value,
+            )
+            return {"step": 1, "value": value}
+
+        @compensation_decorator
+        async def compensation1(ctx: WorkflowContext, value: int) -> None:
+            compensation_log.append(f"compensation1: {value}")
+
+        # Create instance manually in compensating state
+        instance_id = await create_test_instance(
+            "test_workflow",
+            {"input_value": 42}
+        )
+
+        # Register compensation
+        await sqlite_storage.push_compensation(
+            instance_id=instance_id,
+            activity_name="compensation1",
+            args={"args": [], "kwargs": {"value": 42}}
+        )
+
+        # Simulate crash during compensation - set status to compensating
+        await sqlite_storage.update_instance_status(
+            instance_id=instance_id,
+            status="compensating",
+            metadata={}
+        )
+
+        # Simulate lock acquisition (as if worker crashed)
+        await sqlite_storage.acquire_lock(
+            instance_id=instance_id,
+            worker_id="old-worker",
+            timeout_seconds=300
+        )
+
+        # Verify compensating workflows are detected by cleanup_stale_locks
+        workflows = await sqlite_storage.cleanup_stale_locks(timeout_seconds=0)
+        assert len(workflows) == 1
+        assert workflows[0]["instance_id"] == instance_id
+        assert workflows[0]["status"] == "compensating"
+
+        # Resume compensation
+        success = await replay_engine.resume_compensating_workflow(instance_id)
+        assert success is True
+
+        # Check compensation was executed
+        assert len(compensation_log) == 1
+
+        # Check final status is failed
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "failed"
+
+    async def test_compensation_idempotency_after_crash(
+        self, replay_engine, sqlite_storage, create_test_instance
+    ):
+        """Test that partially completed compensations are not re-executed."""
+        from kairo.compensation import compensation as compensation_decorator
+
+        compensation_log = []
+
+        @compensation_decorator
+        async def compensation1(ctx: WorkflowContext, value: int) -> None:
+            compensation_log.append(f"compensation1: {value}")
+
+        @compensation_decorator
+        async def compensation2(ctx: WorkflowContext, value: int) -> None:
+            compensation_log.append(f"compensation2: {value}")
+
+        # Create instance manually
+        instance_id = await create_test_instance(
+            "test_workflow",
+            {"input_value": 42}
+        )
+
+        # Register two compensations
+        await sqlite_storage.push_compensation(
+            instance_id=instance_id,
+            activity_name="compensation2",  # Will be executed first (LIFO)
+            args={"args": [], "kwargs": {"value": 200}}
+        )
+        await sqlite_storage.push_compensation(
+            instance_id=instance_id,
+            activity_name="compensation1",  # Will be executed second
+            args={"args": [], "kwargs": {"value": 100}}
+        )
+
+        # Set status to compensating
+        await sqlite_storage.update_instance_status(
+            instance_id=instance_id,
+            status="compensating",
+            metadata={}
+        )
+
+        # Simulate that compensation2 was already executed (record in history)
+        await sqlite_storage.append_history(
+            instance_id=instance_id,
+            step=-1,
+            event_type="CompensationExecuted",
+            event_data={
+                "activity_name": "compensation2",
+                "compensation_id": 1,
+                "args": [],
+                "kwargs": {"value": 200}
+            }
+        )
+
+        # Create context and execute compensations
+        ctx = WorkflowContext(
+            instance_id=instance_id,
+            workflow_name="test_workflow",
+            storage=sqlite_storage,
+            worker_id=replay_engine.worker_id,
+            is_replaying=False,
+        )
+        ctx.current_step = 0
+
+        await execute_compensations(ctx)
+
+        # Only compensation1 should be executed (compensation2 already done)
+        assert len(compensation_log) == 1
+        assert compensation_log[0] == "compensation1: 100"
+
+    async def test_cancelled_workflow_compensation_recovery(
+        self, replay_engine, sqlite_storage, create_test_instance
+    ):
+        """Test recovery of workflow cancelled during compensation."""
+        from kairo.compensation import compensation as compensation_decorator
+
+        compensation_log = []
+
+        @compensation_decorator
+        async def compensation1(ctx: WorkflowContext, value: int) -> None:
+            compensation_log.append(f"compensation1: {value}")
+
+        # Create instance manually
+        instance_id = await create_test_instance(
+            "test_workflow",
+            {"input_value": 42}
+        )
+
+        # Register compensation
+        await sqlite_storage.push_compensation(
+            instance_id=instance_id,
+            activity_name="compensation1",
+            args={"args": [], "kwargs": {"value": 42}}
+        )
+
+        # Set status to compensating
+        await sqlite_storage.update_instance_status(
+            instance_id=instance_id,
+            status="compensating",
+            metadata={}
+        )
+
+        # Add WorkflowCancelled event to history (to indicate cancellation)
+        await sqlite_storage.append_history(
+            instance_id=instance_id,
+            step=-1000,
+            event_type="WorkflowCancelled",
+            event_data={"reason": "User requested cancellation"}
+        )
+
+        # Resume compensation
+        success = await replay_engine.resume_compensating_workflow(instance_id)
+        assert success is True
+
+        # Check compensation was executed
+        assert len(compensation_log) == 1
+
+        # Check final status is cancelled (not failed)
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "cancelled"
+
+    async def test_no_compensations_skips_status_change(
+        self, replay_engine, sqlite_storage, create_test_instance
+    ):
+        """Test that workflows without compensations don't set compensating status."""
+
+        @activity
+        async def simple_step(ctx: WorkflowContext, value: int) -> dict:
+            # No compensation registered
+            return {"step": 1, "value": value}
+
+        @activity
+        async def failing_step(ctx: WorkflowContext) -> dict:
+            raise ValueError("This step fails")
+
+        @saga
+        async def test_workflow(ctx: WorkflowContext, input_value: int) -> dict:
+            result1 = await simple_step(ctx, input_value)
+            result2 = await failing_step(ctx)  # This will fail
+            return {"result": result2}
+
+        # Start workflow (will fail)
+        with pytest.raises(ValueError):
+            instance_id = await replay_engine.start_workflow(
+                workflow_name="test_workflow",
+                workflow_func=test_workflow,
+                input_data={"input_value": 42}
+            )
+
+        # Find the created instance
+        conn = sqlite_storage._get_connection()
+        async with conn.execute(
+            "SELECT instance_id FROM workflow_instances WHERE workflow_name = ? ORDER BY started_at DESC LIMIT 1",
+            ("test_workflow",)
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            instance_id = row[0]
+
+        # Check status went directly to 'failed' (no compensating state)
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "failed"

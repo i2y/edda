@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Ruff
+.ruff_cache/
+
+# Distribution / packaging
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Backup files
+*.bak
+*.backup
+
+# Log files (root directory)
+*.log
+
+# Debug scripts (root directory only)
+/debug_*.py
+
+# Ad-hoc test scripts (root directory only - tests/ is tracked)
+/test_*.py
+/test_*.sh
+
+# Temporary output files
+*_output.txt
+*_test_*.txt
+
+# SQLite temporary directories
+sqlite:/
+
+# Local documentation (personal/development notes)
+local-docs/
+
+# MkDocs build output
+site/
+
+# Cache directories
+.cache/

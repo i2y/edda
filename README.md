@@ -1,0 +1,597 @@
+# Edda
+
+**Edda** - Norse mythology poetic narratives that preserve ancient sagas and legends
+
+> Lightweight durable execution framework - no separate server required
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
+## Overview
+
+Edda is a lightweight durable execution framework for Python that runs as a **library** in your application - no separate workflow server required. It provides automatic crash recovery through deterministic replay, allowing **long-running workflows** to survive process restarts and failures without losing progress.
+
+**Perfect for**: Order processing, distributed transactions (Saga pattern), AI agent orchestration, and any workflow that must survive crashes.
+
+## Key Features
+
+- ✨ **Lightweight Library**: Runs in your application process - no separate server infrastructure
+- 🔄 **Durable Execution**: Deterministic replay with workflow history for automatic crash recovery
+- 🎯 **Workflow & Activity**: Clear separation between orchestration logic and business logic
+- 🔁 **Saga Pattern**: Automatic compensation on failure with `@on_failure` decorator
+- 🌐 **Multi-worker Execution**: Run workflows safely across multiple servers or containers
+- 🔒 **Pydantic Integration**: Type-safe workflows with automatic validation
+- 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
+- ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
+- ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
+
+## Use Cases
+
+Edda excels at orchestrating **long-running workflows** that must survive failures:
+
+- **🏢 Long-Running Jobs**: Order processing, data pipelines, batch jobs - from minutes to days, weeks, or even months
+- **🔄 Distributed Transactions**: Coordinate microservices with automatic compensation (Saga pattern)
+- **🤖 AI Agent Workflows**: Orchestrate multi-step AI tasks (LLM calls, tool usage, long-running inference)
+- **📡 Event-Driven Workflows**: React to external events with guaranteed delivery and automatic retry
+
+**Key benefit**: Workflows **never lose progress** - crashes and restarts are handled automatically through deterministic replay.
+
+## Architecture
+
+Edda runs as a lightweight library in your applications, with all workflow state stored in a shared database:
+
+```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#1a1a1a', 'secondaryTextColor':'#1a1a1a', 'tertiaryTextColor':'#1a1a1a', 'textColor':'#1a1a1a', 'nodeTextColor':'#1a1a1a'}}}%%
+graph TB
+    subgraph ext["External Systems"]
+        API[REST API<br/>Clients]
+        CE[CloudEvents<br/>Producer]
+    end
+
+    subgraph cluster["Your Multiple Instances"]
+        subgraph pod1["order-service Pod 1"]
+            W1[Edda Workflow]
+        end
+        subgraph pod2["order-service Pod 2"]
+            W2[Edda Workflow]
+        end
+        subgraph pod3["order-service Pod 3"]
+            W3[Edda Workflow]
+        end
+    end
+
+    DB[(Shared Database<br/>PostgreSQL/MySQL<br/>SQLite: single-process only)]
+
+    API -->|"workflow.start()<br/>(Direct Invocation)"| W1
+    API -->|"workflow.start()<br/>(Direct Invocation)"| W2
+    CE -->|"POST /<br/>(CloudEvents)"| W1
+    CE -->|"POST /<br/>(CloudEvents)"| W3
+
+    W1 <-->|Workflow<br/>State| DB
+    W2 <-->|Workflow<br/>State| DB
+    W3 <-->|Workflow<br/>State| DB
+
+    style DB fill:#e1f5ff
+    style W1 fill:#fff4e6
+    style W2 fill:#fff4e6
+    style W3 fill:#fff4e6
+```
+
+**Key Points**:
+
+- Multiple workers can run simultaneously across different pods/servers
+- Each workflow instance runs on only one worker at a time (automatic coordination)
+- `wait_event()` and `wait_timer()` free up worker resources while waiting, resume on any worker when event arrives or timer expires
+- Automatic crash recovery with stale lock cleanup and workflow auto-resume
+
+## Quick Start
+
+```python
+from edda import EddaApp, workflow, activity, WorkflowContext
+
+@activity
+async def process_payment(ctx: WorkflowContext, amount: float):
+    # Durable execution - automatically recorded in history
+    print(f"Processing payment: ${amount}")
+    return {"status": "paid", "amount": amount}
+
+@workflow
+async def order_workflow(ctx: WorkflowContext, order_id: str, amount: float):
+    # Workflow orchestrates activities with automatic retry on crash
+    result = await process_payment(ctx, amount)
+    return {"order_id": order_id, **result}
+
+# Simplified example - production code needs:
+# 1. await app.initialize() before starting workflows
+# 2. try-finally with await app.shutdown() for cleanup
+# 3. PostgreSQL or MySQL for multi-process/multi-pod deployments
+app = EddaApp(db_url="sqlite:///workflow.db")
+
+# Start workflow
+instance_id = await order_workflow.start(order_id="ORD-123", amount=99.99)
+```
+
+**What happens on crash?**
+
+1. Activities already executed return cached results from history
+2. Workflow resumes from the last checkpoint
+3. No manual intervention required
+
+## Installation
+
+Install Edda from PyPI using uv:
+
+```bash
+# Basic installation (includes SQLite support)
+uv add edda-framework
+
+# With PostgreSQL support
+uv add edda-framework --extra postgresql
+
+# With MySQL support
+uv add edda-framework --extra mysql
+
+# With Viewer UI
+uv add edda-framework --extra viewer
+
+# All extras (PostgreSQL, MySQL, Viewer UI)
+uv add edda-framework --extra postgresql --extra mysql --extra viewer
+```
+
+### Installing from GitHub (Development Versions)
+
+Install the latest development version directly from GitHub:
+
+```bash
+# Using uv (latest from main branch)
+uv add git+https://github.com/i2y/edda.git
+
+# Using pip
+pip install git+https://github.com/i2y/edda.git
+```
+
+**Install specific version or branch:**
+
+```bash
+# Specific tag/release
+uv add git+https://github.com/i2y/edda.git@v0.1.0
+pip install git+https://github.com/i2y/edda.git@v0.1.0
+
+# Specific branch
+uv add git+https://github.com/i2y/edda.git@feature-branch
+pip install git+https://github.com/i2y/edda.git@feature-branch
+
+# With extras (PostgreSQL, Viewer)
+uv add "git+https://github.com/i2y/edda.git[postgresql,viewer]"
+pip install "git+https://github.com/i2y/edda.git[postgresql,viewer]"
+```
+
+**Database Drivers**:
+- **SQLite**: Included by default (via `aiosqlite`)
+  - Single-process deployments only (supports multiple async workers within one process, not multiple processes/pods)
+- **PostgreSQL**: Add `--extra postgresql` for `asyncpg` driver
+  - **Recommended for production**
+- **MySQL**: Add `--extra mysql` for `aiomysql` driver
+  - **Recommended for production**
+- **Viewer UI**: Add `--extra viewer` for workflow visualization
+
+### Database Selection Guide
+
+| Database | Use Case | Multi-Pod Support | Production Ready | Notes |
+|----------|----------|-------------------|------------------|-------|
+| **SQLite** | Development, testing, single-process deployments | ❌ No | ⚠️ Limited | Supports multiple async workers within one process, but not multiple processes/pods (K8s, Docker Compose with multiple replicas) |
+| **PostgreSQL** | Production, multi-process/multi-pod systems | ✅ Yes | ✅ Yes | **Recommended for production** - Full support for database-based exclusive control and concurrent workflows |
+| **MySQL** | Production with existing MySQL infrastructure | ✅ Yes | ✅ Yes | Suitable for production - Good choice if you already use MySQL |
+
+**Important**: For multi-process or multi-pod deployments (K8s, Docker Compose with multiple replicas, etc.), you **must** use PostgreSQL or MySQL. SQLite supports multiple async workers within a single process, but its table-level locking makes it unsuitable for multi-process/multi-pod scenarios.
+
+### Development Installation
+
+If you want to contribute to Edda or modify the framework itself:
+
+```bash
+# Clone repository
+git clone https://github.com/i2y/edda.git
+cd kairo
+uv sync --all-extras
+```
+
+### Running Tests
+
+Run Edda's test suite:
+
+```bash
+# Run tests
+uv run pytest
+
+# Run with coverage
+uv run pytest --cov=edda
+```
+
+## Core Concepts
+
+### Workflows and Activities
+
+**Activity**: A unit of work that performs business logic. Activity results are recorded in history.
+
+**Workflow**: Orchestration logic that coordinates activities. Workflows can be replayed from history after crashes.
+
+```python
+from edda import workflow, activity, WorkflowContext
+
+@activity
+async def send_email(ctx: WorkflowContext, email: str, message: str):
+    # Business logic - this will be recorded
+    print(f"Sending email to {email}")
+    return {"sent": True}
+
+@workflow
+async def user_signup(ctx: WorkflowContext, email: str):
+    # Orchestration logic
+    await send_email(ctx, email, "Welcome!")
+    return {"status": "completed"}
+```
+
+**Activity IDs**: Activities are automatically identified with IDs like `"send_email:1"` for deterministic replay. Manual IDs are only needed for concurrent execution (e.g., `asyncio.gather`). See [MIGRATION_GUIDE_ACTIVITY_ID.md](MIGRATION_GUIDE_ACTIVITY_ID.md) for details.
+
+### Durable Execution
+
+Edda ensures workflow progress is never lost through **deterministic replay**:
+
+1. **Activity results are recorded** in a history table
+2. **On crash recovery**, workflows resume from the last checkpoint
+3. **Already-executed activities** return cached results from history
+4. **New activities** continue from where the workflow left off
+
+```python
+@workflow
+async def long_running_workflow(ctx: WorkflowContext, user_id: str):
+    # Activity 1: Recorded in history
+    result1 = await create_user(ctx, user_id)
+
+    # If process crashes here, activity won't re-execute on restart
+
+    # Activity 2: Continues from history on restart
+    result2 = await send_welcome_email(ctx, result1["email"])
+
+    return result2
+```
+
+**Key guarantees**:
+- Activities execute **exactly once** (results cached in history)
+- Workflows can survive **arbitrary crashes**
+- No manual checkpoint management required
+
+### Compensation (Saga Pattern)
+
+When a workflow fails, Edda automatically executes compensation functions for **already-executed activities in reverse order**. This implements the Saga pattern for distributed transaction rollback.
+
+**Key behavior**:
+- Compensation functions run in **reverse order** of activity execution
+- Only **already-executed activities** are compensated
+- If Activity A and B completed, then C fails → B and A compensations run (in that order)
+
+```python
+from edda import activity, on_failure, compensation, workflow, WorkflowContext
+
+@compensation
+async def cancel_reservation(ctx: WorkflowContext, item_id: str):
+    # Automatically called on workflow failure (reverse order)
+    print(f"Cancelled reservation for {item_id}")
+    return {"cancelled": True}
+
+@activity
+@on_failure(cancel_reservation)
+async def reserve_inventory(ctx: WorkflowContext, item_id: str):
+    print(f"Reserved {item_id}")
+    return {"reserved": True}
+
+@workflow
+async def order_workflow(ctx: WorkflowContext, item1: str, item2: str):
+    await reserve_inventory(ctx, item1)  # Step 1: Reserve item1
+    await reserve_inventory(ctx, item2)  # Step 2: Reserve item2
+    await charge_payment(ctx)            # Step 3: If this fails...
+    # Compensation runs: cancel item2 → cancel item1 (reverse order)
+```
+
+### Multi-worker Execution
+
+Multiple workers can safely process workflows using database-based exclusive control. This means:
+
+- Edda uses database row locks (not Redis or ZooKeeper)
+- Each workflow instance runs on only one worker at a time
+- If a worker crashes, another worker automatically resumes
+- No additional infrastructure required
+
+```python
+# Worker 1 and Worker 2 can run simultaneously
+# Only one will acquire the lock for each workflow instance
+
+app = EddaApp(
+    db_url="postgresql://localhost/workflows",  # Shared database for coordination
+    service_name="order-service"
+)
+```
+
+**Features**:
+- Each workflow instance runs on only one worker at a time (automatic coordination)
+- Automatic stale lock cleanup (5-minute timeout)
+- Crashed workflows automatically resume on any available worker
+
+### Pydantic Integration
+
+Type-safe workflows with automatic validation:
+
+```python
+from pydantic import BaseModel, Field
+from edda import workflow, WorkflowContext
+
+class OrderItem(BaseModel):
+    item_id: str
+    quantity: int = Field(..., ge=1)
+    price: float = Field(..., gt=0)
+
+@workflow
+async def process_order(ctx: WorkflowContext, items: list[OrderItem]) -> dict:
+    # Automatic validation before workflow starts
+    total = sum(item.price * item.quantity for item in items)
+    return {"total": total, "item_count": len(items)}
+```
+
+### Transactional Outbox
+
+Activities are automatically transactional by default, ensuring atomicity:
+
+```python
+from edda import activity, send_event_transactional, WorkflowContext
+
+@activity  # Automatically transactional
+async def create_order(ctx: WorkflowContext, order_id: str):
+    # All operations in a single transaction:
+    # 1. Activity execution
+    # 2. History recording
+    # 3. Event publishing (outbox table)
+
+    await send_event_transactional(
+        ctx,
+        event_type="order.created",
+        event_source="order-service",
+        event_data={"order_id": order_id}
+    )
+
+    return {"order_id": order_id}
+```
+
+**Custom Database Operations** - Use `ctx.session` for your database operations:
+
+```python
+@activity  # Edda manages the transaction
+async def process_payment(ctx: WorkflowContext, order_id: str, amount: float):
+    # Access Edda-managed session (same database as Edda)
+    session = ctx.session
+
+    # Your business logic
+    payment = Payment(order_id=order_id, amount=amount)
+    session.add(payment)
+
+    # Edda event (same transaction)
+    await send_event_transactional(
+        ctx,
+        event_type="payment.processed",
+        event_source="payment-service",
+        event_data={"order_id": order_id, "amount": amount}
+    )
+
+    # Edda automatically commits: your data + Edda's outbox (atomic!)
+    return {"payment_id": f"PAY-{order_id}"}
+```
+
+## Event Integration
+
+Edda provides optional event-driven capabilities for workflows that need to wait for external events.
+
+### CloudEvents Support
+
+Native support for CloudEvents protocol:
+
+```python
+from edda import EddaApp
+
+app = EddaApp(
+    db_url="sqlite:///workflow.db",
+    service_name="order-service",
+    outbox_enabled=True  # Enable transactional outbox
+)
+
+# Accepts CloudEvents at any HTTP path
+```
+
+**CloudEvents handling**:
+- All HTTP requests (any path) are accepted as CloudEvents
+- Events without matching workflow handlers are silently discarded
+- Special endpoint: `POST /cancel/{instance_id}` for workflow cancellation
+- Automatic CloudEvents validation and parsing
+- Works with CloudEvents-compatible systems (Knative Eventing, CloudEvents SDKs, etc.)
+
+**CloudEvents HTTP Binding compliance**:
+- **202 Accepted**: Event accepted for asynchronous processing (success)
+- **400 Bad Request**: CloudEvents parsing/validation error (non-retryable)
+- **500 Internal Server Error**: Internal error (retryable)
+- Error responses include `error_type` and `retryable` flags for client retry logic
+
+### Event & Timer Waiting
+
+Workflows can wait for external events or timers without consuming worker resources. While waiting, the workflow state is persisted to the database and can be resumed by **any available worker** when the event arrives or timer expires:
+
+```python
+from edda import workflow, wait_event, send_event, WorkflowContext
+
+@workflow
+async def payment_workflow(ctx: WorkflowContext, order_id: str):
+    # Send payment request event
+    await send_event("payment.requested", "payment-service", {"order_id": order_id})
+
+    # Wait for payment completion event (process-releasing)
+    payment_event = await wait_event(ctx, "payment.completed")
+
+    return payment_event.data
+```
+
+**wait_timer() for time-based waiting**:
+
+```python
+from edda import wait_timer
+
+@workflow
+async def order_with_timeout(ctx: WorkflowContext, order_id: str):
+    # Create order
+    await create_order(ctx, order_id)
+
+    # Wait 60 seconds for payment
+    await wait_timer(ctx, duration_seconds=60)
+
+    # Check payment status
+    return await check_payment(ctx, order_id)
+```
+
+**Multi-worker continuation behavior**:
+- `wait_event()` releases the workflow lock atomically
+- Event delivery acquires the lock and resumes on any available worker
+- Safe for multi-pod/multi-container environments (K8s, Docker Compose, etc.)
+- No worker is blocked while waiting for events or timers
+
+**For technical details**, see [Multi-Worker Continuations](local-docs/distributed-coroutines.md).
+
+### ASGI Integration
+
+Edda runs as an ASGI application:
+
+```bash
+# Run standalone
+uvicorn demo_app:application --port 8001
+```
+
+**Mounting to existing ASGI apps:**
+
+You can mount EddaApp to any path in existing ASGI frameworks:
+
+```python
+from fastapi import FastAPI
+from edda import EddaApp
+
+# Create FastAPI app
+api = FastAPI()
+
+# Create Edda app
+edda_app = EddaApp(db_url="sqlite:///workflow.db")
+
+# Mount Edda at /workflows path
+api.mount("/workflows", edda_app)
+
+# Now Edda handles all requests under /workflows/*
+# POST /workflows/any-path -> CloudEvents handler
+# POST /workflows/cancel/{instance_id} -> Cancellation
+```
+
+This works with any ASGI framework (Starlette, FastAPI, Quart, etc.)
+
+## Observability Hooks
+
+Extend Edda with custom observability without coupling to specific tools:
+
+```python
+from edda import EddaApp
+
+class MyHooks:
+    async def on_workflow_start(self, instance_id, workflow_name, input_data):
+        print(f"Workflow {workflow_name} started: {instance_id}")
+
+    async def on_workflow_complete(self, instance_id, workflow_name, result):
+        print(f"Workflow {workflow_name} completed")
+
+    async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
+        print(f"Activity {activity_name} completed (cache_hit={cache_hit})")
+
+app = EddaApp(
+    db_url="sqlite:///workflow.db",
+    service_name="my-service",
+    hooks=MyHooks()
+)
+```
+
+`MyHooks` implements the `WorkflowHooks` Protocol through structural subtyping. See integration examples in the examples directory.
+
+## Serialization
+
+Edda supports both **binary (bytes)** and **JSON (dict)** data for event storage and transport, allowing you to choose based on your needs.
+
+### Binary Data Support
+
+For maximum performance and zero storage overhead, Edda stores binary data directly in database BLOB columns:
+
+```python
+from edda import send_event, wait_event
+
+# Send binary data (e.g., Protobuf)
+msg = OrderCreated(order_id="123", amount=99.99)
+await send_event("order.created", "orders", msg.SerializeToString())  # bytes → BLOB
+
+# Receive binary data
+event = await wait_event(ctx, "payment.completed")
+payment = PaymentCompleted()
+payment.ParseFromString(event.data)  # bytes from BLOB
+```
+
+**Benefits**:
+- ✅ Zero storage overhead (100 bytes → 100 bytes, not 133 bytes with base64)
+- ✅ Maximum performance (no encoding/decoding)
+- ✅ Native BLOB storage (SQLite, PostgreSQL, MySQL)
+- ✅ CloudEvents Binary Content Mode compatible
+
+### JSON Data Support
+
+For debugging and human-readable logs, use JSON dict format:
+
+```python
+from google.protobuf import json_format
+from edda import send_event, wait_event
+
+# Send: Protobuf → JSON dict
+msg = OrderCreated(order_id="123", amount=99.99)
+await send_event("order.created", "orders", json_format.MessageToDict(msg))
+
+# Receive: JSON dict → Protobuf
+event = await wait_event(ctx, "payment.completed")
+payment = json_format.ParseDict(event.data, PaymentCompleted())
+```
+
+**Benefits**:
+- ✅ Human-readable in database and logs
+- ✅ Easy debugging and troubleshooting
+- ✅ Full Viewer UI compatibility
+- ✅ CloudEvents Structured Content Mode compatible
+
+### Recommendation
+
+- **Production**: Use binary mode for performance and storage efficiency
+- **Development**: Use JSON mode for easier debugging
+
+## Next Steps
+
+- **[Getting Started](https://edda-framework.dev/getting-started/installation/)**: Installation and setup guide
+- **[Core Concepts](https://edda-framework.dev/getting-started/concepts/)**: Learn about workflows, activities, and durable execution
+- **[Examples](https://edda-framework.dev/examples/simple/)**: See Edda in action with real-world examples
+- **[FastAPI Integration](https://edda-framework.dev/examples/fastapi-integration/)**: Integrate with FastAPI (direct invocation + CloudEvents)
+- **[Transactional Outbox](https://edda-framework.dev/core-features/transactional-outbox/)**: Reliable event publishing with guaranteed delivery
+- **[Viewer UI](https://edda-framework.dev/viewer-ui/setup/)**: Visualize and monitor your workflows
+- **[Lifecycle Hooks](https://edda-framework.dev/core-features/hooks/)**: Add observability and monitoring with custom hooks
+- **[CloudEvents HTTP Binding](https://edda-framework.dev/core-features/events/cloudevents-http-binding/)**: CloudEvents specification compliance and error handling
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- GitHub Issues: https://github.com/i2y/edda/issues
+- Documentation: https://github.com/i2y/edda#readme
