@@ -39,6 +39,8 @@ dev = [
     "ruff>=0.14.2",
     "mypy>=1.18.2",
     "tsuno>=0.1.3",
+    "testcontainers[postgres]>=4.0.0",
+    "testcontainers[mysql]>=4.0.0",
 ]
 server = [
     "tsuno>=0.1.3",

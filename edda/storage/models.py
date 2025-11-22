@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     status TEXT NOT NULL DEFAULT 'pending',
     retry_count INTEGER DEFAULT 0,
     last_error TEXT,
-    CONSTRAINT valid_outbox_status CHECK (status IN ('pending', 'published', 'failed'))
+    CONSTRAINT valid_outbox_status CHECK (status IN ('pending', 'processing', 'published', 'failed', 'invalid', 'expired'))
 );
 """
 

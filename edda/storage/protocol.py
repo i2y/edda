@@ -621,15 +621,28 @@ class StorageProtocol(Protocol):
 
     async def get_pending_outbox_events(self, limit: int = 10) -> list[dict[str, Any]]:
         """
-        Get pending outbox events for publishing.
+        Get pending/failed outbox events and atomically mark them as 'processing'.
+
+        This method uses SELECT FOR UPDATE (with SKIP LOCKED on PostgreSQL/MySQL)
+        to safely fetch events in a multi-worker environment. It fetches both
+        'pending' and 'failed' events (for automatic retry). Fetched events are
+        immediately marked as 'processing' within the same transaction to prevent
+        duplicate processing by other workers.
 
         Args:
             limit: Maximum number of events to return
 
         Returns:
-            List of pending events, ordered by created_at.
+            List of events (now with status='processing'), ordered by created_at.
             Each event contains: event_id, event_type, event_source, event_data,
-            created_at, status, retry_count, last_error
+            created_at, status ('processing'), retry_count, last_error
+
+        Note:
+            - Fetches both 'pending' and 'failed' events (failed events will be retried)
+            - Returned events will always have status='processing' (not 'pending'/'failed')
+            - This prevents duplicate processing in distributed environments
+            - After successful publishing, call mark_outbox_published(event_id)
+            - On failure, call mark_outbox_failed(event_id, error_message)
         """
         ...
 

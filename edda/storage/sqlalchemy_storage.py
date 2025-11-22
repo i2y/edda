@@ -259,7 +259,7 @@ class OutboxEvent(Base):  # type: ignore[valid-type, misc]
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'published', 'failed', 'invalid', 'expired')",
+            "status IN ('pending', 'processing', 'published', 'failed', 'invalid', 'expired')",
             name="valid_outbox_status",
         ),
         CheckConstraint(
@@ -1585,36 +1585,64 @@ class SQLAlchemyStorage:
             await self._commit_if_not_in_transaction(session)
 
     async def get_pending_outbox_events(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get pending outbox events for publishing (with row-level locking)."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            result = await session.execute(
-                select(OutboxEvent)
-                .where(OutboxEvent.status == "pending")
-                .order_by(OutboxEvent.created_at.asc())
-                .limit(limit)
-                .with_for_update(skip_locked=True)
-            )
-            rows = result.scalars().all()
+        """
+        Get pending/failed outbox events for publishing (with row-level locking).
 
-            return [
-                {
-                    "event_id": row.event_id,
-                    "event_type": row.event_type,
-                    "event_source": row.event_source,
-                    "event_data": (
-                        row.event_data_binary
-                        if row.data_type == "binary"
-                        else json.loads(row.event_data)  # type: ignore[arg-type]
-                    ),
-                    "content_type": row.content_type,
-                    "created_at": row.created_at.isoformat(),
-                    "status": row.status,
-                    "retry_count": row.retry_count,
-                    "last_error": row.last_error,
-                }
-                for row in rows
-            ]
+        This method uses SELECT FOR UPDATE SKIP LOCKED to safely fetch events
+        in a multi-worker environment. It fetches both 'pending' and 'failed'
+        events (for retry). Fetched events are immediately marked as 'processing'
+        to prevent duplicate processing by other workers.
+
+        Args:
+            limit: Maximum number of events to fetch
+
+        Returns:
+            List of event dictionaries with 'processing' status
+        """
+        # Use new session for lock operation (SKIP LOCKED requires separate transactions)
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            # Explicitly begin transaction before SELECT FOR UPDATE
+            # This ensures proper transaction isolation for SKIP LOCKED
+            async with session.begin():
+                # 1. SELECT FOR UPDATE to lock rows (both 'pending' and 'failed' for retry)
+                result = await session.execute(
+                    select(OutboxEvent)
+                    .where(OutboxEvent.status.in_(["pending", "failed"]))
+                    .order_by(OutboxEvent.created_at.asc())
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+                rows = result.scalars().all()
+
+                # 2. Mark as 'processing' to prevent duplicate fetches
+                if rows:
+                    event_ids = [row.event_id for row in rows]
+                    await session.execute(
+                        update(OutboxEvent)
+                        .where(OutboxEvent.event_id.in_(event_ids))
+                        .values(status="processing")
+                    )
+
+                # 3. Return events (now with status='processing')
+                return [
+                    {
+                        "event_id": row.event_id,
+                        "event_type": row.event_type,
+                        "event_source": row.event_source,
+                        "event_data": (
+                            row.event_data_binary
+                            if row.data_type == "binary"
+                            else json.loads(row.event_data)  # type: ignore[arg-type]
+                        ),
+                        "content_type": row.content_type,
+                        "created_at": row.created_at.isoformat(),
+                        "status": "processing",  # Always 'processing' after update
+                        "retry_count": row.retry_count,
+                        "last_error": row.last_error,
+                    }
+                    for row in rows
+                ]
 
     async def mark_outbox_published(self, event_id: str) -> None:
         """Mark outbox event as successfully published."""
@@ -1629,10 +1657,10 @@ class SQLAlchemyStorage:
 
     async def mark_outbox_failed(self, event_id: str, error: str) -> None:
         """
-        Increment retry count and update error message.
+        Mark event as failed and increment retry count.
 
-        Note: This does NOT change the status to 'failed'. Events remain 'pending'
-        so they can be retried. Use a separate method to mark as permanently failed.
+        The event status is changed to 'failed' so it can be retried later.
+        get_pending_outbox_events() will fetch both 'pending' and 'failed' events.
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
@@ -1640,6 +1668,7 @@ class SQLAlchemyStorage:
                 update(OutboxEvent)
                 .where(OutboxEvent.event_id == event_id)
                 .values(
+                    status="failed",
                     retry_count=OutboxEvent.retry_count + 1,
                     last_error=error,
                 )

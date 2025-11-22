@@ -25,7 +25,7 @@ class TestWorkflowInstances:
         assert instance["workflow_name"] == sample_workflow_data["workflow_name"]
         assert instance["owner_service"] == sample_workflow_data["owner_service"]
         assert instance["status"] == "running"
-        assert instance["current_step"] == 0
+        assert instance["current_activity_id"] is None
         assert instance["locked_by"] is None
         assert instance["locked_at"] is None
 
@@ -49,15 +49,15 @@ class TestWorkflowInstances:
         assert instance["output_data"] == {"result": "success"}
 
     async def test_update_instance_step(self, mysql_storage, sample_workflow_data):
-        """Test updating workflow instance step counter."""
+        """Test updating workflow instance activity ID."""
         await mysql_storage.create_instance(**sample_workflow_data)
 
-        # Update step
-        await mysql_storage.update_instance_step(sample_workflow_data["instance_id"], 5)
+        # Update activity ID
+        await mysql_storage.update_instance_activity(sample_workflow_data["instance_id"], "test_activity:1")
 
         # Verify update
         instance = await mysql_storage.get_instance(sample_workflow_data["instance_id"])
-        assert instance["current_step"] == 5
+        assert instance["current_activity_id"] == "test_activity:1"
 
 
 class TestDistributedLocking:
@@ -161,7 +161,7 @@ class TestWorkflowHistory:
         # Append history
         await mysql_storage.append_history(
             sample_workflow_data["instance_id"],
-            step=1,
+            activity_id="test_activity:1",
             event_type="activity_scheduled",
             event_data={"activity": "send_email"},
         )
@@ -169,7 +169,7 @@ class TestWorkflowHistory:
         # Verify history
         history = await mysql_storage.get_history(sample_workflow_data["instance_id"])
         assert len(history) == 1
-        assert history[0]["step"] == 1
+        assert history[0]["activity_id"] == "test_activity:1"
         assert history[0]["event_type"] == "activity_scheduled"
 
     async def test_get_history_ordered(self, mysql_storage, sample_workflow_data):
@@ -177,15 +177,15 @@ class TestWorkflowHistory:
         await mysql_storage.create_instance(**sample_workflow_data)
 
         # Append multiple entries
-        for step in [1, 2, 3]:
+        for i in [1, 2, 3]:
             await mysql_storage.append_history(
                 sample_workflow_data["instance_id"],
-                step=step,
-                event_type=f"step_{step}",
-                event_data={"step": step},
+                activity_id=f"test_activity:{i}",
+                event_type=f"step_{i}",
+                event_data={"step": i},
             )
 
         # Verify order
         history = await mysql_storage.get_history(sample_workflow_data["instance_id"])
         assert len(history) == 3
-        assert [h["step"] for h in history] == [1, 2, 3]
+        assert [h["activity_id"] for h in history] == ["test_activity:1", "test_activity:2", "test_activity:3"]

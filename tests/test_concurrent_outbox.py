@@ -19,27 +19,19 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
 
-# Skip all tests in this module for SQLite (SKIP LOCKED not supported)
-pytestmark = pytest.mark.skip(
-    reason="SQLite does not support SKIP LOCKED. "
-    "These tests require PostgreSQL 9.5+ or MySQL 8.0+. "
-    "Run with: docker-compose -f docker-compose.test.yml up -d"
-)
-
-
-@pytest_asyncio.fixture
-async def storage():
-    """Create storage instance for testing."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    storage = SQLAlchemyStorage(engine)
-    await storage.initialize()
-    yield storage
-    await storage.close()
-
-
 @pytest.mark.asyncio
-async def test_concurrent_fetch_no_duplicates(storage):
-    """Test that multiple workers don't fetch the same events."""
+async def test_concurrent_fetch_no_duplicates(db_storage):
+    """Test that multiple workers don't fetch the same events.
+
+    This test simulates a realistic scenario where workers poll in a loop.
+    In concurrent systems, a single poll might not fetch all events if some
+    are locked by other workers. Workers retry until all events are processed.
+    """
+    # Skip for SQLite (SKIP LOCKED not supported)
+    if db_storage.engine.dialect.name == "sqlite":
+        pytest.skip("SQLite does not support SKIP LOCKED")
+
+    storage = db_storage
     # Create 10 outbox events
     for i in range(10):
         await storage.add_outbox_event(
@@ -50,17 +42,25 @@ async def test_concurrent_fetch_no_duplicates(storage):
             content_type="application/json",
         )
 
-    # Simulate 3 workers polling simultaneously
-    async def worker_fetch(worker_id: int, limit: int) -> list[str]:
-        """Fetch events as a worker and return event IDs."""
-        events = await storage.get_pending_outbox_events(limit=limit)
-        return [event["event_id"] for event in events]
+    # Simulate 3 workers polling in a loop (realistic scenario)
+    async def worker_poll_loop(worker_id: int, limit: int) -> list[str]:
+        """Fetch events as a worker, retrying until no more events."""
+        all_events = []
+        max_attempts = 5  # Safety limit
+        for attempt in range(max_attempts):
+            events = await storage.get_pending_outbox_events(limit=limit)
+            if not events:
+                break  # No more events available
+            all_events.extend([event["event_id"] for event in events])
+            # Small delay to allow other workers to commit
+            await asyncio.sleep(0.01)
+        return all_events
 
     # Execute 3 workers concurrently
     results = await asyncio.gather(
-        worker_fetch(1, limit=4),
-        worker_fetch(2, limit=4),
-        worker_fetch(3, limit=4),
+        worker_poll_loop(1, limit=4),
+        worker_poll_loop(2, limit=4),
+        worker_poll_loop(3, limit=4),
     )
 
     # Collect all event IDs fetched by all workers
@@ -76,8 +76,13 @@ async def test_concurrent_fetch_no_duplicates(storage):
 
 
 @pytest.mark.asyncio
-async def test_skip_locked_behavior(storage):
+async def test_skip_locked_behavior(db_storage):
     """Test that SKIP LOCKED correctly skips locked rows."""
+    # Skip for SQLite (SKIP LOCKED not supported)
+    if db_storage.engine.dialect.name == "sqlite":
+        pytest.skip("SQLite does not support SKIP LOCKED")
+
+    storage = db_storage
     # Create 5 events
     for i in range(5):
         await storage.add_outbox_event(
@@ -103,10 +108,14 @@ async def test_skip_locked_behavior(storage):
 
 
 @pytest.mark.asyncio
-async def test_parallel_publishing(storage):
+async def test_parallel_publishing(db_storage):
     """Test that multiple workers can publish events in parallel."""
+    # Skip for SQLite (SKIP LOCKED not supported)
+    if db_storage.engine.dialect.name == "sqlite":
+        pytest.skip("SQLite does not support SKIP LOCKED")
+
+    storage = db_storage
     # Create 6 events
-    event_ids = []
     for i in range(6):
         await storage.add_outbox_event(
             event_id=str(uuid.uuid4()),
@@ -116,12 +125,8 @@ async def test_parallel_publishing(storage):
             content_type="application/json",
         )
 
-    # Get all event IDs
-    all_events = await storage.get_pending_outbox_events(limit=10)
-    event_ids = [event["event_id"] for event in all_events]
-
     # Simulate 2 workers publishing events simultaneously
-    async def worker_publish(event_ids: list[str]):
+    async def worker_publish():
         """Worker that fetches and publishes events."""
         events = await storage.get_pending_outbox_events(limit=3)
         for event in events:
@@ -130,8 +135,8 @@ async def test_parallel_publishing(storage):
 
     # Execute 2 workers concurrently
     results = await asyncio.gather(
-        worker_publish(event_ids[:3]),
-        worker_publish(event_ids[3:]),
+        worker_publish(),
+        worker_publish(),
     )
 
     # Verify each worker published different events
@@ -144,8 +149,17 @@ async def test_parallel_publishing(storage):
 
 
 @pytest.mark.asyncio
-async def test_large_scale_concurrent_processing(storage):
-    """Test concurrent processing at larger scale."""
+async def test_large_scale_concurrent_processing(db_storage):
+    """Test concurrent processing at larger scale.
+
+    This test simulates a realistic scenario where workers poll in a loop.
+    In concurrent systems, workers retry until all events are processed.
+    """
+    # Skip for SQLite (SKIP LOCKED not supported)
+    if db_storage.engine.dialect.name == "sqlite":
+        pytest.skip("SQLite does not support SKIP LOCKED")
+
+    storage = db_storage
     # Create 100 events
     for i in range(100):
         await storage.add_outbox_event(
@@ -156,14 +170,22 @@ async def test_large_scale_concurrent_processing(storage):
             content_type="application/json",
         )
 
-    # Simulate 10 workers polling simultaneously
-    async def worker_fetch(worker_id: int) -> list[str]:
-        """Fetch events as a worker."""
-        events = await storage.get_pending_outbox_events(limit=15)
-        return [event["event_id"] for event in events]
+    # Simulate 10 workers polling in a loop (realistic scenario)
+    async def worker_poll_loop(worker_id: int) -> list[str]:
+        """Fetch events as a worker, retrying until no more events."""
+        all_events = []
+        max_attempts = 10  # Safety limit
+        for attempt in range(max_attempts):
+            events = await storage.get_pending_outbox_events(limit=15)
+            if not events:
+                break  # No more events available
+            all_events.extend([event["event_id"] for event in events])
+            # Small delay to allow other workers to commit
+            await asyncio.sleep(0.01)
+        return all_events
 
     # Execute 10 workers concurrently
-    workers = [worker_fetch(i) for i in range(10)]
+    workers = [worker_poll_loop(i) for i in range(10)]
     results = await asyncio.gather(*workers)
 
     # Collect all event IDs
@@ -179,8 +201,13 @@ async def test_large_scale_concurrent_processing(storage):
 
 
 @pytest.mark.asyncio
-async def test_retry_failed_events_no_duplicate(storage):
+async def test_retry_failed_events_no_duplicate(db_storage):
     """Test that failed events can be retried without duplicates."""
+    # Skip for SQLite (SKIP LOCKED not supported)
+    if db_storage.engine.dialect.name == "sqlite":
+        pytest.skip("SQLite does not support SKIP LOCKED")
+
+    storage = db_storage
     # Create 3 events
     for i in range(3):
         await storage.add_outbox_event(

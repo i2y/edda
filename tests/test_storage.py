@@ -295,13 +295,25 @@ class TestOutboxEvents:
 
     async def test_add_outbox_event(self, sqlite_storage, sample_event_data):
         """Test adding an event to the outbox."""
+        from edda.storage.sqlalchemy_storage import OutboxEvent
+        from sqlalchemy.ext.asyncio import AsyncSession
+        from sqlalchemy import select
+
         await sqlite_storage.add_outbox_event(event_id="event-123", **sample_event_data)
 
-        # Get pending events
+        # Verify event is stored with "pending" status in DB
+        async with AsyncSession(sqlite_storage.engine) as session:
+            result = await session.execute(
+                select(OutboxEvent).where(OutboxEvent.event_id == "event-123")
+            )
+            event = result.scalar_one()
+            assert event.status == "pending"  # In DB, always "pending"
+
+        # When fetched via get_pending_outbox_events(), status becomes "processing"
         pending = await sqlite_storage.get_pending_outbox_events()
         assert len(pending) == 1
         assert pending[0]["event_id"] == "event-123"
-        assert pending[0]["status"] == "pending"
+        assert pending[0]["status"] == "processing"  # Fetched = "processing"
 
     async def test_mark_outbox_published(self, sqlite_storage, sample_event_data):
         """Test marking an outbox event as published."""

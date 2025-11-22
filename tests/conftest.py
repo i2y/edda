@@ -35,65 +35,103 @@ async def db_storage(request):
     Parametrized fixture that creates storage for SQLite, PostgreSQL, and MySQL.
 
     This fixture will run each test 3 times (once for each database).
-    If PostgreSQL or MySQL is not available, those tests will be skipped.
+    Uses Testcontainers for PostgreSQL and MySQL.
     """
     db_type = request.param
-    db_urls = get_database_urls()
-    db_url = db_urls[db_type]
 
-    # Check if required driver is installed
-    if db_type == "postgresql":
+    if db_type == "sqlite":
+        # SQLite: in-memory database
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        storage = SQLAlchemyStorage(engine)
+        await storage.initialize()
+
+        # Create a sample workflow definition for tests
+        await storage.upsert_workflow_definition(
+            workflow_name="test_workflow",
+            source_hash="abc123def456",
+            source_code="async def test_workflow(ctx): pass",
+        )
+
+        yield storage
+        await storage.close()
+
+    elif db_type == "postgresql":
+        # PostgreSQL with Testcontainers
         try:
             import asyncpg  # noqa: F401
         except ModuleNotFoundError:
-            pytest.skip(
-                "asyncpg driver not installed. "
-                "Install with: uv sync --extra postgresql"
+            pytest.skip("asyncpg not installed")
+
+        try:
+            from testcontainers.postgres import PostgresContainer
+        except ModuleNotFoundError:
+            pytest.skip("testcontainers not installed")
+
+        with PostgresContainer("postgres:17", username="edda", password="edda_test_password", dbname="edda_test") as postgres:
+            db_url = postgres.get_connection_url().replace("psycopg2", "asyncpg")
+            # Use READ COMMITTED to match production and avoid snapshot issues
+            engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
+            storage = SQLAlchemyStorage(engine)
+            await storage.initialize()
+
+            await storage.upsert_workflow_definition(
+                workflow_name="test_workflow",
+                source_hash="abc123def456",
+                source_code="async def test_workflow(ctx): pass",
             )
+
+            yield storage
+
+            # Cleanup
+            async with AsyncSession(storage.engine) as session:
+                await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_history"))
+                await session.execute(text("DELETE FROM outbox_events"))
+                await session.execute(text("DELETE FROM workflow_instances"))
+                await session.execute(text("DELETE FROM workflow_definitions"))
+                await session.commit()
+
+            await storage.close()
+
     elif db_type == "mysql":
+        # MySQL with Testcontainers
         try:
             import aiomysql  # noqa: F401
         except ModuleNotFoundError:
-            pytest.skip(
-                "aiomysql driver not installed. "
-                "Install with: uv sync --extra mysql"
+            pytest.skip("aiomysql not installed")
+
+        try:
+            from testcontainers.mysql import MySqlContainer
+        except ModuleNotFoundError:
+            pytest.skip("testcontainers not installed")
+
+        with MySqlContainer("mysql:9", username="edda", password="edda_test_password", dbname="edda_test") as mysql:
+            db_url = mysql.get_connection_url().replace("mysql://", "mysql+aiomysql://")
+            # Use READ COMMITTED instead of REPEATABLE READ to avoid snapshot issues with SKIP LOCKED
+            engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
+            storage = SQLAlchemyStorage(engine)
+            await storage.initialize()
+
+            await storage.upsert_workflow_definition(
+                workflow_name="test_workflow",
+                source_hash="abc123def456",
+                source_code="async def test_workflow(ctx): pass",
             )
 
-    # Try to connect
-    engine = create_async_engine(db_url, echo=False)
-    storage = SQLAlchemyStorage(engine)
+            yield storage
 
-    try:
-        await storage.initialize()
-    except OperationalError as e:
-        pytest.skip(
-            f"{db_type.upper()} is not available. "
-            f"Please ensure {db_type.upper()} is running and accessible.\n"
-            f"Error: {e}"
-        )
+            # Cleanup
+            async with AsyncSession(storage.engine) as session:
+                await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_history"))
+                await session.execute(text("DELETE FROM outbox_events"))
+                await session.execute(text("DELETE FROM workflow_instances"))
+                await session.execute(text("DELETE FROM workflow_definitions"))
+                await session.commit()
 
-    # Create a sample workflow definition for tests
-    await storage.upsert_workflow_definition(
-        workflow_name="test_workflow",
-        source_hash="abc123def456",  # Must match sample_workflow_data
-        source_code="async def test_workflow(ctx): pass",
-    )
-
-    yield storage
-
-    # Cleanup: For persistent databases (PostgreSQL, MySQL), truncate all tables
-    if db_type in ["postgresql", "mysql"]:
-        async with AsyncSession(storage.engine) as session:
-            # Truncate all tables in reverse order of dependencies
-            await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-            await session.execute(text("DELETE FROM workflow_event_subscriptions"))
-            await session.execute(text("DELETE FROM workflow_history"))
-            await session.execute(text("DELETE FROM outbox_events"))
-            await session.execute(text("DELETE FROM workflow_instances"))
-            await session.execute(text("DELETE FROM workflow_definitions"))
-            await session.commit()
-
-    await storage.close()
+            await storage.close()
 
 
 @pytest_asyncio.fixture
@@ -116,7 +154,7 @@ async def sqlite_storage():
 
 @pytest_asyncio.fixture
 async def postgresql_storage():
-    """Create a PostgreSQL storage for testing (requires Docker)."""
+    """Create a PostgreSQL storage for testing with Testcontainers."""
     # Check if asyncpg driver is installed
     try:
         import asyncpg  # noqa: F401
@@ -126,45 +164,51 @@ async def postgresql_storage():
             "Install with: uv sync --extra postgresql"
         )
 
-    db_urls = get_database_urls()
-    engine = create_async_engine(db_urls["postgresql"], echo=False)
-    storage = SQLAlchemyStorage(engine)
-
+    # Try to use Testcontainers
     try:
-        await storage.initialize()
-    except OperationalError as e:
+        from testcontainers.postgres import PostgresContainer
+    except ModuleNotFoundError:
         pytest.skip(
-            f"PostgreSQL is not available. "
-            f"Please ensure PostgreSQL is running and accessible.\n"
-            f"Error: {e}"
+            "testcontainers not installed. "
+            "Install with: uv sync --extra dev"
         )
 
-    # Create a sample workflow definition for tests
-    await storage.upsert_workflow_definition(
-        workflow_name="test_workflow",
-        source_hash="abc123def456",
-        source_code="async def test_workflow(ctx): pass",
-    )
+    # Start PostgreSQL container
+    with PostgresContainer("postgres:17", username="edda", password="edda_test_password", dbname="edda_test") as postgres:
+        # Get connection URL and replace psycopg2 with asyncpg
+        db_url = postgres.get_connection_url().replace("psycopg2", "asyncpg")
+        engine = create_async_engine(db_url, echo=False)
+        storage = SQLAlchemyStorage(engine)
 
-    yield storage
+        await storage.initialize()
 
-    # Cleanup: Truncate all tables
-    async with AsyncSession(storage.engine) as session:
-        await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-        await session.execute(text("DELETE FROM workflow_event_subscriptions"))
-        await session.execute(text("DELETE FROM workflow_compensations"))
-        await session.execute(text("DELETE FROM workflow_history"))
-        await session.execute(text("DELETE FROM outbox_events"))
-        await session.execute(text("DELETE FROM workflow_instances"))
-        await session.execute(text("DELETE FROM workflow_definitions"))
-        await session.commit()
+        # Create a sample workflow definition for tests
+        await storage.upsert_workflow_definition(
+            workflow_name="test_workflow",
+            source_hash="abc123def456",
+            source_code="async def test_workflow(ctx): pass",
+        )
 
-    await storage.close()
+        yield storage
+
+        # Cleanup: Truncate all tables
+        async with AsyncSession(storage.engine) as session:
+            await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_compensations"))
+            await session.execute(text("DELETE FROM workflow_history"))
+            await session.execute(text("DELETE FROM outbox_events"))
+            await session.execute(text("DELETE FROM workflow_instances"))
+            await session.execute(text("DELETE FROM workflow_definitions"))
+            await session.commit()
+
+        await storage.close()
+    # Container automatically stopped here
 
 
 @pytest_asyncio.fixture
 async def mysql_storage():
-    """Create a MySQL storage for testing (requires Docker)."""
+    """Create a MySQL storage for testing with Testcontainers."""
     # Check if aiomysql driver is installed
     try:
         import aiomysql  # noqa: F401
@@ -174,40 +218,46 @@ async def mysql_storage():
             "Install with: uv sync --extra mysql"
         )
 
-    db_urls = get_database_urls()
-    engine = create_async_engine(db_urls["mysql"], echo=False)
-    storage = SQLAlchemyStorage(engine)
-
+    # Try to use Testcontainers
     try:
-        await storage.initialize()
-    except OperationalError as e:
+        from testcontainers.mysql import MySqlContainer
+    except ModuleNotFoundError:
         pytest.skip(
-            f"MySQL is not available. "
-            f"Please ensure MySQL is running and accessible.\n"
-            f"Error: {e}"
+            "testcontainers not installed. "
+            "Install with: uv sync --extra dev"
         )
 
-    # Create a sample workflow definition for tests
-    await storage.upsert_workflow_definition(
-        workflow_name="test_workflow",
-        source_hash="abc123def456",
-        source_code="async def test_workflow(ctx): pass",
-    )
+    # Start MySQL container
+    with MySqlContainer("mysql:9", username="edda", password="edda_test_password", dbname="edda_test") as mysql:
+        # Get connection URL and add aiomysql driver
+        db_url = mysql.get_connection_url().replace("mysql://", "mysql+aiomysql://")
+        engine = create_async_engine(db_url, echo=False)
+        storage = SQLAlchemyStorage(engine)
 
-    yield storage
+        await storage.initialize()
 
-    # Cleanup: Truncate all tables
-    async with AsyncSession(storage.engine) as session:
-        await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-        await session.execute(text("DELETE FROM workflow_event_subscriptions"))
-        await session.execute(text("DELETE FROM workflow_compensations"))
-        await session.execute(text("DELETE FROM workflow_history"))
-        await session.execute(text("DELETE FROM outbox_events"))
-        await session.execute(text("DELETE FROM workflow_instances"))
-        await session.execute(text("DELETE FROM workflow_definitions"))
-        await session.commit()
+        # Create a sample workflow definition for tests
+        await storage.upsert_workflow_definition(
+            workflow_name="test_workflow",
+            source_hash="abc123def456",
+            source_code="async def test_workflow(ctx): pass",
+        )
 
-    await storage.close()
+        yield storage
+
+        # Cleanup: Truncate all tables
+        async with AsyncSession(storage.engine) as session:
+            await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_compensations"))
+            await session.execute(text("DELETE FROM workflow_history"))
+            await session.execute(text("DELETE FROM outbox_events"))
+            await session.execute(text("DELETE FROM workflow_instances"))
+            await session.execute(text("DELETE FROM workflow_definitions"))
+            await session.commit()
+
+        await storage.close()
+    # Container automatically stopped here
 
 
 @pytest.fixture
