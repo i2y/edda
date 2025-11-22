@@ -13,7 +13,6 @@ Tests cover:
 - Replay behavior (no retry during replay)
 """
 
-import time
 from datetime import UTC, datetime
 
 import pytest

@@ -117,7 +117,12 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                 if len(all_executions) > 1:
                     # Find current execution index
                     current_index = next(
-                        (i for i, ex in enumerate(all_executions) if ex["activity_id"] == activity_id), 0
+                        (
+                            i
+                            for i, ex in enumerate(all_executions)
+                            if ex["activity_id"] == activity_id
+                        ),
+                        0,
                     )
 
                     with ui.tabs() as tabs:
@@ -1337,7 +1342,9 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             # Left pane: Execution Flow
             with ui.column().style("flex: 1; overflow: auto; padding-right: 1rem;"):
                 ui.markdown("## Execution Flow")
-                ui.label("Click on an activity to view details →").classes("text-gray-600 text-sm mb-2")
+                ui.label("Click on an activity to view details →").classes(
+                    "text-gray-600 text-sm mb-2"
+                )
 
                 if history:
                     # Get workflow source code for hybrid diagram

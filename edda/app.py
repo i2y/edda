@@ -20,6 +20,7 @@ from edda.hooks import WorkflowHooks
 from edda.locking import auto_resume_stale_workflows_periodically, generate_worker_id
 from edda.outbox.relayer import OutboxRelayer
 from edda.replay import ReplayEngine
+from edda.retry import RetryPolicy
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
 
@@ -189,7 +190,6 @@ class EddaApp:
                 self.storage,
                 self.replay_engine,
                 interval=60,  # Check every 60 seconds
-                timeout_seconds=300,  # Clean locks older than 5 minutes
             )
         )
         self._background_tasks.append(auto_resume_task)
@@ -425,7 +425,9 @@ class EddaApp:
             # Get activity_id from the subscription (stored when wait_event was called)
             activity_id = subscription.get("activity_id")
             if not activity_id:
-                print(f"[EventDelivery] Warning: No activity_id in subscription for {instance_id}, skipping")
+                print(
+                    f"[EventDelivery] Warning: No activity_id in subscription for {instance_id}, skipping"
+                )
                 continue
 
             workflow_name = instance["workflow_name"]
@@ -686,7 +688,9 @@ class EddaApp:
                 # Get activity_id from the subscription (stored when wait_event was called)
                 activity_id = subscription.get("activity_id")
                 if not activity_id:
-                    print(f"[EventTimeoutCheck] Warning: No activity_id in subscription for {instance_id}, skipping")
+                    print(
+                        f"[EventTimeoutCheck] Warning: No activity_id in subscription for {instance_id}, skipping"
+                    )
                     continue
 
                 # 1. Record event timeout to history

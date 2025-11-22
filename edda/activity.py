@@ -22,7 +22,7 @@ from edda.pydantic_utils import (
     from_json_dict,
     to_json_dict,
 )
-from edda.retry import RetryMetadata
+from edda.retry import RetryMetadata, RetryPolicy
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -96,7 +96,9 @@ class Activity:
 
         # Call hook: activity start
         if ctx.hooks and hasattr(ctx.hooks, "on_activity_start"):
-            await ctx.hooks.on_activity_start(ctx.instance_id, activity_id, self.name, ctx.is_replaying)
+            await ctx.hooks.on_activity_start(
+                ctx.instance_id, activity_id, self.name, ctx.is_replaying
+            )
 
         # Check if workflow has been cancelled
         instance = await ctx._get_instance()
@@ -170,7 +172,9 @@ class Activity:
                         retry_metadata.total_attempts = attempt  # Update attempt count on success
                         retry_meta = retry_metadata
 
-                    result = await self._execute_and_record(ctx, activity_id, args, kwargs, retry_meta)
+                    result = await self._execute_and_record(
+                        ctx, activity_id, args, kwargs, retry_meta
+                    )
                     return result
 
             except WorkflowCancelledException:
@@ -204,9 +208,7 @@ class Activity:
                 retry_metadata.add_attempt(attempt, error)
 
                 # Check if should retry
-                should_retry, reason = self._should_retry(
-                    retry_policy, error, attempt, start_time, retry_metadata
-                )
+                should_retry, reason = self._should_retry(retry_policy, error, attempt, start_time)
 
                 if not should_retry:
                     # Exhausted retries - mark metadata as exhausted
@@ -310,7 +312,9 @@ class Activity:
             # Register the compensation
             from edda.compensation import register_compensation
 
-            await register_compensation(ctx, compensation_func, activity_id=activity_id, **comp_kwargs)
+            await register_compensation(
+                ctx, compensation_func, activity_id=activity_id, **comp_kwargs
+            )
 
             print(f"[Activity] Auto-registered compensation: {compensation_func.__name__}")
 
@@ -378,7 +382,6 @@ class Activity:
         error: Exception,
         attempt: int,
         start_time: float,
-        retry_metadata: "RetryMetadata",
     ) -> tuple[bool, str]:
         """
         Determine if the activity should be retried.
@@ -388,7 +391,6 @@ class Activity:
             error: Exception that caused the failure
             attempt: Current attempt number (1-indexed)
             start_time: Start time of the first attempt (Unix timestamp)
-            retry_metadata: Retry metadata for observability
 
         Returns:
             Tuple of (should_retry: bool, reason: str)

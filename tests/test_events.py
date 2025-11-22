@@ -86,7 +86,9 @@ class TestWaitEvent:
         # Verify exception contains subscription details
         assert exc_info.value.event_type == "order.created"
         assert exc_info.value.timeout_seconds == 600
-        assert exc_info.value.activity_id == "wait_event_order.created:1"  # First auto-generated activity_id
+        assert (
+            exc_info.value.activity_id == "wait_event_order.created:1"
+        )  # First auto-generated activity_id
 
         # Subscription is NOT registered yet (handled by ReplayEngine atomically)
         subscriptions = await sqlite_storage.find_waiting_instances("order.created")

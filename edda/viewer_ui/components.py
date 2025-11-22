@@ -1053,7 +1053,11 @@ def generate_hybrid_mermaid(
                     normalized_name = activity_name.replace("Compensate: ", "")
                     # Track compensation executions separately
                     executed_compensations.append(
-                        {"activity_name": normalized_name, "activity_id": activity_id, "status": status}
+                        {
+                            "activity_name": normalized_name,
+                            "activity_id": activity_id,
+                            "status": status,
+                        }
                     )
                 else:
                     executed_activities.add(normalized_name)

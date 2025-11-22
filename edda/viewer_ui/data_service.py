@@ -136,7 +136,9 @@ class WorkflowDataService:
             "compensations": compensations,
         }
 
-    async def get_activity_detail(self, instance_id: str, activity_id: str) -> dict[str, Any] | None:
+    async def get_activity_detail(
+        self, instance_id: str, activity_id: str
+    ) -> dict[str, Any] | None:
         """
         Get detailed information about a specific activity execution.
 

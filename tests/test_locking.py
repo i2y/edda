@@ -242,7 +242,9 @@ class TestCleanupStaleLocks:
 
         # Manually set lock_expires_at to past time to simulate stale lock
         from datetime import UTC, datetime, timedelta
+
         from sqlalchemy import update
+
         from edda.storage.sqlalchemy_storage import WorkflowInstance
 
         async with sqlite_storage.engine.begin() as conn:

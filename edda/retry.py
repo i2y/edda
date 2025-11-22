@@ -7,7 +7,7 @@ Inspired by Restate's retry mechanism and Temporal's retry policies.
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Type
+from typing import Any
 
 
 @dataclass
@@ -52,8 +52,8 @@ class RetryPolicy:
     max_duration: float | None = 300.0  # seconds (5 minutes), None = infinite
 
     # Exception filtering
-    retryable_error_types: tuple[Type[Exception], ...] = (Exception,)
-    non_retryable_error_types: tuple[Type[Exception], ...] = ()
+    retryable_error_types: tuple[type[Exception], ...] = (Exception,)
+    non_retryable_error_types: tuple[type[Exception], ...] = ()
 
     def is_retryable(self, error: Exception) -> bool:
         """
@@ -82,12 +82,8 @@ class RetryPolicy:
         if self.non_retryable_error_types and isinstance(error, self.non_retryable_error_types):
             return False
 
-        # Check explicit retryable types
-        if self.retryable_error_types and isinstance(error, self.retryable_error_types):
-            return True
-
-        # Default: non-retryable (safe default)
-        return False
+        # Check explicit retryable types (default: non-retryable)
+        return bool(self.retryable_error_types and isinstance(error, self.retryable_error_types))
 
     def calculate_delay(self, attempt: int) -> float:
         """

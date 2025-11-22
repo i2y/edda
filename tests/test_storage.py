@@ -295,9 +295,10 @@ class TestOutboxEvents:
 
     async def test_add_outbox_event(self, sqlite_storage, sample_event_data):
         """Test adding an event to the outbox."""
-        from edda.storage.sqlalchemy_storage import OutboxEvent
-        from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from edda.storage.sqlalchemy_storage import OutboxEvent
 
         await sqlite_storage.add_outbox_event(event_id="event-123", **sample_event_data)
 

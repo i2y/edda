@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
+    pass
 
 
 @runtime_checkable
@@ -312,17 +312,14 @@ class StorageProtocol(Protocol):
         """
         ...
 
-    async def cleanup_stale_locks(self, timeout_seconds: int = 300) -> list[dict[str, str]]:
+    async def cleanup_stale_locks(self) -> list[dict[str, str]]:
         """
-        Clean up locks older than timeout_seconds.
+        Clean up locks that have expired (based on lock_expires_at column).
 
         This should be called periodically to clean up locks from crashed workers.
 
-        Args:
-            timeout_seconds: Lock age threshold in seconds (default: 300 = 5 minutes)
-
         Returns:
-            List of cleaned workflow instances with status='running'.
+            List of cleaned workflow instances with status='running' or 'compensating'.
             Each dict contains: {'instance_id': str, 'workflow_name': str, 'source_hash': str}
             These are workflows that need to be auto-resumed.
         """

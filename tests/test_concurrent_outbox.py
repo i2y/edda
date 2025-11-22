@@ -10,13 +10,8 @@ SQLite does NOT support SKIP LOCKED, so these tests will be skipped on SQLite.
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
 
 import pytest
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
-
-from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
 
 @pytest.mark.asyncio
@@ -47,7 +42,7 @@ async def test_concurrent_fetch_no_duplicates(db_storage):
         """Fetch events as a worker, retrying until no more events."""
         all_events = []
         max_attempts = 5  # Safety limit
-        for attempt in range(max_attempts):
+        for _attempt in range(max_attempts):
             events = await storage.get_pending_outbox_events(limit=limit)
             if not events:
                 break  # No more events available
@@ -175,7 +170,7 @@ async def test_large_scale_concurrent_processing(db_storage):
         """Fetch events as a worker, retrying until no more events."""
         all_events = []
         max_attempts = 10  # Safety limit
-        for attempt in range(max_attempts):
+        for _attempt in range(max_attempts):
             events = await storage.get_pending_outbox_events(limit=15)
             if not events:
                 break  # No more events available

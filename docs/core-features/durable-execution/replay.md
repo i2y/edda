@@ -356,15 +356,14 @@ When a worker process crashes, its locks become "stale." Edda automatically clea
 ```python
 async def cleanup_stale_locks_periodically(
     storage: StorageProtocol,
-    interval: int = 60,           # Check every 60 seconds
-    timeout_seconds: int = 300,   # 5-minute threshold
+    interval: int = 60,  # Check every 60 seconds
 ) -> None:
     """Background task to clean up stale locks"""
     while True:
         await asyncio.sleep(interval)
 
-        # Clean up locks older than 5 minutes
-        workflows_to_resume = await storage.cleanup_stale_locks(timeout_seconds)
+        # Clean up stale locks (uses lock_expires_at column)
+        workflows_to_resume = await storage.cleanup_stale_locks()
 
         if len(workflows_to_resume) > 0:
             print(f"Cleaned up {len(workflows_to_resume)} stale locks")
@@ -375,7 +374,7 @@ This background task starts automatically when `EddaApp` launches.
 **How it works:**
 
 1. **Every 60 seconds**, check for stale locks
-2. **Locks older than 5 minutes** are detected
+2. **Expired locks** are detected (based on `lock_expires_at` column set at lock acquisition)
 3. Release those locks (`locked_by=NULL`)
 4. Return list of workflows that need to be resumed
 
@@ -404,14 +403,13 @@ async def auto_resume_stale_workflows_periodically(
     storage: StorageProtocol,
     replay_engine: Any,
     interval: int = 60,
-    timeout_seconds: int = 300,
 ) -> None:
     """Stale lock cleanup + automatic resume"""
     while True:
         await asyncio.sleep(interval)
 
         # Clean up stale locks and get workflows to resume
-        workflows_to_resume = await storage.cleanup_stale_locks(timeout_seconds)
+        workflows_to_resume = await storage.cleanup_stale_locks()
 
         if len(workflows_to_resume) > 0:
             # Auto-resume workflows

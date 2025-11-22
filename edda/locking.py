@@ -189,7 +189,6 @@ async def _refresh_lock_periodically(
 async def cleanup_stale_locks_periodically(
     storage: StorageProtocol,
     interval: int = 60,
-    timeout_seconds: int = 300,
 ) -> None:
     """
     Background task to periodically clean up stale locks.
@@ -202,22 +201,19 @@ async def cleanup_stale_locks_periodically(
 
     Example:
         >>> asyncio.create_task(
-        ...     cleanup_stale_locks_periodically(
-        ...         storage, interval=60, timeout_seconds=300
-        ...     )
+        ...     cleanup_stale_locks_periodically(storage, interval=60)
         ... )
 
     Args:
         storage: Storage backend
         interval: Cleanup interval in seconds (default: 60)
-        timeout_seconds: Lock age threshold in seconds (default: 300 = 5 minutes)
     """
     with suppress(asyncio.CancelledError):
         while True:
             await asyncio.sleep(interval)
 
             # Clean up stale locks
-            workflows = await storage.cleanup_stale_locks(timeout_seconds)
+            workflows = await storage.cleanup_stale_locks()
 
             if len(workflows) > 0:
                 # Log cleanup (in a real implementation, use proper logging)
@@ -228,7 +224,6 @@ async def auto_resume_stale_workflows_periodically(
     storage: StorageProtocol,
     replay_engine: Any,
     interval: int = 60,
-    timeout_seconds: int = 300,
 ) -> None:
     """
     Background task to periodically clean up stale locks and auto-resume workflows.
@@ -239,7 +234,7 @@ async def auto_resume_stale_workflows_periodically(
     Example:
         >>> asyncio.create_task(
         ...     auto_resume_stale_workflows_periodically(
-        ...         storage, replay_engine, interval=60, timeout_seconds=300
+        ...         storage, replay_engine, interval=60
         ...     )
         ... )
 
@@ -247,14 +242,13 @@ async def auto_resume_stale_workflows_periodically(
         storage: Storage backend
         replay_engine: ReplayEngine instance for resuming workflows
         interval: Cleanup interval in seconds (default: 60)
-        timeout_seconds: Lock age threshold in seconds (default: 300 = 5 minutes)
     """
     with suppress(asyncio.CancelledError):
         while True:
             await asyncio.sleep(interval)
 
             # Clean up stale locks and get workflows to resume
-            workflows_to_resume = await storage.cleanup_stale_locks(timeout_seconds)
+            workflows_to_resume = await storage.cleanup_stale_locks()
 
             if len(workflows_to_resume) > 0:
                 # Log cleanup (in a real implementation, use proper logging)

@@ -53,7 +53,9 @@ class TestWorkflowInstances:
         await mysql_storage.create_instance(**sample_workflow_data)
 
         # Update activity ID
-        await mysql_storage.update_instance_activity(sample_workflow_data["instance_id"], "test_activity:1")
+        await mysql_storage.update_instance_activity(
+            sample_workflow_data["instance_id"], "test_activity:1"
+        )
 
         # Verify update
         instance = await mysql_storage.get_instance(sample_workflow_data["instance_id"])
@@ -188,4 +190,8 @@ class TestWorkflowHistory:
         # Verify order
         history = await mysql_storage.get_history(sample_workflow_data["instance_id"])
         assert len(history) == 3
-        assert [h["activity_id"] for h in history] == ["test_activity:1", "test_activity:2", "test_activity:3"]
+        assert [h["activity_id"] for h in history] == [
+            "test_activity:1",
+            "test_activity:2",
+            "test_activity:3",
+        ]

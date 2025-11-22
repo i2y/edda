@@ -15,7 +15,6 @@ import pytest_asyncio
 from edda.activity import Activity, activity
 from edda.context import WorkflowContext
 from edda.exceptions import TerminalError
-from edda.retry import RetryPolicy
 
 
 @pytest.mark.asyncio

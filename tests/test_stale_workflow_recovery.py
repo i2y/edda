@@ -90,15 +90,21 @@ class TestStaleLocksCleanup:
         async with AsyncSession(sqlite_storage.engine, expire_on_commit=False) as conn:
             # Running workflow with Stale Lock
             await conn.execute(
-                text("UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'running-1'")
+                text(
+                    "UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'running-1'"
+                )
             )
             # Waiting workflow with Stale Lock (should not be resumed)
             await conn.execute(
-                text("UPDATE workflow_instances SET status = 'waiting_for_event' WHERE instance_id = 'waiting-1'")
+                text(
+                    "UPDATE workflow_instances SET status = 'waiting_for_event' WHERE instance_id = 'waiting-1'"
+                )
             )
             # Completed workflow with Stale Lock (should not be resumed)
             await conn.execute(
-                text("UPDATE workflow_instances SET status = 'completed' WHERE instance_id = 'completed-1'")
+                text(
+                    "UPDATE workflow_instances SET status = 'completed' WHERE instance_id = 'completed-1'"
+                )
             )
             await conn.commit()
 
@@ -108,7 +114,7 @@ class TestStaleLocksCleanup:
         await set_lock_expired(sqlite_storage, "completed-1")
 
         # Clean up Stale Locks
-        workflows_to_resume = await sqlite_storage.cleanup_stale_locks(timeout_seconds=300)
+        workflows_to_resume = await sqlite_storage.cleanup_stale_locks()
 
         # Verify only status='running' workflow is returned
         assert len(workflows_to_resume) == 1
@@ -153,7 +159,7 @@ class TestStaleLocksCleanup:
             await conn.commit()
 
         # Clean up Stale Locks (timeout = 300 seconds)
-        workflows_to_resume = await sqlite_storage.cleanup_stale_locks(timeout_seconds=300)
+        workflows_to_resume = await sqlite_storage.cleanup_stale_locks()
 
         # Verify no workflows were cleaned up
         assert len(workflows_to_resume) == 0
@@ -192,7 +198,9 @@ class TestStaleWorkflowRecovery:
         # Update status to running
         async with AsyncSession(sqlite_storage.engine, expire_on_commit=False) as conn:
             await conn.execute(
-                text("UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'stale-1'")
+                text(
+                    "UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'stale-1'"
+                )
             )
             await conn.commit()
 
@@ -204,7 +212,6 @@ class TestStaleWorkflowRecovery:
             cleanup_stale_locks_periodically(
                 storage=sqlite_storage,
                 interval=0.1,  # Fast interval for testing
-                timeout_seconds=300,
             )
         )
 
@@ -246,7 +253,9 @@ class TestStaleWorkflowRecovery:
         # Update status to running
         async with AsyncSession(sqlite_storage.engine, expire_on_commit=False) as conn:
             await conn.execute(
-                text("UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'stale-2'")
+                text(
+                    "UPDATE workflow_instances SET status = 'running' WHERE instance_id = 'stale-2'"
+                )
             )
             await conn.commit()
 
@@ -263,7 +272,6 @@ class TestStaleWorkflowRecovery:
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
                 interval=0.1,
-                timeout_seconds=300,
             )
         )
 
@@ -337,7 +345,6 @@ class TestStaleWorkflowRecovery:
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
                 interval=0.1,
-                timeout_seconds=300,
             )
         )
 
@@ -416,7 +423,7 @@ class TestStaleWorkflowRecovery:
         assert instance["status"] == "running"
 
         # Run cleanup with auto-resume
-        workflows_to_resume = await sqlite_storage.cleanup_stale_locks(timeout_seconds=300)
+        workflows_to_resume = await sqlite_storage.cleanup_stale_locks()
         assert len(workflows_to_resume) == 1
 
         # Manually trigger resume (simulating what the periodic task does)

@@ -68,9 +68,10 @@ class TestSendEventTransactional:
         assert uuid.UUID(event_id)
 
         # Verify event is stored with "pending" status in DB
-        from edda.storage.sqlalchemy_storage import OutboxEvent
-        from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from edda.storage.sqlalchemy_storage import OutboxEvent
 
         async with AsyncSession(sqlite_storage.engine) as session:
             result = await session.execute(
@@ -283,8 +284,9 @@ class TestOutboxRelayer:
 
         # Verify event status is 'failed' (current implementation bug - should be 'invalid')
         # Note: Event will still be fetched for retry, but relayer skips it due to retry_count
-        from edda.storage.sqlalchemy_storage import OutboxEvent
         from sqlalchemy import select
+
+        from edda.storage.sqlalchemy_storage import OutboxEvent
 
         async with AsyncSession(sqlite_storage.engine) as session:
             result = await session.execute(
@@ -452,9 +454,10 @@ class TestOutboxRelayer:
             await outbox_relayer._poll_and_publish()
 
             # Verify event status in DB (should be 'failed' for retry)
-            from edda.storage.sqlalchemy_storage import OutboxEvent
-            from sqlalchemy.ext.asyncio import AsyncSession
             from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            from edda.storage.sqlalchemy_storage import OutboxEvent
 
             async with AsyncSession(sqlite_storage.engine) as session:
                 result = await session.execute(
@@ -495,9 +498,10 @@ class TestOutboxRelayer:
             await outbox_relayer._poll_and_publish()
 
             # Verify event status in DB (should be 'failed' for retry)
-            from edda.storage.sqlalchemy_storage import OutboxEvent
-            from sqlalchemy.ext.asyncio import AsyncSession
             from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            from edda.storage.sqlalchemy_storage import OutboxEvent
 
             async with AsyncSession(sqlite_storage.engine) as session:
                 result = await session.execute(

@@ -6,13 +6,12 @@ decorator level and runtime level, with proper priority handling.
 """
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from edda.context import WorkflowContext
 from edda.locking import generate_worker_id
 from edda.workflow import workflow
-from edda.context import WorkflowContext
 
 
 @pytest.mark.asyncio
@@ -204,8 +203,8 @@ class TestLockTimeoutCustomization:
         # Wait 3 seconds
         await asyncio.sleep(3)
 
-        # Cleanup with global timeout of 300 seconds
-        stale_workflows = await sqlite_storage.cleanup_stale_locks(timeout_seconds=300)
+        # Cleanup (uses lock_expires_at column set during lock acquisition)
+        stale_workflows = await sqlite_storage.cleanup_stale_locks()
 
         # Only instance_id_1 should be cleaned up (2-second timeout expired)
         # instance_id_2 should still be locked (10-second timeout not expired)

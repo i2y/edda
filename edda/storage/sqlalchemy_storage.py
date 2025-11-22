@@ -27,7 +27,6 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
-    case,
     delete,
     func,
     or_,
@@ -1007,20 +1006,16 @@ class SQLAlchemyStorage:
             await session.commit()
             return bool(result.rowcount and result.rowcount > 0)  # type: ignore[attr-defined]
 
-    async def cleanup_stale_locks(self, timeout_seconds: int = 300) -> list[dict[str, str]]:
+    async def cleanup_stale_locks(self) -> list[dict[str, str]]:
         """
-        Clean up locks that have expired (based on lock_expires_at).
+        Clean up locks that have expired (based on lock_expires_at column).
 
         Returns list of workflows with status='running' or 'compensating' that need auto-resume.
 
         Workflows with status='compensating' crashed during compensation execution
         and need special handling to complete compensations.
 
-        Args:
-            timeout_seconds: Deprecated - no longer used (kept for backward compatibility).
-                Lock expiry is now determined by lock_expires_at column set during lock acquisition.
-
-        Note: Now uses lock_expires_at column for efficient SQL-side filtering.
+        Note: Uses lock_expires_at column for efficient SQL-side filtering.
         Note: ALWAYS uses separate session (not external session).
         """
         session = self._get_session_for_operation(is_lock_operation=True)
@@ -1601,48 +1596,47 @@ class SQLAlchemyStorage:
         """
         # Use new session for lock operation (SKIP LOCKED requires separate transactions)
         session = self._get_session_for_operation(is_lock_operation=True)
-        async with self._session_scope(session) as session:
-            # Explicitly begin transaction before SELECT FOR UPDATE
-            # This ensures proper transaction isolation for SKIP LOCKED
-            async with session.begin():
-                # 1. SELECT FOR UPDATE to lock rows (both 'pending' and 'failed' for retry)
-                result = await session.execute(
-                    select(OutboxEvent)
-                    .where(OutboxEvent.status.in_(["pending", "failed"]))
-                    .order_by(OutboxEvent.created_at.asc())
-                    .limit(limit)
-                    .with_for_update(skip_locked=True)
+        # Explicitly begin transaction before SELECT FOR UPDATE
+        # This ensures proper transaction isolation for SKIP LOCKED
+        async with self._session_scope(session) as session, session.begin():
+            # 1. SELECT FOR UPDATE to lock rows (both 'pending' and 'failed' for retry)
+            result = await session.execute(
+                select(OutboxEvent)
+                .where(OutboxEvent.status.in_(["pending", "failed"]))
+                .order_by(OutboxEvent.created_at.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            rows = result.scalars().all()
+
+            # 2. Mark as 'processing' to prevent duplicate fetches
+            if rows:
+                event_ids = [row.event_id for row in rows]
+                await session.execute(
+                    update(OutboxEvent)
+                    .where(OutboxEvent.event_id.in_(event_ids))
+                    .values(status="processing")
                 )
-                rows = result.scalars().all()
 
-                # 2. Mark as 'processing' to prevent duplicate fetches
-                if rows:
-                    event_ids = [row.event_id for row in rows]
-                    await session.execute(
-                        update(OutboxEvent)
-                        .where(OutboxEvent.event_id.in_(event_ids))
-                        .values(status="processing")
-                    )
-
-                # 3. Return events (now with status='processing')
-                return [
-                    {
-                        "event_id": row.event_id,
-                        "event_type": row.event_type,
-                        "event_source": row.event_source,
-                        "event_data": (
-                            row.event_data_binary
-                            if row.data_type == "binary"
-                            else json.loads(row.event_data)  # type: ignore[arg-type]
-                        ),
-                        "content_type": row.content_type,
-                        "created_at": row.created_at.isoformat(),
-                        "status": "processing",  # Always 'processing' after update
-                        "retry_count": row.retry_count,
-                        "last_error": row.last_error,
-                    }
-                    for row in rows
-                ]
+            # 3. Return events (now with status='processing')
+            return [
+                {
+                    "event_id": row.event_id,
+                    "event_type": row.event_type,
+                    "event_source": row.event_source,
+                    "event_data": (
+                        row.event_data_binary
+                        if row.data_type == "binary"
+                        else json.loads(row.event_data)  # type: ignore[arg-type]
+                    ),
+                    "content_type": row.content_type,
+                    "created_at": row.created_at.isoformat(),
+                    "status": "processing",  # Always 'processing' after update
+                    "retry_count": row.retry_count,
+                    "last_error": row.last_error,
+                }
+                for row in rows
+            ]
 
     async def mark_outbox_published(self, event_id: str) -> None:
         """Mark outbox event as successfully published."""

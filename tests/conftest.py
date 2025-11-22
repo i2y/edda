@@ -7,7 +7,6 @@ import os
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from edda.serialization.json import JSONSerializer
@@ -67,7 +66,9 @@ async def db_storage(request):
         except ModuleNotFoundError:
             pytest.skip("testcontainers not installed")
 
-        with PostgresContainer("postgres:17", username="edda", password="edda_test_password", dbname="edda_test") as postgres:
+        with PostgresContainer(
+            "postgres:17", username="edda", password="edda_test_password", dbname="edda_test"
+        ) as postgres:
             db_url = postgres.get_connection_url().replace("psycopg2", "asyncpg")
             # Use READ COMMITTED to match production and avoid snapshot issues
             engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
@@ -106,7 +107,9 @@ async def db_storage(request):
         except ModuleNotFoundError:
             pytest.skip("testcontainers not installed")
 
-        with MySqlContainer("mysql:9", username="edda", password="edda_test_password", dbname="edda_test") as mysql:
+        with MySqlContainer(
+            "mysql:9", username="edda", password="edda_test_password", dbname="edda_test"
+        ) as mysql:
             db_url = mysql.get_connection_url().replace("mysql://", "mysql+aiomysql://")
             # Use READ COMMITTED instead of REPEATABLE READ to avoid snapshot issues with SKIP LOCKED
             engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
@@ -159,22 +162,18 @@ async def postgresql_storage():
     try:
         import asyncpg  # noqa: F401
     except ModuleNotFoundError:
-        pytest.skip(
-            "asyncpg driver not installed. "
-            "Install with: uv sync --extra postgresql"
-        )
+        pytest.skip("asyncpg driver not installed. " "Install with: uv sync --extra postgresql")
 
     # Try to use Testcontainers
     try:
         from testcontainers.postgres import PostgresContainer
     except ModuleNotFoundError:
-        pytest.skip(
-            "testcontainers not installed. "
-            "Install with: uv sync --extra dev"
-        )
+        pytest.skip("testcontainers not installed. " "Install with: uv sync --extra dev")
 
     # Start PostgreSQL container
-    with PostgresContainer("postgres:17", username="edda", password="edda_test_password", dbname="edda_test") as postgres:
+    with PostgresContainer(
+        "postgres:17", username="edda", password="edda_test_password", dbname="edda_test"
+    ) as postgres:
         # Get connection URL and replace psycopg2 with asyncpg
         db_url = postgres.get_connection_url().replace("psycopg2", "asyncpg")
         engine = create_async_engine(db_url, echo=False)
@@ -213,22 +212,18 @@ async def mysql_storage():
     try:
         import aiomysql  # noqa: F401
     except ModuleNotFoundError:
-        pytest.skip(
-            "aiomysql driver not installed. "
-            "Install with: uv sync --extra mysql"
-        )
+        pytest.skip("aiomysql driver not installed. " "Install with: uv sync --extra mysql")
 
     # Try to use Testcontainers
     try:
         from testcontainers.mysql import MySqlContainer
     except ModuleNotFoundError:
-        pytest.skip(
-            "testcontainers not installed. "
-            "Install with: uv sync --extra dev"
-        )
+        pytest.skip("testcontainers not installed. " "Install with: uv sync --extra dev")
 
     # Start MySQL container
-    with MySqlContainer("mysql:9", username="edda", password="edda_test_password", dbname="edda_test") as mysql:
+    with MySqlContainer(
+        "mysql:9", username="edda", password="edda_test_password", dbname="edda_test"
+    ) as mysql:
         # Get connection URL and add aiomysql driver
         db_url = mysql.get_connection_url().replace("mysql://", "mysql+aiomysql://")
         engine = create_async_engine(db_url, echo=False)

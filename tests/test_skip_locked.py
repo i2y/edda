@@ -225,9 +225,7 @@ class TestSkipLockedBehavior:
 class TestSkipLockedMultiDatabase:
     """Test SKIP LOCKED behavior across PostgreSQL and MySQL."""
 
-    async def test_skip_locked_no_blocking_all_databases(
-        self, db_storage, sample_workflow_data
-    ):
+    async def test_skip_locked_no_blocking_all_databases(self, db_storage, sample_workflow_data):
         """Test SKIP LOCKED across PostgreSQL and MySQL."""
         # This test will run multiple times (once for each database)
         # due to the parametrized db_storage fixture

@@ -141,9 +141,7 @@ async def test_ctx_session_with_manual_transaction():
     @workflow
     async def manual_transaction_workflow(ctx: WorkflowContext, order_id: str, amount: float):
         """Workflow with manual transaction."""
-        result = await manual_transaction_activity(
-            ctx, order_id, amount, activity_id="manual_tx:1"
-        )
+        result = await manual_transaction_activity(ctx, order_id, amount, activity_id="manual_tx:1")
         return result
 
     # Execute workflow
