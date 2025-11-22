@@ -17,7 +17,7 @@ site_name = "Edda Documentation"
 # meaningful description of the site content for use by search engines.
 #
 # Read more: https://zensical.org/docs/setup/basics/#site_description
-site_description = "Lightweight durable workflow framework for Python - CloudEvents native, deterministic replay, and distributed execution."
+site_description = "Lightweight durable execution framework for Python"
 
 # The site_author attribute. This is used in the HTML head element.
 #

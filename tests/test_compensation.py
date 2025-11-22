@@ -19,6 +19,7 @@ from edda.compensation import (
     register_compensation,
 )
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
 
@@ -295,7 +296,8 @@ class TestCompensationWithWorkflow:
 
         @activity
         async def failing_step(ctx: WorkflowContext) -> dict:
-            raise ValueError("This step fails")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("This step fails")
 
         @workflow
         async def compensating_workflow(ctx: WorkflowContext, input_value: int) -> dict:
@@ -306,7 +308,7 @@ class TestCompensationWithWorkflow:
             return {"results": [result1, result2, result3]}
 
         # Start workflow (will fail and execute compensations)
-        with pytest.raises(ValueError, match="This step fails"):
+        with pytest.raises(TerminalError, match="This step fails"):
             await compensating_workflow.start(input_value=10)
 
         # Note: Current implementation logs compensations but doesn't execute them

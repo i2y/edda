@@ -41,6 +41,7 @@ class EddaApp:
         outbox_enabled: bool = False,
         broker_url: str = "http://broker-ingress.knative-eventing.svc.cluster.local/default/default",
         hooks: WorkflowHooks | None = None,
+        default_retry_policy: "RetryPolicy | None" = None,
     ):
         """
         Initialize Edda application.
@@ -51,12 +52,16 @@ class EddaApp:
             outbox_enabled: Enable transactional outbox pattern
             broker_url: Knative Broker URL for outbox publishing
             hooks: Optional WorkflowHooks implementation for observability
+            default_retry_policy: Default retry policy for all activities.
+                                 If None, uses DEFAULT_RETRY_POLICY (5 attempts, exponential backoff).
+                                 Can be overridden per-activity using @activity(retry_policy=...).
         """
         self.db_url = db_url
         self.service_name = service_name
         self.outbox_enabled = outbox_enabled
         self.broker_url = broker_url
         self.hooks = hooks
+        self.default_retry_policy = default_retry_policy
 
         # Generate unique worker ID for this process
         self.worker_id = generate_worker_id(service_name)
@@ -129,6 +134,7 @@ class EddaApp:
             service_name=self.service_name,
             worker_id=self.worker_id,
             hooks=self.hooks,
+            default_retry_policy=self.default_retry_policy,
         )
 
         # Set global replay engine for workflow decorator

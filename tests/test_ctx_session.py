@@ -9,6 +9,7 @@ from sqlalchemy.orm import declarative_base
 
 from edda import EddaApp, activity, workflow
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
 from edda.outbox.transactional import send_event_transactional
 
 # Test ORM model
@@ -182,8 +183,8 @@ async def test_ctx_session_rollback_on_error():
         order = Order(order_id=order_id, amount=amount, status="failing")
         session.add(order)
 
-        # Simulate error
-        raise ValueError("Intentional failure")
+        # Simulate error (TerminalError is never retried)
+        raise TerminalError("Intentional failure")
 
     @workflow
     async def failing_workflow(ctx: WorkflowContext, order_id: str, amount: float):
@@ -192,7 +193,7 @@ async def test_ctx_session_rollback_on_error():
         return result
 
     # Execute workflow (should fail)
-    with pytest.raises(ValueError, match="Intentional failure"):
+    with pytest.raises(TerminalError, match="Intentional failure"):
         await failing_workflow.start(order_id="ORD-003", amount=300.0)
 
     # Verify order was NOT created (transaction rolled back)

@@ -19,8 +19,10 @@ from edda.app import EddaApp
 from edda.compensation import compensation, on_failure, register_compensation
 from edda.context import WorkflowContext
 from edda.events import ReceivedEvent, send_event, wait_event, wait_timer, wait_until
+from edda.exceptions import RetryExhaustedError, TerminalError
 from edda.hooks import HooksBase, WorkflowHooks
 from edda.outbox import OutboxRelayer, send_event_transactional
+from edda.retry import RetryPolicy
 from edda.workflow import workflow
 
 __version__ = "0.1.0"
@@ -42,4 +44,7 @@ __all__ = [
     "send_event_transactional",
     "WorkflowHooks",
     "HooksBase",
+    "RetryPolicy",
+    "RetryExhaustedError",
+    "TerminalError",
 ]

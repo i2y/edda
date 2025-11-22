@@ -43,6 +43,7 @@ class ReplayEngine:
         service_name: str,
         worker_id: str,
         hooks: Any = None,
+        default_retry_policy: Any = None,
     ):
         """
         Initialize the replay engine.
@@ -52,11 +53,13 @@ class ReplayEngine:
             service_name: Name of the service (e.g., "order-service")
             worker_id: Unique worker ID for this process
             hooks: Optional WorkflowHooks implementation for observability
+            default_retry_policy: Default retry policy for all activities (RetryPolicy or None)
         """
         self.storage = storage
         self.service_name = service_name
         self.worker_id = worker_id
         self.hooks = hooks
+        self.default_retry_policy = default_retry_policy
 
     def _prepare_workflow_input(
         self,
@@ -205,6 +208,8 @@ class ReplayEngine:
                 is_replaying=False,
                 hooks=self.hooks,
             )
+            # Set default retry policy for activity resolution
+            ctx._app_retry_policy = self.default_retry_policy
 
             try:
                 # Call hook: workflow start
@@ -415,6 +420,8 @@ class ReplayEngine:
             is_replaying=True,
             hooks=self.hooks,
         )
+        # Set default retry policy for activity resolution
+        ctx._app_retry_policy = self.default_retry_policy
 
         # Load history for replay
         await ctx._load_history()
@@ -588,6 +595,8 @@ class ReplayEngine:
                 is_replaying=is_replay,
                 hooks=self.hooks,
             )
+            # Set default retry policy for activity resolution
+            ctx._app_retry_policy = self.default_retry_policy
 
             # Load history if replaying
             if is_replay:
@@ -665,6 +674,8 @@ class ReplayEngine:
                     is_replaying=False,
                     hooks=self.hooks,
                 )
+                # Set default retry policy for activity resolution
+                ctx._app_retry_policy = self.default_retry_policy
 
                 # Execute compensations to clean up
                 print(f"[Cancel] Executing compensations for {instance_id}")
@@ -753,6 +764,8 @@ class ReplayEngine:
                     is_replaying=False,
                     hooks=self.hooks,
                 )
+                # Set default retry policy for activity resolution
+                ctx._app_retry_policy = self.default_retry_policy
 
                 # Re-execute compensations (idempotent - skips already executed)
                 print(f"[ResumeCompensating] Re-executing compensations for {instance_id}")

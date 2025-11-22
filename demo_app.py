@@ -1,4 +1,4 @@
-"""Demo Kairo ASGI application for tsuno."""
+"""Demo Edda ASGI application for tsuno."""
 
 import os
 from datetime import datetime
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from edda import (
     EddaApp,
+    RetryPolicy,
     WorkflowContext,
     activity,
     compensation,
@@ -399,9 +400,29 @@ async def reserve_inventory(
     )
 
 
-@activity
+@activity(
+    retry_policy=RetryPolicy(
+        max_attempts=10,  # More attempts for critical payment operations
+        initial_interval=0.5,  # Faster initial retry (0.5 seconds)
+        backoff_coefficient=1.5,  # Slower exponential growth
+        max_interval=30.0,  # Cap at 30 seconds (instead of default 60)
+        max_duration=120.0,  # Stop after 2 minutes total
+    )
+)
 async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) -> PaymentResult:  # noqa: ARG001
-    """Process payment (Pydantic integration)"""
+    """
+    Process payment with aggressive retry policy.
+
+    Custom retry configuration for critical payment operations:
+    - 10 max attempts (vs default 5) for higher resilience
+    - 0.5s initial interval (vs default 1s) for faster recovery
+    - 1.5 backoff coefficient (vs default 2.0) for more frequent retries
+    - 30s max interval to avoid long waits
+    - 2 minute total duration to prevent indefinite retry
+
+    This ensures payment gateway timeouts are handled gracefully while
+    preventing revenue loss from transient failures.
+    """
     print(f"[Activity] Processing payment for order: {order_id}, amount: ${amount}")
     return PaymentResult(
         order_id=order_id,

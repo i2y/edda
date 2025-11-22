@@ -120,6 +120,215 @@ async def create_order_with_db(ctx: WorkflowContext, order_id: str):
     return {"order_id": order_id}
 ```
 
+## Retry Policies
+
+Activities automatically retry on failure with exponential backoff. This provides resilience against transient failures like network timeouts or temporary service unavailability.
+
+### Default Retry Behavior
+
+By default, activities retry **5 times** with exponential backoff:
+
+```python
+@activity  # Default: 5 attempts with exponential backoff
+async def call_payment_api(ctx: WorkflowContext, amount: float):
+    response = await payment_service.charge(amount)
+    return {"transaction_id": response.id}
+```
+
+**Default schedule:**
+
+- Attempt 1: Immediate execution
+- Attempt 2: 1 second delay
+- Attempt 3: 2 seconds delay
+- Attempt 4: 4 seconds delay
+- Attempt 5: 8 seconds delay
+
+If all 5 attempts fail, `RetryExhaustedError` is raised.
+
+### Custom Retry Policies
+
+Configure retry behavior per activity using `RetryPolicy`:
+
+```python
+from edda import activity, RetryPolicy
+
+@activity(retry_policy=RetryPolicy(
+    max_attempts=10,           # More attempts for critical operations
+    initial_interval=0.5,      # Faster initial retry (0.5 seconds)
+    backoff_coefficient=1.5,   # Slower exponential growth
+    max_interval=30.0,         # Cap delay at 30 seconds
+    max_duration=120.0         # Stop after 2 minutes total
+))
+async def critical_payment_operation(ctx: WorkflowContext, order_id: str):
+    # This activity retries aggressively (up to 10 times)
+    response = await payment_service.process(order_id)
+    return {"status": response.status}
+```
+
+**RetryPolicy parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_attempts` | `int \| None` | `5` | Maximum retry attempts (`None` = infinite) |
+| `initial_interval` | `float` | `1.0` | First retry delay (seconds) |
+| `backoff_coefficient` | `float` | `2.0` | Exponential backoff multiplier |
+| `max_interval` | `float` | `60.0` | Maximum retry delay (seconds) |
+| `max_duration` | `float \| None` | `300.0` | Maximum total retry time (seconds) |
+
+### Application-Level Default Policy
+
+Set a default retry policy for all activities in your application:
+
+```python
+from edda import EddaApp, RetryPolicy
+
+app = EddaApp(
+    db_url="postgresql://localhost/workflows",
+    default_retry_policy=RetryPolicy(
+        max_attempts=10,
+        initial_interval=2.0,
+        max_interval=120.0
+    )
+)
+```
+
+**Policy resolution order:**
+
+1. Activity-level policy (highest priority)
+2. Application-level policy
+3. Framework default (5 attempts)
+
+### Non-Retryable Errors
+
+Use `TerminalError` for errors that should **never** be retried:
+
+```python
+from edda import activity, TerminalError
+
+@activity
+async def validate_order(ctx: WorkflowContext, order_id: str):
+    order = await db.get_order(order_id)
+
+    if not order:
+        # Don't retry - order doesn't exist
+        raise TerminalError(f"Order {order_id} not found")
+
+    if order.status == "cancelled":
+        # Business rule violation - don't retry
+        raise TerminalError(f"Order {order_id} is cancelled")
+
+    return {"order_id": order_id, "valid": True}
+```
+
+**When to use `TerminalError`:**
+
+- ✅ Validation failures (invalid input, malformed data)
+- ✅ Business rule violations (insufficient funds, order cancelled)
+- ✅ Permanent errors (resource not found, access denied)
+- ❌ Transient errors (network timeout, service unavailable) - let these retry!
+
+### Handling Retry Exhaustion
+
+When all retry attempts fail, `RetryExhaustedError` is raised:
+
+```python
+from edda import workflow, activity, RetryExhaustedError
+
+@workflow
+async def order_processing(ctx: WorkflowContext, order_id: str):
+    try:
+        # Activity retries automatically (5 attempts by default)
+        payment = await charge_customer(ctx, order_id)
+    except RetryExhaustedError as e:
+        # All retry attempts failed - handle gracefully
+        await notify_admin(ctx, order_id, error=str(e))
+        await cancel_order(ctx, order_id)
+        raise  # Re-raise to fail the workflow
+
+    return {"status": "completed"}
+```
+
+**`RetryExhaustedError` provides:**
+
+- Original exception via `__cause__` (exception chaining)
+- Retry metadata (total attempts, duration)
+- All error messages from failed attempts
+
+### Retry Metadata
+
+Retry information is automatically recorded in workflow history for observability:
+
+```python
+{
+    "event_type": "ActivityCompleted",
+    "event_data": {
+        "activity_name": "call_payment_api",
+        "result": {"transaction_id": "txn_123"},
+        "retry_metadata": {
+            "total_attempts": 3,
+            "total_duration_ms": 7200,
+            "exhausted": false,
+            "last_error": {
+                "error_type": "ConnectionError",
+                "message": "Network timeout"
+            },
+            "errors": [
+                {"attempt": 1, "error_type": "ConnectionError", ...},
+                {"attempt": 2, "error_type": "ConnectionError", ...}
+            ]
+        }
+    }
+}
+```
+
+**Use retry metadata for:**
+
+- 📊 Monitoring retry patterns and failure rates
+- 🐛 Debugging transient failures
+- ⚡ Performance analysis (identifying slow external services)
+- 🚨 Alerting on high retry rates
+
+### Preset Retry Policies
+
+Edda provides preset policies for common scenarios:
+
+```python
+from edda.retry import AGGRESSIVE_RETRY, CONSERVATIVE_RETRY, INFINITE_RETRY
+
+# Fast retries for low-latency services
+@activity(retry_policy=AGGRESSIVE_RETRY)
+async def fast_api_call(ctx: WorkflowContext, url: str):
+    # 10 attempts, 0.1s initial delay, 1 minute max
+    pass
+
+# Slow retries for rate-limited APIs
+@activity(retry_policy=CONSERVATIVE_RETRY)
+async def rate_limited_api(ctx: WorkflowContext, endpoint: str):
+    # 3 attempts, 5s initial delay, 15 minutes max
+    pass
+
+# Infinite retries (Restate-style, use with caution)
+@activity(retry_policy=INFINITE_RETRY)
+async def critical_operation(ctx: WorkflowContext, data: dict):
+    # Retries forever until success
+    # Warning: Only use for truly critical operations
+    pass
+```
+
+### Best Practices
+
+1. **Use default retry for most activities** - The default policy (5 attempts, exponential backoff) handles most transient failures
+
+2. **Use `TerminalError` for permanent failures** - Don't waste time retrying validation errors or business rule violations
+
+3. **Customize retry for critical operations** - Payment processing, data consistency operations may need more aggressive retry
+
+4. **Monitor retry metadata** - High retry rates indicate systemic issues (e.g., unreliable external service)
+
+5. **Handle `RetryExhaustedError` gracefully** - Implement fallback logic (notifications, compensations) when retries fail
+
+6. **Avoid infinite retry in production** - Use finite `max_attempts` and `max_duration` to prevent runaway retries
+
 ## Activity IDs and Deterministic Replay
 
 Edda automatically assigns IDs to activities for deterministic replay after crashes. Understanding when to use manual IDs vs. auto-generated IDs is important.
@@ -197,8 +406,6 @@ result2 = await activity_two(ctx, data)
 result1 = await activity_one(ctx, data, activity_id="activity_one:1")
 result2 = await activity_two(ctx, data, activity_id="activity_two:1")
 ```
-
-For more details, see [MIGRATION_GUIDE_ACTIVITY_ID.md](../../MIGRATION_GUIDE_ACTIVITY_ID.md).
 
 ## Workflow vs. Activity: When to Use Which?
 

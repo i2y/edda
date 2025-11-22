@@ -15,6 +15,7 @@ import pytest_asyncio
 
 from edda.activity import activity
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
 from edda.replay import ReplayEngine
 from edda.workflow import Workflow, set_replay_engine, workflow
 
@@ -156,7 +157,8 @@ class TestSagaStart:
 
         @activity
         async def failing_step(ctx: WorkflowContext) -> dict:
-            raise ValueError("Step failed")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("Step failed")
 
         @workflow
         async def failing_saga(ctx: WorkflowContext) -> dict:
@@ -164,7 +166,7 @@ class TestSagaStart:
             return {}
 
         # Should raise the error after marking workflow as failed
-        with pytest.raises(ValueError, match="Step failed"):
+        with pytest.raises(TerminalError, match="Step failed"):
             await failing_saga.start()
 
     async def test_saga_start_without_engine_raises_error(self):
@@ -311,7 +313,8 @@ class TestSagaResume:
 
         @activity
         async def failing_step(ctx: WorkflowContext) -> dict:
-            raise RuntimeError("Resume failed")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("Resume failed")
 
         @workflow
         async def paused_saga(ctx: WorkflowContext, initial: str) -> dict:
@@ -320,7 +323,7 @@ class TestSagaResume:
             return {}
 
         # Should raise the error after marking workflow as failed
-        with pytest.raises(RuntimeError, match="Resume failed"):
+        with pytest.raises(TerminalError, match="Resume failed"):
             await paused_saga.resume(instance_id=paused_workflow_instance, event=None)
 
         # Verify workflow was marked as failed
@@ -333,7 +336,7 @@ class TestSagaResume:
         assert "error_type" in output_data
         assert "stack_trace" in output_data
         assert "Resume failed" in output_data["error_message"]
-        assert output_data["error_type"] == "RuntimeError"
+        assert output_data["error_type"] == "TerminalError"
 
     async def test_saga_resume_without_engine_raises_error(self):
         """Test that resuming workflow without engine raises error."""

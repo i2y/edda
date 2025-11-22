@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda.activity import activity
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
 from edda.outbox.transactional import send_event_transactional
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
@@ -218,9 +219,9 @@ async def test_context_transaction_rollback_on_error(context):
                 event_data={"test": "data"},
             )
 
-            # Simulate an error
-            raise ValueError("Test error")
-    except ValueError:
+            # Simulate an error (TerminalError is never retried)
+            raise TerminalError("Test error")
+    except TerminalError:
         pass
 
     assert not context.storage.in_transaction()
@@ -269,12 +270,12 @@ async def test_activity_transaction_rollback(context):
             event_data={"value": value},
         )
 
-        # Simulate an error
-        raise ValueError("Activity failed")
+        # Simulate an error (TerminalError is never retried)
+        raise TerminalError("Activity failed")
 
     assert not context.storage.in_transaction()
 
-    with pytest.raises(ValueError, match="Activity failed"):
+    with pytest.raises(TerminalError, match="Activity failed"):
         await failing_activity(context, 123)
 
     assert not context.storage.in_transaction()
@@ -352,10 +353,10 @@ async def test_atomic_rollback(context):
             event_data={"value": value},
         )
 
-        # Simulate error after sending event
-        raise RuntimeError("Something went wrong")
+        # Simulate error after sending event (TerminalError is never retried)
+        raise TerminalError("Something went wrong")
 
-    with pytest.raises(RuntimeError, match="Something went wrong"):
+    with pytest.raises(TerminalError, match="Something went wrong"):
         await failing_activity(context, 42)
 
     # Verify rollback behavior

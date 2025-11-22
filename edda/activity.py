@@ -6,12 +6,15 @@ within workflows. Activities are the building blocks of Sagas and support
 deterministic replay through result caching.
 """
 
+import asyncio
 import functools
 import inspect
+import time
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
 from edda.context import WorkflowContext
+from edda.exceptions import RetryExhaustedError, TerminalError, WorkflowCancelledException
 from edda.pydantic_utils import (
     enum_value_to_enum,
     extract_enum_from_annotation,
@@ -19,6 +22,7 @@ from edda.pydantic_utils import (
     from_json_dict,
     to_json_dict,
 )
+from edda.retry import RetryMetadata
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -28,25 +32,29 @@ class Activity:
     Wrapper class for activity functions.
 
     Handles execution, result caching during replay, and history recording.
+    Supports automatic retry with exponential backoff.
     """
 
-    def __init__(self, func: Callable[..., Any]):
+    def __init__(self, func: Callable[..., Any], retry_policy: "RetryPolicy | None" = None):
         """
         Initialize activity wrapper.
 
         Args:
             func: The async function to wrap
+            retry_policy: Optional retry policy for this activity.
+                         If None, uses the default policy from EddaApp.
         """
         self.func = func
         self.name = func.__name__
+        self.retry_policy = retry_policy
         functools.update_wrapper(self, func)
 
     async def __call__(self, ctx: WorkflowContext, *args: Any, **kwargs: Any) -> Any:
         """
-        Execute the activity.
+        Execute the activity with automatic retry.
 
         During replay, returns cached result. During normal execution,
-        executes the function and records the result.
+        executes the function with retry logic and records the result.
 
         Args:
             ctx: Workflow context
@@ -62,7 +70,10 @@ class Activity:
             Activity result
 
         Raises:
-            Any exception raised by the activity function
+            RetryExhaustedError: When all retry attempts are exhausted
+            TerminalError: For non-retryable errors
+            WorkflowCancelledException: When workflow is cancelled
+            Any exception raised by the activity function (if retry policy allows)
 
         Example:
             Sequential execution (auto-generated IDs - recommended)::
@@ -90,8 +101,6 @@ class Activity:
         # Check if workflow has been cancelled
         instance = await ctx._get_instance()
         if instance and instance.get("status") == "cancelled":
-            from edda.exceptions import WorkflowCancelledException
-
             raise WorkflowCancelledException(f"Workflow {ctx.instance_id} has been cancelled")
 
         # Check if we're replaying and have a cached result
@@ -139,42 +148,111 @@ class Activity:
                 # Return cached successful result
                 return restored_result
 
-        # Execute activity in transaction for atomic operations
-        # Note: If the activity fails, we record the failure OUTSIDE the transaction
-        # to ensure the failure history is saved for observability
-        try:
-            async with ctx.transaction():
-                return await self._execute_and_record(ctx, activity_id, args, kwargs)
-        except Exception as error:
-            # Activity failed - check if this is a cancellation exception
-            from edda.exceptions import WorkflowCancelledException
+        # Resolve retry policy (activity-level > app-level > default)
+        retry_policy = self._resolve_retry_policy(ctx)
 
-            if isinstance(error, WorkflowCancelledException):
-                # Re-raise cancellation without additional handling
+        # Retry loop (OUTSIDE transaction - each attempt is independent)
+        attempt = 0
+        start_time = time.time()
+        retry_metadata = RetryMetadata()
+        last_error: Exception | None = None
+
+        while True:
+            attempt += 1
+
+            try:
+                # Execute activity in transaction (one attempt)
+                async with ctx.transaction():
+                    # Calculate retry metadata if there were retries
+                    retry_meta = None
+                    if attempt > 1:
+                        retry_metadata.total_duration_ms = int((time.time() - start_time) * 1000)
+                        retry_metadata.total_attempts = attempt  # Update attempt count on success
+                        retry_meta = retry_metadata
+
+                    result = await self._execute_and_record(ctx, activity_id, args, kwargs, retry_meta)
+                    return result
+
+            except WorkflowCancelledException:
+                # Never retry cancellation
                 raise
 
-            # For other exceptions, check if failure was already recorded
-            # (it would have been recorded inside the transaction, but then rolled back)
-            # We need to re-record it outside the transaction for observability
+            except TerminalError as error:
+                # Never retry terminal errors, but record the failure
+                input_data = {
+                    "args": [to_json_dict(arg) for arg in args],
+                    "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
+                }
+                # Record failure (no retry metadata for terminal errors)
+                await ctx._record_activity_failed(
+                    activity_id, self.name, error, input_data, retry_metadata=None
+                )
 
-            # Capture input parameters for recording
-            input_data = {
-                "args": [to_json_dict(arg) for arg in args],
-                "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
-            }
+                # Call hook: activity failed
+                if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
+                    await ctx.hooks.on_activity_failed(
+                        ctx.instance_id, activity_id, self.name, error
+                    )
 
-            # Record failure outside transaction (ensures it's saved)
-            await ctx._record_activity_failed(activity_id, self.name, error, input_data)
+                # Re-raise immediately (no retry)
+                raise
 
-            # Call hook: activity failed
-            if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
-                await ctx.hooks.on_activity_failed(ctx.instance_id, activity_id, self.name, error)
+            except Exception as error:
+                last_error = error
 
-            # Re-raise the error
-            raise
+                # Record this attempt in metadata
+                retry_metadata.add_attempt(attempt, error)
+
+                # Check if should retry
+                should_retry, reason = self._should_retry(
+                    retry_policy, error, attempt, start_time, retry_metadata
+                )
+
+                if not should_retry:
+                    # Exhausted retries - mark metadata as exhausted
+                    retry_metadata.exhausted = True
+                    retry_metadata.total_duration_ms = int((time.time() - start_time) * 1000)
+
+                    # Record failure with retry metadata outside transaction
+                    input_data = {
+                        "args": [to_json_dict(arg) for arg in args],
+                        "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
+                    }
+                    # Include retry metadata in the failure record
+                    await ctx._record_activity_failed(
+                        activity_id, self.name, error, input_data, retry_metadata
+                    )
+
+                    # Call hook: activity failed
+                    if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
+                        await ctx.hooks.on_activity_failed(
+                            ctx.instance_id, activity_id, self.name, error
+                        )
+
+                    # Raise RetryExhaustedError with original exception as cause
+                    raise RetryExhaustedError(
+                        f"Activity {self.name} failed after {attempt} attempts: {reason}"
+                    ) from last_error
+
+                # Calculate backoff delay
+                delay = retry_policy.calculate_delay(attempt)
+
+                # Call hook: activity retry
+                if ctx.hooks and hasattr(ctx.hooks, "on_activity_retry"):
+                    await ctx.hooks.on_activity_retry(
+                        ctx.instance_id, activity_id, self.name, error, attempt, delay
+                    )
+
+                # Wait before next retry
+                await asyncio.sleep(delay)
 
     async def _execute_and_record(
-        self, ctx: WorkflowContext, activity_id: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        ctx: WorkflowContext,
+        activity_id: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        retry_metadata: Any = None,
     ) -> Any:
         """
         Execute activity function and record the result.
@@ -188,6 +266,7 @@ class Activity:
             activity_id: Activity ID
             args: Positional arguments for the activity
             kwargs: Keyword arguments for the activity
+            retry_metadata: Optional retry metadata (RetryMetadata instance)
 
         Returns:
             Activity result
@@ -212,7 +291,9 @@ class Activity:
         # Record successful completion with input data
         # Always record when we actually execute, even during replay
         # (if we're here, it means there was no cached result)
-        await ctx._record_activity_completed(activity_id, self.name, result_for_storage, input_data)
+        await ctx._record_activity_completed(
+            activity_id, self.name, result_for_storage, input_data, retry_metadata
+        )
 
         # Auto-register compensation if @on_failure decorator is present
         if hasattr(self.func, "_compensation_func") and hasattr(self.func, "_has_compensation"):
@@ -267,21 +348,92 @@ class Activity:
         # Auto-generate ID using context's generator
         return ctx._generate_activity_id(self.name)
 
+    def _resolve_retry_policy(self, ctx: WorkflowContext) -> "RetryPolicy":
+        """
+        Resolve retry policy with priority: activity-level > app-level > default.
 
-def activity(func: F | None = None) -> F | Callable[[F], F]:
+        Args:
+            ctx: Workflow context
+
+        Returns:
+            Resolved retry policy
+        """
+        from edda.retry import DEFAULT_RETRY_POLICY
+
+        # Priority 1: Activity-level policy (specified in @activity decorator)
+        if self.retry_policy is not None:
+            return self.retry_policy
+
+        # Priority 2: App-level policy (EddaApp default_retry_policy)
+        # Note: This will be implemented in Phase 5 (edda/app.py)
+        if hasattr(ctx, "_app_retry_policy") and ctx._app_retry_policy is not None:
+            return ctx._app_retry_policy
+
+        # Priority 3: Framework default
+        return DEFAULT_RETRY_POLICY
+
+    def _should_retry(
+        self,
+        retry_policy: "RetryPolicy",
+        error: Exception,
+        attempt: int,
+        start_time: float,
+        retry_metadata: "RetryMetadata",
+    ) -> tuple[bool, str]:
+        """
+        Determine if the activity should be retried.
+
+        Args:
+            retry_policy: Retry policy configuration
+            error: Exception that caused the failure
+            attempt: Current attempt number (1-indexed)
+            start_time: Start time of the first attempt (Unix timestamp)
+            retry_metadata: Retry metadata for observability
+
+        Returns:
+            Tuple of (should_retry: bool, reason: str)
+            - should_retry: True if retry should be attempted, False otherwise
+            - reason: Human-readable reason for the decision
+        """
+        import time
+
+        # Check if error is retryable according to policy
+        if not retry_policy.is_retryable(error):
+            return False, f"Error type {type(error).__name__} is not retryable"
+
+        # Check max_attempts limit
+        if retry_policy.max_attempts is not None and attempt >= retry_policy.max_attempts:
+            return False, f"Max attempts ({retry_policy.max_attempts}) reached"
+
+        # Check max_duration limit
+        if retry_policy.max_duration is not None:
+            elapsed = time.time() - start_time
+            if elapsed >= retry_policy.max_duration:
+                return (
+                    False,
+                    f"Max duration ({retry_policy.max_duration}s) exceeded (elapsed: {elapsed:.1f}s)",
+                )
+
+        # Should retry
+        return True, f"Will retry (attempt {attempt + 1})"
+
+
+def activity(
+    func: F | None = None, *, retry_policy: "RetryPolicy | None" = None
+) -> F | Callable[[F], F]:
     """
-    Decorator for defining activities (atomic units of work).
+    Decorator for defining activities (atomic units of work) with automatic retry.
 
     Activities are async functions that take a WorkflowContext as the first
     parameter, followed by any other parameters.
 
     Activities are automatically wrapped in a transaction, ensuring that
     activity execution, history recording, and event sending are atomic.
+    Each retry attempt is executed in an independent transaction.
 
-    When using ctx.use_session() to share an external database session, the
-    external session takes priority and all operations (activity execution,
-    history recording, event sending) use that shared session, ensuring
-    atomicity across your database and Edda's database.
+    When using ctx.session to access the Edda-managed session, all operations
+    (activity execution, history recording, event sending) use that shared session,
+    ensuring atomicity within a single transaction.
 
     For non-idempotent operations (e.g., external API calls), place them in
     Activities to leverage result caching during replay. For operations that
@@ -289,29 +441,43 @@ def activity(func: F | None = None) -> F | Callable[[F], F]:
     Workflow function.
 
     Example:
-        >>> @activity
+        >>> @activity  # Uses default retry policy (5 attempts, exponential backoff)
         ... async def reserve_inventory(ctx: WorkflowContext, order_id: str) -> dict:
         ...     # Your business logic here
         ...     return {"reservation_id": "123"}
 
-        >>> @activity  # Works with ctx.use_session() for atomic operations
+        >>> from edda.retry import RetryPolicy, AGGRESSIVE_RETRY
+        >>> @activity(retry_policy=AGGRESSIVE_RETRY)  # Custom retry policy
         ... async def process_payment(ctx: WorkflowContext, amount: float) -> dict:
-        ...     session = AsyncSession(your_engine)
-        ...     ctx.use_session(session)  # External session takes priority
-        ...     # Your DB operations + Edda's operations = single transaction
-        ...     # Edda automatically commits (or rolls back on exception)
+        ...     # Fast retries for low-latency services
         ...     return {"status": "completed"}
 
         >>> @activity  # Non-idempotent operations cached during replay
         ... async def charge_credit_card(ctx: WorkflowContext, amount: float) -> dict:
         ...     # External API call - result is cached, won't be called again on replay
+        ...     # If this fails, automatic retry with exponential backoff
         ...     return {"transaction_id": "txn_123"}
+
+        >>> from edda.exceptions import TerminalError
+        >>> @activity
+        ... async def validate_user(ctx: WorkflowContext, user_id: str) -> dict:
+        ...     user = await fetch_user(user_id)
+        ...     if not user:
+        ...         # Don't retry - user doesn't exist
+        ...         raise TerminalError(f"User {user_id} not found")
+        ...     return {"user_id": user_id, "name": user.name}
 
     Args:
         func: Async function to wrap as an activity
+        retry_policy: Optional retry policy for this activity.
+                     If None, uses the default policy from EddaApp.
 
     Returns:
         Decorated function that can be called within a workflow
+
+    Raises:
+        RetryExhaustedError: When all retry attempts are exhausted
+        TerminalError: For non-retryable errors (no retry attempted)
     """
 
     def decorator(f: F) -> F:
@@ -319,8 +485,8 @@ def activity(func: F | None = None) -> F | Callable[[F], F]:
         if not inspect.iscoroutinefunction(f):
             raise TypeError(f"Activity {f.__name__} must be an async function")
 
-        # Create the Activity wrapper
-        activity_wrapper = Activity(f)
+        # Create the Activity wrapper with retry policy
+        activity_wrapper = Activity(f, retry_policy=retry_policy)
 
         # Mark as activity for introspection
         activity_wrapper._is_activity = True  # type: ignore[attr-defined]
@@ -328,9 +494,9 @@ def activity(func: F | None = None) -> F | Callable[[F], F]:
         # Return the wrapper cast to the original type
         return cast(F, activity_wrapper)
 
-    # Support @activity syntax (no parameters supported anymore)
+    # Support both @activity and @activity(retry_policy=...)
     if func is None:
-        # This should not happen anymore, but keep for compatibility
+        # Called with arguments: @activity(retry_policy=...)
         return decorator
     else:
         # Called without arguments: @activity

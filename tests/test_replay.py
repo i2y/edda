@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from edda.activity import activity
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
 from edda.replay import ReplayEngine
 
 
@@ -117,10 +118,11 @@ class TestReplayEngineBasic:
         """Test that workflow errors are handled properly."""
 
         async def failing_workflow(_ctx: WorkflowContext) -> dict:
-            raise ValueError("Workflow error")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("Workflow error")
 
         # Should raise the error after marking workflow as failed
-        with pytest.raises(ValueError, match="Workflow error"):
+        with pytest.raises(TerminalError, match="Workflow error"):
             await replay_engine.start_workflow(
                 workflow_name="failing_workflow",
                 workflow_func=failing_workflow,
@@ -158,8 +160,8 @@ class TestReplayEngineBasic:
         assert "stack_trace" in output_data
 
         assert output_data["error_message"] == "Workflow error"
-        assert output_data["error_type"] == "ValueError"
-        assert "ValueError: Workflow error" in output_data["stack_trace"]
+        assert output_data["error_type"] == "TerminalError"
+        assert "TerminalError: Workflow error" in output_data["stack_trace"]
         assert "failing_workflow" in output_data["stack_trace"]
 
     async def test_start_workflow_releases_lock_on_completion(self, replay_engine, sqlite_storage):
@@ -326,7 +328,8 @@ class TestReplayEngineResume:
 
         @activity
         async def failing_activity(_ctx: WorkflowContext) -> dict:
-            raise ValueError("Resume error")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("Resume error")
 
         async def test_workflow(_ctx: WorkflowContext, name: str) -> dict:
             await activity1(_ctx)
@@ -335,7 +338,7 @@ class TestReplayEngineResume:
             return {}
 
         # Should raise the error after marking workflow as failed
-        with pytest.raises(ValueError, match="Resume error"):
+        with pytest.raises(TerminalError, match="Resume error"):
             await replay_engine.resume_workflow(
                 instance_id=completed_workflow_instance,
                 workflow_func=test_workflow,
@@ -352,7 +355,7 @@ class TestReplayEngineResume:
         assert "error_type" in output_data
         assert "stack_trace" in output_data
         assert "Resume error" in output_data["error_message"]
-        assert output_data["error_type"] == "ValueError"
+        assert output_data["error_type"] == "TerminalError"
 
     async def test_resume_workflow_releases_lock(
         self, replay_engine, completed_workflow_instance, sqlite_storage
@@ -474,9 +477,10 @@ class TestReplayEngineLocking:
         )
 
         async def failing_func(_ctx: WorkflowContext) -> dict:
-            raise ValueError("Execution error")
+            # TerminalError is never retried and propagates immediately
+            raise TerminalError("Execution error")
 
-        with pytest.raises(ValueError, match="Execution error"):
+        with pytest.raises(TerminalError, match="Execution error"):
             await replay_engine.execute_with_lock(
                 instance_id=instance_id,
                 workflow_func=failing_func,

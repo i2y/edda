@@ -247,4 +247,3 @@ This flexibility allows:
 
 - **[Setup Guide](setup.md)**: Install and configure Viewer UI
 - **[Examples](../examples/simple.md)**: See Viewer in action with examples
-- **[Pydantic Integration](../../local-docs/pydantic-integration.md)**: Learn about automatic form generation

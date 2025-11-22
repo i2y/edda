@@ -66,6 +66,9 @@ class WorkflowContext:
         # Auto-generation counter for activity IDs (func_name -> call_count)
         self._activity_call_counters: dict[str, int] = {}
 
+        # Default retry policy from EddaApp (set by ReplayEngine)
+        self._app_retry_policy: Any = None
+
     @property
     def storage(self) -> StorageProtocol:
         """
@@ -239,7 +242,12 @@ class WorkflowContext:
         self.executed_activity_ids.add(activity_id)
 
     async def _record_activity_completed(
-        self, activity_id: str, activity_name: str, result: Any, input_data: dict[str, Any] | None = None
+        self,
+        activity_id: str,
+        activity_name: str,
+        result: Any,
+        input_data: dict[str, Any] | None = None,
+        retry_metadata: Any = None,
     ) -> None:
         """
         Record that an activity completed successfully (internal use only).
@@ -249,12 +257,18 @@ class WorkflowContext:
             activity_name: Name of the activity
             result: Activity result (must be JSON-serializable)
             input_data: Activity input parameters (args and kwargs)
+            retry_metadata: Optional retry metadata (RetryMetadata instance)
         """
         event_data: dict[str, Any] = {
             "activity_name": activity_name,
             "result": result,
             "input": input_data or {},
         }
+
+        # Include retry metadata if provided
+        if retry_metadata is not None:
+            event_data["retry_metadata"] = retry_metadata.to_dict()
+
         await self.storage.append_history(
             self.instance_id,
             activity_id=activity_id,
@@ -271,6 +285,7 @@ class WorkflowContext:
         activity_name: str,
         error: Exception,
         input_data: dict[str, Any] | None = None,
+        retry_metadata: Any = None,
     ) -> None:
         """
         Record that an activity failed (internal use only).
@@ -280,23 +295,30 @@ class WorkflowContext:
             activity_name: Name of the activity
             error: The exception that was raised
             input_data: Activity input parameters (args and kwargs)
+            retry_metadata: Optional retry metadata (RetryMetadata instance)
         """
         import traceback
 
         # Capture full stack trace
         stack_trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
+        event_data: dict[str, Any] = {
+            "activity_name": activity_name,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "stack_trace": stack_trace,
+            "input": input_data or {},
+        }
+
+        # Include retry metadata if provided
+        if retry_metadata is not None:
+            event_data["retry_metadata"] = retry_metadata.to_dict()
+
         await self.storage.append_history(
             self.instance_id,
             activity_id=activity_id,
             event_type="ActivityFailed",
-            event_data={
-                "activity_name": activity_name,
-                "error_type": type(error).__name__,
-                "error_message": str(error),
-                "stack_trace": stack_trace,
-                "input": input_data or {},
-            },
+            event_data=event_data,
         )
 
     async def _get_instance(self) -> dict[str, Any] | None:

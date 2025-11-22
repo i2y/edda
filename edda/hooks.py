@@ -139,6 +139,31 @@ class WorkflowHooks(Protocol):
         """
         ...
 
+    async def on_activity_retry(
+        self,
+        instance_id: str,
+        activity_id: str,
+        activity_name: str,
+        error: Exception,
+        attempt: int,
+        delay: float,
+    ) -> None:
+        """
+        Called when an activity is about to be retried after a failure.
+
+        This hook is called BEFORE the retry delay (asyncio.sleep), allowing
+        observability tools to track retry attempts in real-time.
+
+        Args:
+            instance_id: Unique workflow instance ID
+            activity_id: Activity ID (e.g., "my_activity:1")
+            activity_name: Name of the activity function
+            error: Exception that caused the failure
+            attempt: Current attempt number (1-indexed, before retry)
+            delay: Backoff delay in seconds before the next retry
+        """
+        ...
+
     async def on_event_sent(
         self,
         event_type: str,
@@ -228,6 +253,17 @@ class HooksBase(WorkflowHooks, ABC):
         step: int,
         activity_name: str,
         error: Exception,
+    ) -> None:
+        pass
+
+    async def on_activity_retry(
+        self,
+        instance_id: str,
+        activity_id: str,
+        activity_name: str,
+        error: Exception,
+        attempt: int,
+        delay: float,
     ) -> None:
         pass
 

@@ -262,6 +262,98 @@ async def long_running_workflow(ctx: WorkflowContext, user_id: str):
 - Workflows can survive **arbitrary crashes**
 - No manual checkpoint management required
 
+### Automatic Activity Retry
+
+Activities automatically retry with exponential backoff when errors occur, improving reliability without manual error handling:
+
+```python
+from edda import activity, WorkflowContext
+
+@activity
+async def call_external_api(ctx: WorkflowContext, url: str):
+    # Automatically retries up to 5 times with exponential backoff
+    # Delays: 1s, 2s, 4s, 8s, 16s
+    response = await httpx.get(url, timeout=10)
+    return response.json()
+```
+
+**Default retry policy**:
+- **5 attempts** (including initial)
+- **Exponential backoff**: 1s, 2s, 4s, 8s, 16s between attempts
+- **Max delay**: 60 seconds
+- **Total duration**: 5 minutes maximum
+
+**Custom retry policies** for specific activities:
+
+```python
+from edda import activity, RetryPolicy, WorkflowContext
+
+@activity(retry_policy=RetryPolicy(
+    max_attempts=3,
+    initial_interval=0.5,
+    backoff_coefficient=2.0,
+    max_interval=10.0,
+    max_duration=60.0
+))
+async def flaky_operation(ctx: WorkflowContext, data: dict):
+    # Custom: 3 attempts, delays 0.5s, 1s, 2s
+    return await external_service.process(data)
+```
+
+**Application-level default policy**:
+
+```python
+from edda import EddaApp, RetryPolicy
+
+app = EddaApp(
+    db_url="sqlite:///workflow.db",
+    default_retry_policy=RetryPolicy(
+        max_attempts=10,
+        initial_interval=2.0
+    )
+)
+```
+
+**Non-retryable errors** with `TerminalError`:
+
+```python
+from edda import activity, TerminalError, WorkflowContext
+
+@activity
+async def validate_user(ctx: WorkflowContext, user_id: str):
+    user = await get_user(user_id)
+    if user is None:
+        # Immediately fail without retry (user doesn't exist)
+        raise TerminalError(f"User {user_id} not found")
+    return user
+```
+
+**Retry metadata for observability**:
+
+Retry information is automatically embedded in activity history for monitoring:
+
+```python
+{
+    "event_type": "ActivityCompleted",
+    "event_data": {
+        "activity_name": "call_external_api",
+        "result": {...},
+        "retry_metadata": {
+            "total_attempts": 3,
+            "total_duration_ms": 7200,
+            "last_error": {...},
+            "exhausted": False,
+            "errors": [...]
+        }
+    }
+}
+```
+
+**Policy resolution order**:
+1. Activity-level policy (`@activity(retry_policy=...)`)
+2. Application-level policy (`EddaApp(default_retry_policy=...)`)
+3. Framework default (5 attempts, exponential backoff)
+
 ### Compensation (Saga Pattern)
 
 When a workflow fails, Edda automatically executes compensation functions for **already-executed activities in reverse order**. This implements the Saga pattern for distributed transaction rollback.

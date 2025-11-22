@@ -14,6 +14,8 @@ import pytest_asyncio
 
 from edda.activity import Activity, activity
 from edda.context import WorkflowContext
+from edda.exceptions import TerminalError
+from edda.retry import RetryPolicy
 
 
 @pytest.mark.asyncio
@@ -303,9 +305,10 @@ class TestActivityErrorHandling:
 
         @activity
         async def failing_activity(ctx: WorkflowContext) -> dict:
-            raise ValueError("Test error")
+            # TerminalError is never retried and propagates original exception
+            raise TerminalError("Test error")
 
-        with pytest.raises(ValueError, match="Test error"):
+        with pytest.raises(TerminalError, match="Test error"):
             await failing_activity(context)
 
     async def test_activity_error_records_history(self, context, sqlite_storage, workflow_instance):
@@ -313,9 +316,10 @@ class TestActivityErrorHandling:
 
         @activity
         async def failing_activity(ctx: WorkflowContext) -> dict:
-            raise RuntimeError("Activity failed")
+            # TerminalError is never retried and propagates original exception
+            raise TerminalError("Activity failed")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TerminalError):
             await failing_activity(context, activity_id="failing_activity:1")
 
         # Verify failure was recorded
@@ -326,14 +330,14 @@ class TestActivityErrorHandling:
         assert event["activity_id"] == "failing_activity:1"
         assert event["event_type"] == "ActivityFailed"
         assert event["event_data"]["activity_name"] == "failing_activity"
-        assert event["event_data"]["error_type"] == "RuntimeError"
+        assert event["event_data"]["error_type"] == "TerminalError"
         assert event["event_data"]["error_message"] == "Activity failed"
 
         # Verify stack trace was recorded
         assert "stack_trace" in event["event_data"]
         stack_trace = event["event_data"]["stack_trace"]
-        assert "RuntimeError: Activity failed" in stack_trace
-        assert "raise RuntimeError" in stack_trace  # Should contain the line that raised
+        assert "TerminalError: Activity failed" in stack_trace
+        assert "raise TerminalError" in stack_trace  # Should contain the line that raised
 
     async def test_activity_replay_cached_error(self, sqlite_storage, create_test_instance):
         """Test that replayed activities re-raise cached errors."""
@@ -382,9 +386,10 @@ class TestActivityErrorHandling:
 
         @activity
         async def failing_activity(ctx: WorkflowContext) -> dict:
-            raise ValueError("Error")
+            # TerminalError is never retried and propagates original exception
+            raise TerminalError("Error")
 
-        with pytest.raises(ValueError):
+        with pytest.raises(TerminalError):
             await failing_activity(context, activity_id="failing_activity:1")
 
         # Activity ID should be tracked even though it failed
@@ -399,13 +404,14 @@ class TestActivityErrorHandling:
         @activity
         async def nested_failing_activity(ctx: WorkflowContext) -> dict:
             # Nested function to create a deeper stack trace
+            # TerminalError is never retried and propagates original exception
             def inner_function():
-                raise ValueError("Detailed error message")
+                raise TerminalError("Detailed error message")
 
             inner_function()
             return {}
 
-        with pytest.raises(ValueError):
+        with pytest.raises(TerminalError):
             await nested_failing_activity(context)
 
         # Verify stack trace format
@@ -415,7 +421,7 @@ class TestActivityErrorHandling:
 
         # Stack trace should contain:
         # - Exception type and message
-        assert "ValueError: Detailed error message" in stack_trace
+        assert "TerminalError: Detailed error message" in stack_trace
 
         # - File path
         assert "test_activity.py" in stack_trace

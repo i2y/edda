@@ -185,8 +185,6 @@ payment = json_format.ParseDict(event.data, PaymentCompleted())
 
 **Recommendation**: Use binary mode for production (performance), JSON mode for development (debugging).
 
-For details, see the [Protobuf Integration Guide](../local-docs/protobuf-guide.md).
-
 ## Next Steps
 
 - **[Getting Started](getting-started/installation.md)**: Installation and setup guide

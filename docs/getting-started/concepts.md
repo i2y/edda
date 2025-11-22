@@ -131,6 +131,152 @@ Step 3: Profile setup  # Fresh execution
 
 Steps 0 and 1 are **replayed from history** without re-executing the activities.
 
+## Automatic Activity Retry
+
+Edda automatically retries failed activities with exponential backoff, ensuring resilience against transient failures.
+
+### Default Retry Behavior
+
+By default, activities retry **5 times** with exponential backoff:
+
+```python
+from edda import activity, WorkflowContext
+
+@activity  # Automatically retries 5 times (default)
+async def call_external_api(ctx: WorkflowContext, url: str):
+    response = await http_client.get(url)
+    return {"data": response.json()}
+```
+
+**Default retry schedule:**
+- Attempt 1: Immediate
+- Attempt 2: 1 second delay
+- Attempt 3: 2 seconds delay
+- Attempt 4: 4 seconds delay
+- Attempt 5: 8 seconds delay
+
+### Retry vs. Crash Recovery
+
+**Important distinction:**
+
+| Feature | Retry | Crash Recovery |
+|---------|-------|----------------|
+| **Trigger** | Activity failure | Process crash |
+| **Scope** | Single activity | Entire workflow |
+| **Speed** | Immediate (seconds) | After lock timeout (5 minutes) |
+| **Use case** | Transient errors | Infrastructure failures |
+
+**Example:**
+
+```python
+@workflow
+async def resilient_workflow(ctx: WorkflowContext, user_id: str):
+    # Step 1: Call external API (retries automatically on network errors)
+    user_data = await fetch_user_data(ctx, user_id)
+    # ✅ Retry: Immediate exponential backoff (max 5 attempts)
+
+    # 💥 Process crashes here
+
+    # Step 2: Save to database
+    await save_user(ctx, user_data)
+    # ✅ Crash Recovery: Workflow replays from history (Step 1 cached)
+```
+
+### Custom Retry Policy
+
+Configure retry behavior per activity:
+
+```python
+from edda import activity, RetryPolicy
+
+@activity(retry_policy=RetryPolicy(
+    max_attempts=10,           # More attempts for critical operations
+    initial_interval=0.5,      # Faster initial retry
+    backoff_coefficient=1.5,   # Slower exponential growth
+    max_interval=30.0,         # Cap at 30 seconds
+    max_duration=120.0         # Stop retrying after 2 minutes total
+))
+async def critical_payment_api(ctx: WorkflowContext, amount: float):
+    # Retry aggressively for payment operations
+    response = await payment_service.charge(amount)
+    return {"transaction_id": response.id}
+```
+
+### Non-Retryable Errors
+
+Use `TerminalError` for errors that should **not** be retried:
+
+```python
+from edda import activity, TerminalError, WorkflowContext
+
+@activity
+async def validate_user(ctx: WorkflowContext, user_id: str):
+    user = await fetch_user(user_id)
+
+    if not user:
+        # Don't retry - user doesn't exist
+        raise TerminalError(f"User {user_id} not found")
+
+    return {"user_id": user_id, "email": user["email"]}
+```
+
+**When to use `TerminalError`:**
+- Validation failures (invalid input)
+- Business rule violations (insufficient funds)
+- Permanent errors (resource not found)
+
+### Retry Exhaustion
+
+When all retry attempts are exhausted, `RetryExhaustedError` is raised:
+
+```python
+from edda import activity, RetryExhaustedError, WorkflowContext
+
+@workflow
+async def order_workflow(ctx: WorkflowContext, order_id: str):
+    try:
+        # Activity retries up to 5 times
+        payment = await charge_payment(ctx, order_id)
+    except RetryExhaustedError as e:
+        # All 5 attempts failed - execute fallback logic
+        await notify_payment_team(ctx, order_id)
+        raise  # Re-raise to fail the workflow
+```
+
+**`RetryExhaustedError` contains:**
+- Original exception via `__cause__`
+- Retry metadata (total_attempts, total_duration_ms)
+- All error messages from each attempt
+
+### Retry Metadata
+
+Retry information is automatically recorded in workflow history:
+
+```json
+{
+    "event_type": "ActivityCompleted",
+    "event_data": {
+        "activity_name": "call_external_api",
+        "result": {"data": "..."},
+        "retry_metadata": {
+            "total_attempts": 3,
+            "total_duration_ms": 7200,
+            "exhausted": false,
+            "last_error": {
+                "error_type": "ConnectionError",
+                "message": "Network timeout"
+            }
+        }
+    }
+}
+```
+
+**Use retry metadata for:**
+- Observability and monitoring
+- Debugging transient failures
+- Performance analysis
+- Alerting on retry patterns
+
 ## Control Flow in Workflows
 
 Workflows can use standard Python control flow (if statements, loops, etc.), but understanding **deterministic replay** is crucial.
