@@ -1,5 +1,5 @@
 """
-Pytest configuration and fixtures for Kairo tests.
+Pytest configuration and fixtures for Edda tests.
 """
 
 import os
@@ -19,12 +19,12 @@ def get_database_urls() -> dict[str, str]:
     return {
         "sqlite": "sqlite+aiosqlite:///:memory:",
         "postgresql": os.getenv(
-            "KAIRO_TEST_POSTGRES_URL",
-            "postgresql+asyncpg://kairo:kairo_test_password@localhost:5432/kairo_test",
+            "EDDA_TEST_POSTGRES_URL",
+            "postgresql+asyncpg://edda:edda_test_password@localhost:5432/edda_test",
         ),
         "mysql": os.getenv(
-            "KAIRO_TEST_MYSQL_URL",
-            "mysql+aiomysql://kairo:kairo_test_password@localhost:3306/kairo_test",
+            "EDDA_TEST_MYSQL_URL",
+            "mysql+aiomysql://edda:edda_test_password@localhost:3306/edda_test",
         ),
     }
 
@@ -40,6 +40,24 @@ async def db_storage(request):
     db_type = request.param
     db_urls = get_database_urls()
     db_url = db_urls[db_type]
+
+    # Check if required driver is installed
+    if db_type == "postgresql":
+        try:
+            import asyncpg  # noqa: F401
+        except ModuleNotFoundError:
+            pytest.skip(
+                "asyncpg driver not installed. "
+                "Install with: uv sync --extra postgresql"
+            )
+    elif db_type == "mysql":
+        try:
+            import aiomysql  # noqa: F401
+        except ModuleNotFoundError:
+            pytest.skip(
+                "aiomysql driver not installed. "
+                "Install with: uv sync --extra mysql"
+            )
 
     # Try to connect
     engine = create_async_engine(db_url, echo=False)
@@ -99,6 +117,15 @@ async def sqlite_storage():
 @pytest_asyncio.fixture
 async def postgresql_storage():
     """Create a PostgreSQL storage for testing (requires Docker)."""
+    # Check if asyncpg driver is installed
+    try:
+        import asyncpg  # noqa: F401
+    except ModuleNotFoundError:
+        pytest.skip(
+            "asyncpg driver not installed. "
+            "Install with: uv sync --extra postgresql"
+        )
+
     db_urls = get_database_urls()
     engine = create_async_engine(db_urls["postgresql"], echo=False)
     storage = SQLAlchemyStorage(engine)
@@ -138,6 +165,15 @@ async def postgresql_storage():
 @pytest_asyncio.fixture
 async def mysql_storage():
     """Create a MySQL storage for testing (requires Docker)."""
+    # Check if aiomysql driver is installed
+    try:
+        import aiomysql  # noqa: F401
+    except ModuleNotFoundError:
+        pytest.skip(
+            "aiomysql driver not installed. "
+            "Install with: uv sync --extra mysql"
+        )
+
     db_urls = get_database_urls()
     engine = create_async_engine(db_urls["mysql"], echo=False)
     storage = SQLAlchemyStorage(engine)

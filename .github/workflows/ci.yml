@@ -13,6 +13,36 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
 
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: edda
+          POSTGRES_PASSWORD: edda_test_password
+          POSTGRES_DB: edda_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      mysql:
+        image: mysql:9
+        env:
+          MYSQL_ROOT_PASSWORD: root_password
+          MYSQL_DATABASE: edda_test
+          MYSQL_USER: edda
+          MYSQL_PASSWORD: edda_test_password
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+        ports:
+          - 3306:3306
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,11 +53,14 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: uv sync --extra dev
+      - name: Install dependencies (all database drivers)
+        run: uv sync --extra dev --extra postgresql --extra mysql
 
-      - name: Run tests
-        run: uv run pytest
+      - name: Run tests (all databases)
+        env:
+          EDDA_TEST_POSTGRES_URL: postgresql+asyncpg://edda:edda_test_password@localhost:5432/edda_test
+          EDDA_TEST_MYSQL_URL: mysql+aiomysql://edda:edda_test_password@localhost:3306/edda_test
+        run: uv run pytest -v --tb=short
 
       - name: Type check
         run: uv run mypy edda
