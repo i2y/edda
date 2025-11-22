@@ -482,7 +482,7 @@ Edda supports distributed execution, so workflows continue during deployment:
 
 **Database-based exclusive control guarantee:**
 
-Edda's database row locks prevent multiple workers from executing the same workflow instance simultaneously:
+Edda's database-based exclusive control prevents multiple workers from executing the same workflow instance simultaneously:
 
 ```python
 async with workflow_lock(storage, instance_id, worker_id):
@@ -579,7 +579,7 @@ This prevents:
 
 ### Exclusive Control Guarantees
 
-Edda's database row locks prevent concurrent execution:
+Edda's database-based exclusive control prevents concurrent execution:
 
 ```python
 async with workflow_lock(storage, instance_id, worker_id, timeout_seconds=300):
@@ -588,7 +588,6 @@ async with workflow_lock(storage, instance_id, worker_id, timeout_seconds=300):
 ```
 
 Features:
-- **SELECT FOR UPDATE** based locking (database-level)
 - **5-minute timeout** by default (prevents indefinite locks)
 - **Worker ID tracking** (know which worker holds the lock)
 - **Stale lock cleanup** (automatic recovery after crashes)

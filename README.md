@@ -390,7 +390,7 @@ async def order_workflow(ctx: WorkflowContext, item1: str, item2: str):
 
 Multiple workers can safely process workflows using database-based exclusive control. This means:
 
-- Edda uses database row locks (not Redis or ZooKeeper)
+- Edda uses database-based locks (not Redis or ZooKeeper)
 - Each workflow instance runs on only one worker at a time
 - If a worker crashes, another worker automatically resumes
 - No additional infrastructure required
@@ -615,30 +615,7 @@ app = EddaApp(
 
 ## Serialization
 
-Edda supports both **binary (bytes)** and **JSON (dict)** data for event storage and transport, allowing you to choose based on your needs.
-
-### Binary Data Support
-
-For maximum performance and zero storage overhead, Edda stores binary data directly in database BLOB columns:
-
-```python
-from edda import send_event, wait_event
-
-# Send binary data (e.g., Protobuf)
-msg = OrderCreated(order_id="123", amount=99.99)
-await send_event("order.created", "orders", msg.SerializeToString())  # bytes → BLOB
-
-# Receive binary data
-event = await wait_event(ctx, "payment.completed")
-payment = PaymentCompleted()
-payment.ParseFromString(event.data)  # bytes from BLOB
-```
-
-**Benefits**:
-- ✅ Zero storage overhead (100 bytes → 100 bytes, not 133 bytes with base64)
-- ✅ Maximum performance (no encoding/decoding)
-- ✅ Native BLOB storage (SQLite, PostgreSQL, MySQL)
-- ✅ CloudEvents Binary Content Mode compatible
+Edda supports both **JSON (dict)** and **binary (bytes)** data for event storage and transport, allowing you to choose based on your needs.
 
 ### JSON Data Support
 
@@ -663,10 +640,41 @@ payment = json_format.ParseDict(event.data, PaymentCompleted())
 - ✅ Full Viewer UI compatibility
 - ✅ CloudEvents Structured Content Mode compatible
 
-### Recommendation
+### Binary Data Support
 
-- **Production**: Use binary mode for performance and storage efficiency
-- **Development**: Use JSON mode for easier debugging
+For maximum performance and zero storage overhead, Edda stores binary data directly in database BLOB columns:
+
+```python
+from edda import send_event, wait_event
+
+# Send binary data (e.g., Protobuf)
+msg = OrderCreated(order_id="123", amount=99.99)
+await send_event("order.created", "orders", msg.SerializeToString())  # bytes → BLOB
+
+# Receive binary data
+event = await wait_event(ctx, "payment.completed")
+payment = PaymentCompleted()
+payment.ParseFromString(event.data)  # bytes from BLOB
+```
+
+**Benefits**:
+- ✅ Zero storage overhead (100 bytes → 100 bytes, not 133 bytes with base64)
+- ✅ Maximum performance (no encoding/decoding)
+- ✅ Native BLOB storage (SQLite, PostgreSQL, MySQL)
+- ✅ CloudEvents Binary Content Mode compatible
+
+### Choosing Between JSON and Binary Mode
+
+Both modes are equally valid for production use:
+
+- **JSON Mode**: Human-readable, excellent observability, Viewer UI support
+  - Use when debugging, monitoring, and data inspection are priorities
+
+- **Binary Mode**: Zero serialization overhead, smaller storage
+  - Use when payload size or serialization performance are critical
+  - Ideal for high-throughput scenarios (>1000 events/sec)
+
+**Both modes are first-class citizens** - choose based on your specific requirements, not environment.
 
 ## Next Steps
 

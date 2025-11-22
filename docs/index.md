@@ -148,25 +148,9 @@ uv add edda-framework --extra postgresql --extra mysql --extra viewer
 
 ## Serialization
 
-Edda supports both **binary (bytes)** and **JSON (dict)** data for event storage and transport.
+Edda supports both **JSON (dict)** and **binary (bytes)** data for event storage and transport.
 
-### Binary Mode (Production)
-
-For maximum performance and zero storage overhead:
-
-```python
-# Send binary data (e.g., Protobuf)
-msg = OrderCreated(order_id="123", amount=99.99)
-await send_event("order.created", "orders", msg.SerializeToString())  # bytes → BLOB
-
-# Receive binary data
-payment = PaymentCompleted()
-payment.ParseFromString(event.data)  # bytes from BLOB
-```
-
-**Benefits**: Zero overhead (100 bytes → 100 bytes), maximum performance, CloudEvents Binary Content Mode compatible.
-
-### JSON Mode (Development)
+### JSON Mode (Observability-Focused)
 
 For debugging and human-readable logs:
 
@@ -183,7 +167,23 @@ payment = json_format.ParseDict(event.data, PaymentCompleted())
 
 **Benefits**: Human-readable in database and logs, easy debugging, full Viewer UI compatibility.
 
-**Recommendation**: Use binary mode for production (performance), JSON mode for development (debugging).
+### Binary Mode (Performance-Optimized)
+
+For maximum performance and zero storage overhead:
+
+```python
+# Send binary data (e.g., Protobuf)
+msg = OrderCreated(order_id="123", amount=99.99)
+await send_event("order.created", "orders", msg.SerializeToString())  # bytes → BLOB
+
+# Receive binary data
+payment = PaymentCompleted()
+payment.ParseFromString(event.data)  # bytes from BLOB
+```
+
+**Benefits**: Zero overhead (100 bytes → 100 bytes), maximum performance, CloudEvents Binary Content Mode compatible.
+
+**Both modes are production-ready** - choose based on your operational priorities: observability/debugging (JSON) or performance/storage efficiency (Binary).
 
 ## Next Steps
 
