@@ -24,6 +24,7 @@ async def my_workflow(ctx: WorkflowContext, param1: str, param2: int):
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `event_handler` | `bool` | `False` | If `True`, automatically registers as CloudEvents handler |
+| `lock_timeout_seconds` | `int \| None` | `None` | Lock timeout in seconds (uses global default 300s if `None`). See [Lock Timeout Customization](#lock-timeout-customization) |
 
 ### Starting Workflows
 
@@ -328,6 +329,118 @@ async def critical_operation(ctx: WorkflowContext, data: dict):
 5. **Handle `RetryExhaustedError` gracefully** - Implement fallback logic (notifications, compensations) when retries fail
 
 6. **Avoid infinite retry in production** - Use finite `max_attempts` and `max_duration` to prevent runaway retries
+
+## Lock Timeout Customization
+
+Control how long a workflow instance can hold a lock before it's considered stale and automatically released.
+
+### Default Behavior
+
+By default, workflow locks expire after **300 seconds (5 minutes)**. This prevents workflows from holding locks indefinitely if a worker crashes.
+
+### Customization Levels
+
+Lock timeout can be customized at three levels with the following priority (highest to lowest):
+
+#### 1. Runtime Override (Highest Priority)
+
+Specify timeout when starting a workflow:
+
+```python
+# Override timeout for this specific instance
+instance_id = await my_workflow.start(
+    user_id=123,
+    lock_timeout_seconds=900  # 15 minutes
+)
+```
+
+**Use case:** One-off long-running workflows that need more time
+
+#### 2. Decorator-Level Default
+
+Set a default timeout for all instances of a workflow:
+
+```python
+@workflow(lock_timeout_seconds=600)  # 10 minutes
+async def long_running_workflow(ctx: WorkflowContext, data: str):
+    # All instances of this workflow get 10-minute lock timeout
+    result = await some_activity(ctx, data)
+    return result
+```
+
+**Use case:** Workflows that consistently need longer execution time
+
+#### 3. Global Default (Lowest Priority)
+
+If not specified at runtime or decorator level, the global default of **300 seconds (5 minutes)** is used.
+
+### Complete Example
+
+```python
+from edda import workflow, WorkflowContext
+
+# Example 1: Decorator-level timeout (10 minutes)
+@workflow(lock_timeout_seconds=600)
+async def batch_processing(ctx: WorkflowContext, batch_id: str):
+    # This workflow gets 10 minutes by default
+    result = await process_large_batch(ctx, batch_id)
+    return result
+
+# Example 2: Default timeout (5 minutes)
+@workflow
+async def quick_workflow(ctx: WorkflowContext, data: str):
+    # This workflow gets default 5 minutes
+    result = await simple_task(ctx, data)
+    return result
+
+# Usage:
+# Use decorator-level timeout (10 minutes)
+await batch_processing.start(batch_id="batch_123")
+
+# Override to 15 minutes for this specific instance
+await batch_processing.start(
+    batch_id="batch_456",
+    lock_timeout_seconds=900
+)
+
+# Use default timeout (5 minutes)
+await quick_workflow.start(data="hello")
+```
+
+### How It Works
+
+When a workflow acquires a lock:
+
+1. **Calculate expiry time**: `lock_expires_at = current_time + timeout_seconds`
+2. **Store in database**: The absolute expiry time is saved to `lock_expires_at` column
+3. **Background cleanup**: Every 60 seconds, stale locks (`lock_expires_at < now`) are automatically released
+4. **Auto-resume**: Workflows with `status="running"` are automatically resumed after lock release
+
+**Priority resolution:**
+
+```python
+# Pseudo-code showing priority order
+actual_timeout = (
+    runtime_timeout              # 1. Runtime (saga.start(lock_timeout_seconds=X))
+    if runtime_timeout is not None
+    else decorator_timeout       # 2. Decorator (@workflow(lock_timeout_seconds=Y))
+    if decorator_timeout is not None
+    else 300                     # 3. Global default
+)
+```
+
+### Best Practices
+
+1. **Use default (5 minutes) for most workflows** - Sufficient for typical operations
+2. **Use decorator-level for consistently long workflows** - Batch processing, report generation
+3. **Use runtime override sparingly** - Only for exceptional cases that need more time
+4. **Don't set too high** - Higher timeouts delay crash recovery (max 60s to 5min typical range)
+5. **Monitor lock expiry** - If workflows frequently hit timeout, optimize activity execution time
+
+### Related Documentation
+
+- **[Crash Recovery](durable-execution/crash-recovery.md)**: Automatic workflow resumption after crashes
+- **[Replay Mechanism](durable-execution/replay.md)**: How workflows resume from stale locks
 
 ## Activity IDs and Deterministic Replay
 

@@ -108,7 +108,9 @@ In production environments with long-running EddaApp instances:
 - **Crash detection**: Edda's background task checks for stale locks every 60 seconds
 - **Auto-resume**: Crashed workflows are automatically resumed when their lock timeout expires
   - Both normal execution and rollback execution are automatically resumed
-  - Default timeout: 5 minutes (customizable per-workflow with `@workflow(lock_timeout_seconds=XXX)`)
+  - Default timeout: 5 minutes (300 seconds)
+  - Customizable at 3 levels: runtime (`start(lock_timeout_seconds=X)`), decorator (`@workflow(lock_timeout_seconds=Y)`), or global default
+  - See [Lock Timeout Customization](../core-features/workflows-activities.md#lock-timeout-customization) for details
   - Workflows resume from their last checkpoint using deterministic replay
 - **Deterministic replay**: Previously executed activities return cached results from history
 - **Resume from checkpoint**: Only remaining activities execute fresh
