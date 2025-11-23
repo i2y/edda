@@ -1817,3 +1817,9 @@ async def scheduled_order_shipment_workflow(
 # Export as ASGI application
 # No need to manually register event handlers!
 application = app
+
+# Export as WSGI application (for gunicorn, uWSGI, etc.)
+# Usage: gunicorn demo_app:wsgi_application --workers 4
+from edda.wsgi import create_wsgi_app
+
+wsgi_application = create_wsgi_app(app)

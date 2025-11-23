@@ -42,14 +42,20 @@ class TestActivityDecorator:
         assert my_test_activity.__name__ == "my_test_activity"
         assert my_test_activity.__doc__ == "Test activity docstring."
 
-    async def test_activity_decorator_requires_async(self):
-        """Test that decorator raises error for non-async functions."""
+    async def test_activity_decorator_supports_sync(self):
+        """Test that decorator supports both sync and async functions."""
 
-        with pytest.raises(TypeError, match="must be an async function"):
+        @activity
+        def sync_function(ctx: WorkflowContext) -> dict:
+            return {"result": "sync"}
 
-            @activity
-            def sync_function(ctx: WorkflowContext) -> dict:
-                return {}
+        # Verify it's a valid activity
+        assert hasattr(sync_function, "_is_activity")
+        assert sync_function._is_activity is True
+
+        # Verify it's detected as a sync function
+        assert hasattr(sync_function, "is_async")
+        assert sync_function.is_async is False
 
     async def test_activity_decorator_creates_wrapper(self):
         """Test that decorator creates Activity wrapper."""

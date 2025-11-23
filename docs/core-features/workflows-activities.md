@@ -121,6 +121,46 @@ async def create_order_with_db(ctx: WorkflowContext, order_id: str):
     return {"order_id": order_id}
 ```
 
+### Sync Activities (WSGI Compatibility)
+
+For WSGI environments (gunicorn, uWSGI) or legacy codebases, Edda supports synchronous activities:
+
+```python
+from edda import activity, WorkflowContext
+
+@activity
+def create_user_record(ctx: WorkflowContext, user_id: str, email: str) -> dict:
+    """Sync activity - executed in thread pool"""
+    # Traditional sync code - no async/await needed!
+    user = User(user_id=user_id, email=email)
+    db.session.add(user)
+    db.session.commit()
+    return {"user_id": user.id}
+
+@activity
+async def async_activity(ctx: WorkflowContext, data: str) -> dict:
+    """Async activity - recommended for I/O operations"""
+    result = await httpx.get(f"https://api.example.com/{data}")
+    return result.json()
+
+@workflow
+async def mixed_workflow(ctx: WorkflowContext, user_id: str) -> dict:
+    # Workflows are always async (for deterministic replay)
+    # But can call both sync and async activities
+    user = await create_user_record(ctx, user_id, "user@example.com", activity_id="create:1")
+    data = await async_activity(ctx, user_id, activity_id="fetch:1")
+    return {"user": user, "data": data}
+```
+
+**When to use sync activities:**
+
+- ✅ Existing sync codebases (Flask, Django)
+- ✅ WSGI deployments (gunicorn, uWSGI)
+- ✅ Libraries without async support
+- ✅ Simple CPU-bound operations
+
+**Performance note:** Async activities are recommended for I/O-bound operations (database queries, HTTP requests, file I/O) for better performance. Sync activities are executed in a thread pool to avoid blocking the event loop.
+
 ## Retry Policies
 
 Activities automatically retry on failure with exponential backoff. This provides resilience against transient failures like network timeouts or temporary service unavailability.
@@ -755,25 +795,40 @@ async def order_workflow(ctx: WorkflowContext, order_id: str, amount: float):
     pass
 ```
 
-### 4. Don't Mix Async/Sync
+### 4. Choose Async or Sync Appropriately
 
-❌ **Bad:**
-
-```python
-@activity
-def sync_activity(ctx: WorkflowContext, param: str):  # ❌ Not async!
-    # This won't work!
-    pass
-```
-
-✅ **Good:**
+✅ **Preferred: Async activities** (better performance for I/O)
 
 ```python
 @activity
-async def async_activity(ctx: WorkflowContext, param: str):  # ✅ Async
-    # Correct!
-    pass
+async def fetch_user_data(ctx: WorkflowContext, user_id: str) -> dict:
+    # Async I/O operations (recommended)
+    result = await httpx.get(f"https://api.example.com/users/{user_id}")
+    return result.json()
 ```
+
+✅ **Valid: Sync activities** (WSGI compatibility, legacy code)
+
+```python
+@activity
+def process_legacy_data(ctx: WorkflowContext, data: str) -> dict:
+    # Sync operations (executed in thread pool)
+    result = legacy_library.process(data)  # No async support
+    return {"processed": result}
+```
+
+✅ **Good: Mix sync and async in same workflow**
+
+```python
+@workflow
+async def order_workflow(ctx: WorkflowContext, order_id: str) -> dict:
+    # Both sync and async activities work fine
+    user = await create_user_record(ctx, order_id, activity_id="user:1")  # Sync
+    payment = await process_payment(ctx, 99.99, activity_id="pay:1")  # Async
+    return {"user": user, "payment": payment}
+```
+
+**Performance tip**: Prefer async activities for I/O-bound operations (database queries, HTTP requests, file I/O). Use sync activities when integrating with legacy code or libraries without async support.
 
 ## Next Steps
 

@@ -13,6 +13,8 @@ import time
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
+import anyio
+
 from edda.context import WorkflowContext
 from edda.exceptions import RetryExhaustedError, TerminalError, WorkflowCancelledException
 from edda.pydantic_utils import (
@@ -40,12 +42,13 @@ class Activity:
         Initialize activity wrapper.
 
         Args:
-            func: The async function to wrap
+            func: The async or sync function to wrap
             retry_policy: Optional retry policy for this activity.
                          If None, uses the default policy from EddaApp.
         """
         self.func = func
         self.name = func.__name__
+        self.is_async = inspect.iscoroutinefunction(func)
         self.retry_policy = retry_policy
         functools.update_wrapper(self, func)
 
@@ -284,8 +287,12 @@ class Activity:
             "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
         }
 
-        # Execute the activity function
-        result = await self.func(ctx, *args, **kwargs)
+        # Execute the activity function (sync or async)
+        if self.is_async:
+            result = await self.func(ctx, *args, **kwargs)
+        else:
+            # Run sync function in thread pool to avoid blocking
+            result = await anyio.to_thread.run_sync(self.func, ctx, *args, **kwargs)
 
         # Convert Pydantic model result to JSON dict for storage
         result_for_storage = to_json_dict(result)
@@ -369,7 +376,7 @@ class Activity:
             return self.retry_policy
 
         # Priority 2: App-level policy (EddaApp default_retry_policy)
-        # Note: This will be implemented in Phase 5 (edda/app.py)
+        # Set by ReplayEngine when creating WorkflowContext (edda/replay.py)
         if hasattr(ctx, "_app_retry_policy") and ctx._app_retry_policy is not None:
             return cast(RetryPolicy, ctx._app_retry_policy)
 
@@ -426,8 +433,9 @@ def activity(
     """
     Decorator for defining activities (atomic units of work) with automatic retry.
 
-    Activities are async functions that take a WorkflowContext as the first
-    parameter, followed by any other parameters.
+    Activities can be async or sync functions that take a WorkflowContext as the first
+    parameter, followed by any other parameters. Sync functions are executed in a
+    thread pool to avoid blocking the event loop.
 
     Activities are automatically wrapped in a transaction, ensuring that
     activity execution, history recording, and event sending are atomic.
@@ -443,34 +451,39 @@ def activity(
     Workflow function.
 
     Example:
-        >>> @activity  # Uses default retry policy (5 attempts, exponential backoff)
-        ... async def reserve_inventory(ctx: WorkflowContext, order_id: str) -> dict:
-        ...     # Your business logic here
+        >>> @activity  # Sync activity (no async/await)
+        ... def reserve_inventory(ctx: WorkflowContext, order_id: str) -> dict:
+        ...     # Your business logic here (executed in thread pool)
+        ...     return {"reservation_id": "123"}
+
+        >>> @activity  # Async activity (recommended for I/O-bound operations)
+        ... async def reserve_inventory_async(ctx: WorkflowContext, order_id: str) -> dict:
+        ...     # Async I/O operations
         ...     return {"reservation_id": "123"}
 
         >>> from edda.retry import RetryPolicy, AGGRESSIVE_RETRY
         >>> @activity(retry_policy=AGGRESSIVE_RETRY)  # Custom retry policy
-        ... async def process_payment(ctx: WorkflowContext, amount: float) -> dict:
+        ... def process_payment(ctx: WorkflowContext, amount: float) -> dict:
         ...     # Fast retries for low-latency services
         ...     return {"status": "completed"}
 
         >>> @activity  # Non-idempotent operations cached during replay
-        ... async def charge_credit_card(ctx: WorkflowContext, amount: float) -> dict:
+        ... def charge_credit_card(ctx: WorkflowContext, amount: float) -> dict:
         ...     # External API call - result is cached, won't be called again on replay
         ...     # If this fails, automatic retry with exponential backoff
         ...     return {"transaction_id": "txn_123"}
 
         >>> from edda.exceptions import TerminalError
         >>> @activity
-        ... async def validate_user(ctx: WorkflowContext, user_id: str) -> dict:
-        ...     user = await fetch_user(user_id)
+        ... def validate_user(ctx: WorkflowContext, user_id: str) -> dict:
+        ...     user = fetch_user(user_id)  # No await needed for sync
         ...     if not user:
         ...         # Don't retry - user doesn't exist
         ...         raise TerminalError(f"User {user_id} not found")
         ...     return {"user_id": user_id, "name": user.name}
 
     Args:
-        func: Async function to wrap as an activity
+        func: Async or sync function to wrap as an activity
         retry_policy: Optional retry policy for this activity.
                      If None, uses the default policy from EddaApp.
 
@@ -480,14 +493,14 @@ def activity(
     Raises:
         RetryExhaustedError: When all retry attempts are exhausted
         TerminalError: For non-retryable errors (no retry attempted)
+
+    Sync activities are executed in a thread pool. For I/O-bound operations
+    (database queries, HTTP requests, etc.), async activities are recommended
+    for better performance.
     """
 
     def decorator(f: F) -> F:
-        # Verify the function is async
-        if not inspect.iscoroutinefunction(f):
-            raise TypeError(f"Activity {f.__name__} must be an async function")
-
-        # Create the Activity wrapper with retry policy
+        # Create the Activity wrapper with retry policy (supports both sync and async)
         activity_wrapper = Activity(f, retry_policy=retry_policy)
 
         # Mark as activity for introspection

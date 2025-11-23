@@ -3,6 +3,15 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
+name = "a2wsgi"
+version = "1.10.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9a/cb/822c56fbea97e9eee201a2e434a80437f6750ebcb1ed307ee3a0a7505b14/a2wsgi-1.10.10.tar.gz", hash = "sha256:a5bcffb52081ba39df0d5e9a884fc6f819d92e3a42389343ba77cbf809fe1f45", size = 18799, upload-time = "2025-06-18T09:00:10.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/02/d5/349aba3dc421e73cbd4958c0ce0a4f1aa3a738bc0d7de75d2f40ed43a535/a2wsgi-1.10.10-py3-none-any.whl", hash = "sha256:d2b21379479718539dc15fce53b876251a0efe7615352dfe49f6ad1bc507848d", size = 17389, upload-time = "2025-06-18T09:00:09.676Z" },
+]
+
+[[package]]
 name = "aiofiles"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -658,7 +667,9 @@ name = "edda-framework"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "a2wsgi" },
     { name = "aiosqlite" },
+    { name = "anyio" },
     { name = "cloudevents" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -698,8 +709,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "a2wsgi", specifier = ">=1.10.0" },
     { name = "aiomysql", marker = "extra == 'mysql'", specifier = ">=0.2.0" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
+    { name = "anyio", specifier = ">=4.0.0" },
     { name = "asyncpg", marker = "extra == 'postgresql'", specifier = ">=0.30.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=25.9.0" },
     { name = "cloudevents", specifier = ">=1.12.0" },

@@ -27,6 +27,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
+- 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
 ## Use Cases
 
@@ -589,6 +590,51 @@ api.mount("/workflows", edda_app)
 ```
 
 This works with any ASGI framework (Starlette, FastAPI, Quart, etc.)
+
+### WSGI Integration
+
+For WSGI environments (gunicorn, uWSGI, Flask, Django), use the WSGI adapter:
+
+```python
+from edda import EddaApp
+from edda.wsgi import create_wsgi_app
+
+# Create Edda app
+edda_app = EddaApp(db_url="sqlite:///workflow.db")
+
+# Convert to WSGI
+wsgi_application = create_wsgi_app(edda_app)
+```
+
+**Running with WSGI servers:**
+
+```bash
+# With Gunicorn
+gunicorn demo_app:wsgi_application --workers 4
+
+# With uWSGI
+uwsgi --http :8000 --wsgi-file demo_app.py --callable wsgi_application
+```
+
+**Sync Activities**: For WSGI environments or legacy codebases, you can write synchronous activities:
+
+```python
+from edda import activity, WorkflowContext
+
+@activity
+def process_payment(ctx: WorkflowContext, amount: float) -> dict:
+    # Sync function - automatically executed in thread pool
+    # No async/await needed!
+    return {"status": "paid", "amount": amount}
+
+@workflow
+async def payment_workflow(ctx: WorkflowContext, order_id: str) -> dict:
+    # Workflows still use async (for deterministic replay)
+    result = await process_payment(ctx, 99.99, activity_id="pay:1")
+    return result
+```
+
+**Performance note**: ASGI servers (uvicorn, hypercorn) are recommended for better performance with Edda's async architecture. WSGI support is provided for compatibility with existing infrastructure and users who prefer synchronous programming.
 
 ## Observability Hooks
 

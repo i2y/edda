@@ -30,6 +30,7 @@ from edda.hooks import HooksBase, WorkflowHooks
 from edda.outbox import OutboxRelayer, send_event_transactional
 from edda.retry import RetryPolicy
 from edda.workflow import workflow
+from edda.wsgi import create_wsgi_app
 
 __version__ = "0.1.0"
 
@@ -53,4 +54,5 @@ __all__ = [
     "RetryPolicy",
     "RetryExhaustedError",
     "TerminalError",
+    "create_wsgi_app",
 ]
