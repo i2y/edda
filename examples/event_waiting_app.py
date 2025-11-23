@@ -28,11 +28,18 @@ Usage:
     # View in Viewer: http://localhost:8080
 """
 
+import asyncio
+import sys
+
 import uvloop
 
 from edda import EddaApp, WorkflowContext, activity, workflow, wait_event
 
-uvloop.install()
+# Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
+if sys.version_info >= (3, 12):
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    uvloop.install()
 
 # Create Kairo app
 app = EddaApp(

@@ -14,7 +14,6 @@ from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
 
 
-@pytest.mark.asyncio
 class TestReceivedEvent:
     """Test suite for ReceivedEvent class."""
 

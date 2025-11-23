@@ -10,7 +10,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import httpx
-from cloudevents.http import CloudEvent, to_structured
+from cloudevents.conversion import to_structured
+from cloudevents.http import CloudEvent
 from pydantic import BaseModel
 
 from edda.pydantic_utils import from_json_dict, is_pydantic_instance, to_json_dict

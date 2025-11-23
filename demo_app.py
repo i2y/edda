@@ -1,6 +1,8 @@
 """Demo Edda ASGI application for tsuno."""
 
+import asyncio
 import os
+import sys
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -19,7 +21,11 @@ from edda import (
     wait_until,
 )
 
-uvloop.install()
+# Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
+if sys.version_info >= (3, 12):
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    uvloop.install()
 
 
 # ========== Enum Definitions for Advanced Workflow ==========

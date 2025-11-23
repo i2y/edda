@@ -226,10 +226,16 @@ class TestTsunoServerIntegration:
         app_file.write_text(
             '''
 """Test application for tsuno server."""
+import asyncio
+import sys
 import uvloop
 from edda import EddaApp
 
-uvloop.install()
+# Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
+if sys.version_info >= (3, 12):
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    uvloop.install()
 
 app = EddaApp(
     service_name="tsuno-test-service",

@@ -371,7 +371,7 @@ class Activity:
         # Priority 2: App-level policy (EddaApp default_retry_policy)
         # Note: This will be implemented in Phase 5 (edda/app.py)
         if hasattr(ctx, "_app_retry_policy") and ctx._app_retry_policy is not None:
-            return ctx._app_retry_policy
+            return cast(RetryPolicy, ctx._app_retry_policy)
 
         # Priority 3: Framework default
         return DEFAULT_RETRY_POLICY

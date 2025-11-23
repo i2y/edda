@@ -17,7 +17,6 @@ from edda.exceptions import RetryExhaustedError
 from edda.retry import DEFAULT_RETRY_POLICY, RetryMetadata
 
 
-@pytest.mark.asyncio
 class TestRetryPolicyDefaults:
     """Test default RetryPolicy values."""
 
@@ -268,7 +267,6 @@ class TestRetryPolicyEdgeCases:
         assert 1.9 <= delay3 <= 2.2
 
 
-@pytest.mark.asyncio
 class TestRetryMetadataStructure:
     """Test RetryMetadata dataclass and tracking."""
 

@@ -7,7 +7,7 @@ managing state, history, and replay during workflow execution.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from edda.events import ReceivedEvent
 from edda.storage.protocol import StorageProtocol
@@ -132,7 +132,7 @@ class WorkflowContext:
                 "Use @activity (default) or async with ctx.transaction()"
             )
 
-        return self.storage._get_session_for_operation()  # type: ignore[attr-defined]
+        return cast("AsyncSession", self.storage._get_session_for_operation())  # type: ignore[attr-defined]
 
     async def _load_history(self) -> None:
         """
@@ -459,44 +459,6 @@ class WorkflowContext:
         except Exception:
             await self.storage.rollback_transaction()
             raise
-
-    def use_session(self, session: "AsyncSession") -> None:
-        """
-        Share an external SQLAlchemy AsyncSession with Edda for atomic operations.
-
-        This method enables true transactional outbox pattern by allowing user
-        business logic and Edda's event publishing to execute within the same
-        database transaction, ensuring atomicity.
-
-        Example:
-            from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-
-            engine = create_async_engine("postgresql+asyncpg://...")
-
-            async with AsyncSession(engine) as session:
-                async with session.begin():
-                    # Business logic
-                    session.add(Order(order_id="ORD-001", amount=100))
-
-                    # Share session with Edda
-                    ctx.use_session(session)
-
-                    # Activity execution + event publishing (same transaction)
-                    await create_order_activity(ctx, order_id="ORD-001")
-                    await send_event_transactional(ctx, "order.created", ...)
-
-                    # All operations commit/rollback together (atomic)
-
-        Args:
-            session: SQLAlchemy AsyncSession to use for Edda operations
-
-        Note:
-            - Session lifecycle is managed by the caller (begin/commit/rollback)
-            - Edda will NOT commit or rollback the session
-            - Lock operations always use separate transactions for safety
-            - This is a convenience method that delegates to storage.use_session()
-        """
-        self.storage.use_session(session)
 
     def in_transaction(self) -> bool:
         """

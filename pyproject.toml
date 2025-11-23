@@ -1,9 +1,9 @@
 [project]
 name = "edda-framework"
 version = "0.1.0"
-description = "CloudEvents-native Durable Execution framework for event-driven workflow orchestration with distributed execution support"
+description = "Lightweight Durable Execution Framework"
 authors = [
-    { name = "Yasushi Ito", email = "6240399+i2y@users.noreply.github.com" }
+    { name = "Yasushi Itoh", email = "6240399+i2y@users.noreply.github.com" }
 ]
 readme = "README.md"
 requires-python = ">=3.11"
@@ -85,6 +85,13 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-branch",
+]
+filterwarnings = [
+    # Suppress testcontainers internal deprecation warnings
+    # These are from testcontainers' own container implementations (PostgresContainer, MySqlContainer)
+    # and will be fixed upstream. See: https://github.com/testcontainers/testcontainers-python/pull/894
+    "ignore:.*wait_container_is_ready.*:DeprecationWarning:testcontainers",
+    "ignore:.*wait_for_logs.*:DeprecationWarning:testcontainers",
 ]
 
 [tool.coverage.run]

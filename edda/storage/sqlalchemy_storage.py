@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import (
@@ -418,7 +418,7 @@ class SQLAlchemyStorage:
             finally:
                 await session.close()
 
-    def _get_current_time_expr(self):
+    def _get_current_time_expr(self) -> Any:
         """
         Get database-specific current time SQL expression.
 
@@ -436,7 +436,7 @@ class SQLAlchemyStorage:
             # PostgreSQL/MySQL: NOW() returns timezone-aware datetime
             return func.now()
 
-    def _make_datetime_comparable(self, column):
+    def _make_datetime_comparable(self, column: Any) -> Any:
         """
         Make datetime column comparable with current time in SQL queries.
 
@@ -842,8 +842,6 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
             # Calculate timeout threshold and current time
-            from datetime import UTC, datetime, timedelta
-
             # Use UTC time consistently (timezone-aware to match DateTime(timezone=True) columns)
             current_time = datetime.now(UTC)
 
@@ -862,7 +860,7 @@ class SQLAlchemyStorage:
                 return False
 
             # Determine actual timeout (priority: instance > parameter > default)
-            actual_timeout = (
+            actual_timeout = int(
                 instance.lock_timeout_seconds
                 if instance.lock_timeout_seconds is not None
                 else timeout_seconds
@@ -920,8 +918,6 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
-            from datetime import UTC, datetime
-
             # Use Python datetime for consistency (timezone-aware)
             current_time = datetime.now(UTC)
 
@@ -957,8 +953,6 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
-            from datetime import UTC, datetime, timedelta
-
             # Use Python datetime for consistency with try_acquire_lock() (timezone-aware)
             current_time = datetime.now(UTC)
 
@@ -979,14 +973,14 @@ class SQLAlchemyStorage:
                 return False
 
             # Determine actual timeout (priority: instance > parameter > default)
-            actual_timeout = (
+            actual_timeout = int(
                 instance.lock_timeout_seconds
                 if instance.lock_timeout_seconds is not None
                 else timeout_seconds
             )
 
             # Calculate new expiry time
-            lock_expires_at = current_time + timedelta(seconds=actual_timeout)  # type: ignore[arg-type]
+            lock_expires_at = current_time + timedelta(seconds=actual_timeout)
 
             # Update lock timestamp and expiry
             result = await session.execute(
@@ -1020,8 +1014,6 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
-            from datetime import UTC, datetime
-
             # Use timezone-aware datetime to match DateTime(timezone=True) columns
             current_time = datetime.now(UTC)
 
@@ -1050,10 +1042,10 @@ class SQLAlchemyStorage:
                 if instance.status in ["running", "compensating"]:
                     workflows_to_resume.append(
                         {
-                            "instance_id": instance.instance_id,
-                            "workflow_name": instance.workflow_name,
-                            "source_hash": instance.source_hash,
-                            "status": instance.status,
+                            "instance_id": str(instance.instance_id),
+                            "workflow_name": str(instance.workflow_name),
+                            "source_hash": str(instance.source_hash),
+                            "status": str(instance.status),
                         }
                     )
 
@@ -1715,8 +1707,6 @@ class SQLAlchemyStorage:
         """Clean up successfully published events older than threshold."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            from datetime import UTC, datetime, timedelta
-
             threshold = datetime.now(UTC) - timedelta(hours=older_than_hours)
 
             result = await session.execute(
@@ -1782,8 +1772,6 @@ class SQLAlchemyStorage:
                 return False
 
             # Update status to cancelled and record metadata
-            from datetime import UTC, datetime
-
             cancellation_metadata = {
                 "cancelled_by": cancelled_by,
                 "cancelled_at": datetime.now(UTC).isoformat(),

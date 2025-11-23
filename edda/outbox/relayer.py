@@ -12,7 +12,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from cloudevents.http import CloudEvent, to_structured
+from cloudevents.conversion import to_structured
+from cloudevents.http import CloudEvent
 
 if TYPE_CHECKING:
     from edda.storage.protocol import StorageProtocol

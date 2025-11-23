@@ -7,6 +7,7 @@ application for handling CloudEvents and executing workflows.
 
 import asyncio
 import json
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -124,7 +125,11 @@ class EddaApp:
             return
 
         # Install uvloop for better performance
-        uvloop.install()
+        # Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
+        if sys.version_info >= (3, 12):
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        else:
+            uvloop.install()
 
         # Initialize storage
         await self.storage.initialize()
