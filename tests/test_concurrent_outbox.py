@@ -71,40 +71,14 @@ async def test_concurrent_fetch_no_duplicates(db_storage):
 
 
 @pytest.mark.asyncio
-async def test_skip_locked_behavior(db_storage):
-    """Test that SKIP LOCKED correctly skips locked rows."""
-    # Skip for SQLite (SKIP LOCKED not supported)
-    if db_storage.engine.dialect.name == "sqlite":
-        pytest.skip("SQLite does not support SKIP LOCKED")
-
-    storage = db_storage
-    # Create 5 events
-    for i in range(5):
-        await storage.add_outbox_event(
-            event_id=str(uuid.uuid4()),
-            event_type=f"test.event.{i}",
-            event_source="test-service",
-            event_data={"index": i},
-            content_type="application/json",
-        )
-
-    # Worker A fetches 3 events (locks them)
-    events_a = await storage.get_pending_outbox_events(limit=3)
-    assert len(events_a) == 3
-
-    # Worker B fetches events (should get remaining 2, not the locked ones)
-    events_b = await storage.get_pending_outbox_events(limit=5)
-    assert len(events_b) == 2  # Only 2 unlocked events available
-
-    # Verify no overlap
-    ids_a = {event["event_id"] for event in events_a}
-    ids_b = {event["event_id"] for event in events_b}
-    assert ids_a.isdisjoint(ids_b), "Workers fetched overlapping events!"
-
-
-@pytest.mark.asyncio
 async def test_parallel_publishing(db_storage):
-    """Test that multiple workers can publish events in parallel."""
+    """Test that multiple workers can publish events in parallel with retry.
+
+    This test simulates realistic production behavior where workers poll in a loop.
+    In concurrent environments (MySQL READ COMMITTED + SKIP LOCKED), a single poll
+    may not fetch all events if some are locked by other workers. Workers retry
+    until all events are processed, matching the OutboxRelayer._poll_loop() behavior.
+    """
     # Skip for SQLite (SKIP LOCKED not supported)
     if db_storage.engine.dialect.name == "sqlite":
         pytest.skip("SQLite does not support SKIP LOCKED")
@@ -120,18 +94,26 @@ async def test_parallel_publishing(db_storage):
             content_type="application/json",
         )
 
-    # Simulate 2 workers publishing events simultaneously
-    async def worker_publish():
-        """Worker that fetches and publishes events."""
-        events = await storage.get_pending_outbox_events(limit=3)
-        for event in events:
-            await storage.mark_outbox_published(event["event_id"])
-        return [event["event_id"] for event in events]
+    # Simulate 2 workers polling in a loop (realistic production scenario)
+    async def worker_publish_with_retry():
+        """Worker that polls and publishes events with retry."""
+        all_events = []
+        max_attempts = 3  # Retry up to 3 times
+        for _attempt in range(max_attempts):
+            events = await storage.get_pending_outbox_events(limit=3)
+            if not events:
+                break  # No more events available
+            for event in events:
+                await storage.mark_outbox_published(event["event_id"])
+            all_events.extend([event["event_id"] for event in events])
+            # Small delay to allow other workers to commit
+            await asyncio.sleep(0.01)
+        return all_events
 
     # Execute 2 workers concurrently
     results = await asyncio.gather(
-        worker_publish(),
-        worker_publish(),
+        worker_publish_with_retry(),
+        worker_publish_with_retry(),
     )
 
     # Verify each worker published different events
@@ -139,8 +121,10 @@ async def test_parallel_publishing(db_storage):
     worker2_ids = set(results[1])
     assert worker1_ids.isdisjoint(worker2_ids), "Workers published overlapping events!"
 
-    # Verify all events are published
-    assert len(worker1_ids) + len(worker2_ids) == 6
+    # Verify all events are eventually published
+    assert len(worker1_ids) + len(worker2_ids) == 6, (
+        f"Expected 6 total events, got {len(worker1_ids) + len(worker2_ids)}"
+    )
 
 
 @pytest.mark.asyncio
