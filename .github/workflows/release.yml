@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  # id-token: write       # Required for PyPI Trusted Publishing (OIDC) - uncomment when PyPI login is fixed
-  contents: write       # Required for creating releases
+  id-token: write # Required for PyPI Trusted Publishing (OIDC)
+  contents: write # Required for creating releases
 
 jobs:
   publish:
@@ -30,9 +30,5 @@ jobs:
       - name: Build package
         run: uv build
 
-      - name: Publish to PyPI (API Token)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-        # Alternative: Use Trusted Publishing (OIDC) when PyPI login is fixed
-        # Uncomment 'id-token: write' in permissions and remove 'with:' block above
