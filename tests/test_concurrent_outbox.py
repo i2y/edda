@@ -122,9 +122,9 @@ async def test_parallel_publishing(db_storage):
     assert worker1_ids.isdisjoint(worker2_ids), "Workers published overlapping events!"
 
     # Verify all events are eventually published
-    assert len(worker1_ids) + len(worker2_ids) == 6, (
-        f"Expected 6 total events, got {len(worker1_ids) + len(worker2_ids)}"
-    )
+    assert (
+        len(worker1_ids) + len(worker2_ids) == 6
+    ), f"Expected 6 total events, got {len(worker1_ids) + len(worker2_ids)}"
 
 
 @pytest.mark.asyncio
