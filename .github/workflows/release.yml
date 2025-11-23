@@ -13,6 +13,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    envrionment: pypi
 
     steps:
       - name: Checkout code
