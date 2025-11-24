@@ -72,6 +72,9 @@ nav = [
     { "Event Waiting" = "examples/events.md" },
     { "FastAPI Integration" = "examples/fastapi-integration.md" },
   ]},
+  { "Integrations" = [
+    { "MCP Integration" = "integrations/mcp.md" },
+  ]},
   { "Viewer UI" = [
     { "Setup" = "viewer-ui/setup.md" },
     { "Visualization" = "viewer-ui/visualization.md" },

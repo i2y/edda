@@ -27,6 +27,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
+- 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
 ## Use Cases
@@ -635,6 +636,49 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str) -> dict:
 ```
 
 **Performance note**: ASGI servers (uvicorn, hypercorn) are recommended for better performance with Edda's async architecture. WSGI support is provided for compatibility with existing infrastructure and users who prefer synchronous programming.
+
+## MCP Integration
+
+Edda integrates with the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), allowing AI assistants like Claude to interact with your durable workflows as long-running tools.
+
+### Quick Example
+
+```python
+from edda.integrations.mcp import EddaMCPServer
+from edda import WorkflowContext, activity
+
+# Create MCP server
+server = EddaMCPServer(
+    name="Order Service",
+    db_url="postgresql://user:pass@localhost/orders",
+)
+
+@activity
+async def process_payment(ctx: WorkflowContext, amount: float):
+    return {"status": "paid", "amount": amount}
+
+@server.durable_tool(description="Process customer order")
+async def process_order(ctx: WorkflowContext, order_id: str):
+    await process_payment(ctx, 99.99)
+    return {"status": "completed", "order_id": order_id}
+
+# Deploy with uvicorn
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(server.asgi_app(), host="0.0.0.0", port=8000)
+```
+
+### Auto-Generated Tools
+
+Each `@durable_tool` automatically generates **three MCP tools**:
+
+1. **Main tool** (`process_order`): Starts the workflow, returns instance ID
+2. **Status tool** (`process_order_status`): Checks workflow progress
+3. **Result tool** (`process_order_result`): Gets final result when completed
+
+This enables AI assistants to work with workflows that take minutes, hours, or even days to complete.
+
+**For detailed documentation**, see [MCP Integration Guide](docs/integrations/mcp.md).
 
 ## Observability Hooks
 

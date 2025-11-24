@@ -1,0 +1,230 @@
+# MCP (Model Context Protocol) Integration
+
+Edda provides seamless integration with the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), allowing AI assistants like Claude to interact with your durable workflows as long-running tools.
+
+## Overview
+
+MCP is a standardized protocol for AI tool integration. Edda's MCP integration automatically converts your durable workflows into MCP-compliant tools that:
+
+- **Start workflows** and return instance IDs immediately
+- **Check workflow status** to monitor progress
+- **Retrieve results** when workflows complete
+
+This enables AI assistants to work with long-running processes that may take minutes, hours, or even days to complete.
+
+## Installation
+
+Install Edda with MCP support:
+
+```bash
+pip install edda-framework[mcp]
+
+# Or using uv
+uv add edda-framework --extra mcp
+```
+
+## Quick Start
+
+### 1. Create an MCP Server
+
+```python
+from edda.integrations.mcp import EddaMCPServer
+from edda import WorkflowContext, activity
+
+# Create MCP server
+server = EddaMCPServer(
+    name="Order Service",
+    db_url="postgresql://user:pass@localhost/orders",
+)
+
+@activity
+async def reserve_inventory(ctx: WorkflowContext, items: list[str]):
+    # Your business logic here
+    return {"reserved": True}
+
+@activity
+async def process_payment(ctx: WorkflowContext, amount: float):
+    # Payment processing logic
+    return {"transaction_id": "txn_123"}
+
+@server.durable_tool(description="Process customer order workflow")
+async def process_order(ctx: WorkflowContext, order_id: str, items: list[str]):
+    """
+    Long-running order processing workflow.
+
+    This workflow reserves inventory, processes payment, and ships the order.
+    """
+    # Reserve inventory
+    await reserve_inventory(ctx, items)
+
+    # Process payment
+    await process_payment(ctx, 99.99)
+
+    return {"status": "completed", "order_id": order_id}
+```
+
+### 2. Deploy the Server
+
+```python
+# Deploy with uvicorn (production)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(server.asgi_app(), host="0.0.0.0", port=8000)
+```
+
+```bash
+# Run the server
+uvicorn your_app:server.asgi_app --host 0.0.0.0 --port 8000
+```
+
+### 3. Use from MCP Clients (e.g., Claude Desktop)
+
+Add to your MCP client configuration (e.g., Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "order-service": {
+      "command": "uvicorn",
+      "args": ["your_app:server.asgi_app", "--host", "127.0.0.1", "--port", "8000"],
+      "env": {
+        "DATABASE_URL": "postgresql://user:pass@localhost/orders"
+      }
+    }
+  }
+}
+```
+
+## Auto-Generated Tools
+
+Each `@durable_tool` automatically generates **three MCP tools**:
+
+### 1. Main Tool: Start Workflow
+
+```
+Tool Name: process_order
+Description: Process customer order workflow
+
+Input: {"order_id": "ORD-123", "items": ["item1", "item2"]}
+Output: {
+  "content": [{
+    "type": "text",
+    "text": "Workflow 'process_order' started successfully.\nInstance ID: abc123...\n\nUse 'process_order_status' tool to check progress."
+  }],
+  "isError": false
+}
+```
+
+### 2. Status Tool: Check Progress
+
+```
+Tool Name: process_order_status
+Description: Check status of process_order workflow
+
+Input: {"instance_id": "abc123..."}
+Output: {
+  "content": [{
+    "type": "text",
+    "text": "Workflow Status: running\nCurrent Activity: payment:1\nInstance ID: abc123..."
+  }],
+  "isError": false
+}
+```
+
+### 3. Result Tool: Get Final Result
+
+```
+Tool Name: process_order_result
+Description: Get result of process_order workflow (if completed)
+
+Input: {"instance_id": "abc123..."}
+Output: {
+  "content": [{
+    "type": "text",
+    "text": "Workflow Result:\n{'status': 'completed', 'order_id': 'ORD-123'}"
+  }],
+  "isError": false
+}
+```
+
+## Advanced Configuration
+
+### Authentication
+
+Protect your MCP server with token-based authentication:
+
+```python
+def verify_token(token: str) -> bool:
+    # Your token verification logic
+    return token == "secret-token-123"
+
+server = EddaMCPServer(
+    name="Order Service",
+    db_url="postgresql://user:pass@localhost/orders",
+    token_verifier=verify_token,
+)
+```
+
+Clients must include the token in the Authorization header:
+
+```http
+Authorization: Bearer secret-token-123
+```
+
+### Transactional Outbox Pattern
+
+Enable event-driven architecture with outbox pattern:
+
+```python
+server = EddaMCPServer(
+    name="Order Service",
+    db_url="postgresql://user:pass@localhost/orders",
+    outbox_enabled=True,
+    broker_url="nats://localhost:4222",
+)
+```
+
+## MCP Protocol Compliance
+
+Edda's MCP integration follows the [MCP Tools specification](https://modelcontextprotocol.io/docs/concepts/tools):
+
+- **JSON-RPC 2.0**: All communication uses JSON-RPC 2.0 protocol
+- **Content Arrays**: Responses include `content` array with text/image/resource items
+- **Error Handling**: Errors are reported with `isError: true` flag
+- **Stateless HTTP**: Uses MCP's streamable HTTP transport for production deployments
+
+## Architecture
+
+```
+┌─────────────────┐
+│    MCP Client   │
+└────────┬────────┘
+         │ JSON-RPC 2.0
+         │ (HTTP Transport)
+         ▼
+┌─────────────────┐
+│  EddaMCPServer  │
+│   ┌─────────┐   │
+│   │ FastMCP │   │  ← Official MCP SDK
+│   └─────────┘   │
+│   ┌─────────┐   │
+│   │ EddaApp │   │  ← Durable Execution
+│   └─────────┘   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│    Database     │
+└─────────────────┘
+```
+
+
+## Related Documentation
+
+- [Edda Workflows and Activities](../core-features/workflows-activities.md)
+- [Transactional Outbox Pattern](../core-features/transactional-outbox.md)
+- [MCP Protocol Specification](https://modelcontextprotocol.io/)
+
+## Examples
+
+See the [examples/mcp/](../../examples/mcp/) directory for complete working examples.

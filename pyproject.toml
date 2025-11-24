@@ -56,6 +56,9 @@ postgresql = [
 mysql = [
     "aiomysql>=0.2.0",
 ]
+mcp = [
+    "mcp>=1.22.0",
+]
 
 [project.scripts]
 edda-viewer = "viewer_app:main"
