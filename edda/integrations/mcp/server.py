@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from edda.app import EddaApp
 from edda.workflow import Workflow
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 except ImportError as e:
     raise ImportError(
         "MCP Python SDK is required for MCP integration. "
@@ -89,7 +89,7 @@ class EddaMCPServer:
             service_name=name,
             db_url=db_url,
             outbox_enabled=outbox_enabled,
-            broker_url=broker_url,
+            broker_url=broker_url or "",
         )
         self._mcp = FastMCP(name, json_response=True, stateless_http=True)
         self._token_verifier = token_verifier
@@ -99,10 +99,10 @@ class EddaMCPServer:
 
     def durable_tool(
         self,
-        func: Callable | None = None,
+        func: Callable[..., Any] | None = None,
         *,
         description: str = "",
-    ) -> Callable:
+    ) -> Callable[..., Any]:
         """
         Decorator to define a durable workflow tool.
 
@@ -128,14 +128,14 @@ class EddaMCPServer:
         """
         from edda.integrations.mcp.decorators import create_durable_tool
 
-        def decorator(f: Callable) -> Workflow:
+        def decorator(f: Callable[..., Any]) -> Workflow:
             return create_durable_tool(self, f, description=description)
 
         if func is None:
             return decorator
         return decorator(func)
 
-    def asgi_app(self) -> Callable:
+    def asgi_app(self) -> Callable[..., Any]:
         """
         Create ASGI application with MCP + CloudEvents support.
 
@@ -150,8 +150,8 @@ class EddaMCPServer:
         Returns:
             ASGI callable (Starlette app)
         """
-        from starlette.requests import Request
-        from starlette.responses import Response
+        from starlette.requests import Request  # type: ignore[import-not-found]
+        from starlette.responses import Response  # type: ignore[import-not-found]
 
         # Get MCP's Starlette app (Issue #1367 workaround: use directly)
         app = self._mcp.streamable_http_app()
@@ -169,9 +169,9 @@ class EddaMCPServer:
             scope["path"] = f"/cancel/{instance_id}"
 
             # Capture response
-            response_data = {"status": 200, "headers": [], "body": b""}
+            response_data: dict[str, Any] = {"status": 200, "headers": [], "body": b""}
 
-            async def send(message: dict) -> None:
+            async def send(message: dict[str, Any]) -> None:
                 if message["type"] == "http.response.start":
                     response_data["status"] = message["status"]
                     response_data["headers"] = message.get("headers", [])
@@ -185,7 +185,7 @@ class EddaMCPServer:
             return Response(
                 content=response_data["body"],
                 status_code=response_data["status"],
-                headers=dict(response_data["headers"]),
+                headers=cast(dict[str, str], dict(response_data["headers"])),
             )
 
         # Add cancel route
@@ -193,14 +193,18 @@ class EddaMCPServer:
 
         # Add authentication middleware if token_verifier provided (AFTER adding routes)
         if self._token_verifier is not None:
-            from starlette.middleware.base import BaseHTTPMiddleware
+            from starlette.middleware.base import (  # type: ignore[import-not-found]
+                BaseHTTPMiddleware,
+            )
 
-            class AuthMiddleware(BaseHTTPMiddleware):
-                def __init__(self, app: Any, token_verifier: Callable):
+            class AuthMiddleware(BaseHTTPMiddleware):  # type: ignore[misc]
+                def __init__(self, app: Any, token_verifier: Callable[[str], bool]):
                     super().__init__(app)
                     self.token_verifier = token_verifier
 
-                async def dispatch(self, request: Request, call_next: Callable):
+                async def dispatch(
+                    self, request: Request, call_next: Callable[..., Any]
+                ) -> Response:
                     auth_header = request.headers.get("authorization", "")
                     if auth_header.startswith("Bearer "):
                         token = auth_header[7:]
@@ -211,7 +215,7 @@ class EddaMCPServer:
             # Wrap app with auth middleware
             app = AuthMiddleware(app, self._token_verifier)
 
-        return app
+        return cast(Callable[..., Any], app)
 
     async def initialize(self) -> None:
         """

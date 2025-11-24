@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from edda.workflow import workflow
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 def create_durable_tool(
     server: EddaMCPServer,
-    func: Callable,
+    func: Callable[..., Any],
     *,
     description: str = "",
 ) -> Workflow:
@@ -38,7 +38,7 @@ def create_durable_tool(
         Workflow instance
     """
     # 1. Create Edda workflow
-    workflow_instance: Workflow = workflow(func, event_handler=False)
+    workflow_instance = cast(Workflow, workflow(func, event_handler=False))
     workflow_name = func.__name__
 
     # Register in server's workflow registry
@@ -56,7 +56,7 @@ def create_durable_tool(
     ]
 
     # Create the tool function
-    async def start_tool(**kwargs: Any) -> dict:
+    async def start_tool(**kwargs: Any) -> dict[str, Any]:
         """
         Start workflow and return instance_id.
 
@@ -94,11 +94,21 @@ def create_durable_tool(
     status_tool_name = f"{workflow_name}_status"
     status_tool_description = f"Check status of {workflow_name} workflow"
 
-    @server._mcp.tool(name=status_tool_name, description=status_tool_description)
-    async def status_tool(instance_id: str) -> dict:
+    @server._mcp.tool(name=status_tool_name, description=status_tool_description)  # type: ignore[misc]
+    async def status_tool(instance_id: str) -> dict[str, Any]:
         """Check workflow status."""
         try:
             instance = await server._edda_app.storage.get_instance(instance_id)
+            if instance is None:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Workflow instance not found: {instance_id}",
+                        }
+                    ],
+                    "isError": True,
+                }
 
             status = instance["status"]
             current_activity_id = instance.get("current_activity_id", "N/A")
@@ -128,11 +138,21 @@ def create_durable_tool(
     result_tool_name = f"{workflow_name}_result"
     result_tool_description = f"Get result of {workflow_name} workflow (if completed)"
 
-    @server._mcp.tool(name=result_tool_name, description=result_tool_description)
-    async def result_tool(instance_id: str) -> dict:
+    @server._mcp.tool(name=result_tool_name, description=result_tool_description)  # type: ignore[misc]
+    async def result_tool(instance_id: str) -> dict[str, Any]:
         """Get workflow result (if completed)."""
         try:
             instance = await server._edda_app.storage.get_instance(instance_id)
+            if instance is None:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Workflow instance not found: {instance_id}",
+                        }
+                    ],
+                    "isError": True,
+                }
 
             status = instance["status"]
 
