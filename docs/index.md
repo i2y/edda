@@ -36,6 +36,28 @@ Edda excels at orchestrating **long-running workflows** that must survive failur
 - **🤖 AI Agent Workflows**: Orchestrate multi-step AI tasks (LLM calls, tool usage, long-running inference)
 - **📡 Event-Driven Workflows**: React to external events with guaranteed delivery and automatic retry
 
+### Business Process Automation
+
+Edda's waiting functions make it ideal for time-based and event-driven business processes:
+
+- **📧 User Onboarding**: Send reminders if users haven't completed setup after N days
+- **🎁 Campaign Processing**: Evaluate conditions and notify winners after campaign ends
+- **💳 Payment Reminders**: Send escalating reminders before payment deadlines
+- **📦 Scheduled Notifications**: Shipping updates, subscription renewals, appointment reminders
+
+**Waiting functions**:
+- `wait_timer(duration_seconds)`: Wait for a relative duration
+- `wait_until(until_time)`: Wait until an absolute datetime (e.g., campaign end date)
+- `wait_event(event_type)`: Wait for external events (near real-time response)
+
+```python
+@workflow
+async def onboarding_reminder(ctx: WorkflowContext, user_id: str):
+    await wait_timer(ctx, duration_seconds=3*24*60*60)  # Wait 3 days
+    if not await check_completed(ctx, user_id):
+        await send_reminder(ctx, user_id)
+```
+
 **Key benefit**: Workflows **never lose progress** - crashes and restarts are handled automatically through deterministic replay.
 
 ## Architecture
