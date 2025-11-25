@@ -100,9 +100,9 @@ async def arrange_shipping(ctx: WorkflowContext, order_id: str):
 @workflow
 async def order_workflow(ctx: WorkflowContext, order_id: str):
     # Activity IDs are auto-generated for sequential calls
-    inventory = await reserve_inventory(ctx, order_id, activity_id="reserve_inventory:1")
-    payment = await process_payment(ctx, order_id, activity_id="process_payment:1")
-    shipping = await arrange_shipping(ctx, order_id, activity_id="arrange_shipping:1")
+    inventory = await reserve_inventory(ctx, order_id)
+    payment = await process_payment(ctx, order_id)
+    shipping = await arrange_shipping(ctx, order_id)
 
     return {"status": "completed"}
 ```
@@ -497,16 +497,16 @@ async with workflow_lock(storage, instance_id, worker_id):
 ```python
 @workflow
 async def order_workflow(ctx: WorkflowContext, order_id: str):
-    # Activity 1
-    inventory = await reserve_inventory(ctx, order_id, activity_id="reserve_inventory:1")
+    # Activity 1 (auto-generated ID: "reserve_inventory:1")
+    inventory = await reserve_inventory(ctx, order_id)
     # → DB saved: activity_id="reserve_inventory:1", result={"reservation_id": "R123"}
 
-    # Activity 2
-    payment = await process_payment(ctx, order_id, activity_id="process_payment:1")
+    # Activity 2 (auto-generated ID: "process_payment:1")
+    payment = await process_payment(ctx, order_id)
     # → DB saved: activity_id="process_payment:1", result={"transaction_id": "T456"}
 
     # Activity 3: Exception occurs (e.g., network error)
-    shipping = await arrange_shipping(ctx, order_id, activity_id="arrange_shipping:1")
+    shipping = await arrange_shipping(ctx, order_id)
     # → Exception thrown, workflow interrupted
 ```
 

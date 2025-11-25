@@ -678,6 +678,32 @@ Each `@durable_tool` automatically generates **three MCP tools**:
 
 This enables AI assistants to work with workflows that take minutes, hours, or even days to complete.
 
+### MCP Prompts
+
+Define reusable prompt templates that can access workflow state:
+
+```python
+from mcp.server.fastmcp.prompts.base import UserMessage
+from mcp.types import TextContent
+
+@server.prompt(description="Analyze a workflow execution")
+async def analyze_workflow(instance_id: str) -> UserMessage:
+    """Generate analysis prompt for a specific workflow."""
+    instance = await server.storage.get_instance(instance_id)
+    history = await server.storage.get_history(instance_id)
+
+    text = f"""Analyze this workflow:
+**Status**: {instance['status']}
+**Activities**: {len(history)}
+**Result**: {instance.get('output_data')}
+
+Please provide insights and optimization suggestions."""
+
+    return UserMessage(content=TextContent(type="text", text=text))
+```
+
+AI clients can use these prompts to generate context-aware analysis of your workflows.
+
 **For detailed documentation**, see [MCP Integration Guide](docs/integrations/mcp.md).
 
 ## Observability Hooks

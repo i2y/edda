@@ -229,7 +229,7 @@ async def main():
             order_id="ORD-12345",
             items=["laptop", "mouse", "keyboard"],
             amount=1299.99,
-            shipping_address="123 Main St, San Francisco, CA",
+            shipping_address="42 Wallaby Way, Sydney, NSW",
         )
 
         print(f"✓ Workflow started: {instance_id}\n")

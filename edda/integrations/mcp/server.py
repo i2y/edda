@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from edda.app import EddaApp
 from edda.workflow import Workflow
+
+if TYPE_CHECKING:
+    from edda.storage.protocol import StorageProtocol
 
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
@@ -45,7 +48,13 @@ class EddaMCPServer:
 
         # Deploy with uvicorn (HTTP transport)
         if __name__ == "__main__":
+            import asyncio
             import uvicorn
+
+            async def startup():
+                await server.initialize()
+
+            asyncio.run(startup())
             uvicorn.run(server.asgi_app(), host="0.0.0.0", port=8000)
 
         # Or deploy with stdio (for MCP clients, e.g., Claude Desktop)
@@ -97,6 +106,22 @@ class EddaMCPServer:
         # Registry of durable tools (workflow_name -> Workflow instance)
         self._workflows: dict[str, Workflow] = {}
 
+    @property
+    def storage(self) -> "StorageProtocol":
+        """
+        Access workflow storage for querying instances and history.
+
+        Returns:
+            StorageProtocol: Storage backend for workflow state
+
+        Example:
+            ```python
+            instance = await server.storage.get_instance(instance_id)
+            history = await server.storage.get_history(instance_id)
+            ```
+        """
+        return self._edda_app.storage
+
     def durable_tool(
         self,
         func: Callable[..., Any] | None = None,
@@ -130,6 +155,59 @@ class EddaMCPServer:
 
         def decorator(f: Callable[..., Any]) -> Workflow:
             return create_durable_tool(self, f, description=description)
+
+        if func is None:
+            return decorator
+        return decorator(func)
+
+    def prompt(
+        self,
+        func: Callable[..., Any] | None = None,
+        *,
+        description: str = "",
+    ) -> Callable[..., Any]:
+        """
+                Decorator to define a prompt template.
+
+                Prompts can access workflow state to generate dynamic, context-aware
+                prompts for AI clients (Claude Desktop, etc.).
+
+                Args:
+                    func: Prompt function (async or sync)
+                    description: Prompt description for MCP clients
+
+                Returns:
+                    Decorated function
+
+                Example:
+                    ```python
+                    from fastmcp.prompts.prompt import PromptMessage, TextContent
+
+                    @server.prompt(description="Analyze workflow results")
+                    async def analyze_workflow(instance_id: str) -> PromptMessage:
+                        '''Generate a prompt to analyze a specific workflow execution.'''
+                        instance = await server.storage.get_instance(instance_id)
+                        history = await server.storage.get_history(instance_id)
+
+                        text = f'''Analyze this workflow:
+
+        Instance ID: {instance_id}
+        Status: {instance['status']}
+        Activities: {len(history)}
+
+        Please identify any issues or optimization opportunities.'''
+
+                        return PromptMessage(
+                            role="user",
+                            content=TextContent(type="text", text=text)
+                        )
+                    ```
+        """
+
+        def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
+            # Use FastMCP's native prompt decorator
+            prompt_desc = description or f.__doc__ or f"Prompt: {f.__name__}"
+            return self._mcp.prompt(description=prompt_desc)(f)
 
         if func is None:
             return decorator
@@ -221,11 +299,9 @@ class EddaMCPServer:
         """
         Initialize the EddaApp (setup replay engine, storage, etc.).
 
-        This method must be called before running the server in stdio mode.
-        For HTTP mode (asgi_app()), initialization happens automatically
-        when the ASGI app is deployed.
+        This method must be called before running the server in either stdio or HTTP mode.
 
-        Example:
+        Example (stdio mode):
             ```python
             async def main():
                 await server.initialize()
@@ -235,8 +311,84 @@ class EddaMCPServer:
                 import asyncio
                 asyncio.run(main())
             ```
+
+        Example (HTTP mode):
+            ```python
+            import asyncio
+            import uvicorn
+
+            async def startup():
+                await server.initialize()
+
+            asyncio.run(startup())
+            uvicorn.run(server.asgi_app(), host="0.0.0.0", port=8000)
+            ```
         """
         await self._edda_app.initialize()
+
+    async def shutdown(self) -> None:
+        """
+        Shutdown the server and cleanup resources.
+
+        Stops background tasks (auto-resume, timer checks, event timeouts),
+        closes storage connections, and performs graceful shutdown.
+
+        This method should be called when the server is shutting down.
+
+        Example (stdio mode):
+            ```python
+            import signal
+            import asyncio
+
+            async def main():
+                server = EddaMCPServer(...)
+                await server.initialize()
+
+                # Setup signal handlers for graceful shutdown
+                loop = asyncio.get_running_loop()
+                shutdown_event = asyncio.Event()
+
+                def signal_handler():
+                    shutdown_event.set()
+
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, signal_handler)
+
+                # Run server
+                try:
+                    await server.run_stdio()
+                finally:
+                    await server.shutdown()
+
+            if __name__ == "__main__":
+                asyncio.run(main())
+            ```
+
+        Example (HTTP mode with uvicorn):
+            ```python
+            import asyncio
+            import uvicorn
+
+            async def startup():
+                await server.initialize()
+
+            async def shutdown_handler():
+                await server.shutdown()
+
+            # Use uvicorn lifecycle events
+            config = uvicorn.Config(
+                server.asgi_app(),
+                host="0.0.0.0",
+                port=8000,
+            )
+            server_instance = uvicorn.Server(config)
+
+            # Uvicorn handles SIGTERM/SIGINT automatically
+            await server_instance.serve()
+            await shutdown_handler()
+            ```
+        """
+        await self._edda_app.shutdown()
 
     async def run_stdio(self) -> None:
         """

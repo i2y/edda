@@ -147,8 +147,8 @@ async def async_activity(ctx: WorkflowContext, data: str) -> dict:
 async def mixed_workflow(ctx: WorkflowContext, user_id: str) -> dict:
     # Workflows are always async (for deterministic replay)
     # But can call both sync and async activities
-    user = await create_user_record(ctx, user_id, "user@example.com", activity_id="create:1")
-    data = await async_activity(ctx, user_id, activity_id="fetch:1")
+    user = await create_user_record(ctx, user_id, "user@example.com")
+    data = await async_activity(ctx, user_id)
     return {"user": user, "data": data}
 ```
 
@@ -823,8 +823,8 @@ def process_legacy_data(ctx: WorkflowContext, data: str) -> dict:
 @workflow
 async def order_workflow(ctx: WorkflowContext, order_id: str) -> dict:
     # Both sync and async activities work fine
-    user = await create_user_record(ctx, order_id, activity_id="user:1")  # Sync
-    payment = await process_payment(ctx, 99.99, activity_id="pay:1")  # Async
+    user = await create_user_record(ctx, order_id)  # Sync
+    payment = await process_payment(ctx, 99.99)  # Async
     return {"user": user, "payment": payment}
 ```
 

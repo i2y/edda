@@ -33,7 +33,7 @@ async def mcp_server_with_tool():
     await server._edda_app.initialize()
     yield server
     # Cleanup after tests
-    await server._edda_app.shutdown()
+    await server.shutdown()
 
 
 @pytest.mark.asyncio
@@ -50,7 +50,7 @@ async def test_e2e_workflow_start_to_result(mcp_server_with_tool):
     assert isinstance(instance_id, str)
 
     # Step 2: Check status
-    instance = await server._edda_app.storage.get_instance(instance_id)
+    instance = await server.storage.get_instance(instance_id)
     status = instance["status"]
 
     # Status should be either completed or running
@@ -99,7 +99,7 @@ async def test_multiple_workflows_concurrently(mcp_server_with_tool):
 
     # All should be in database
     for instance_id in instance_ids:
-        instance = await server._edda_app.storage.get_instance(instance_id)
+        instance = await server.storage.get_instance(instance_id)
         assert instance["workflow_name"] == "process_value"
 
 
@@ -113,7 +113,7 @@ async def test_status_tool_usage(mcp_server_with_tool):
     instance_id = await workflow.start(value="status_test")
 
     # Check status via storage (simulating status tool)
-    instance = await server._edda_app.storage.get_instance(instance_id)
+    instance = await server.storage.get_instance(instance_id)
     status = instance["status"]
 
     assert status in ["completed", "running", "failed"]
@@ -141,7 +141,7 @@ async def test_result_tool_before_completion(mcp_server_with_tool):
     instance_id = await workflow.start()
 
     # Immediately check status (should be running)
-    instance = await server._edda_app.storage.get_instance(instance_id)
+    instance = await server.storage.get_instance(instance_id)
     status = instance["status"]
 
     # If still running, output_data should be None
@@ -179,5 +179,5 @@ async def test_pydantic_model_integration(mcp_server_with_tool):
     instance_id = await workflow.start(order=order_input)
 
     # Verify workflow started
-    instance = await server._edda_app.storage.get_instance(instance_id)
+    instance = await server.storage.get_instance(instance_id)
     assert instance["workflow_name"] == "process_order"

@@ -93,21 +93,22 @@ from edda import EddaApp, workflow, activity, WorkflowContext
 
 @activity
 async def process_payment(ctx: WorkflowContext, amount: float):
-    # Durable execution - automatically recorded in history
     print(f"Processing payment: ${amount}")
     return {"status": "paid", "amount": amount}
 
 @workflow
 async def order_workflow(ctx: WorkflowContext, order_id: str, amount: float):
-    # Workflow orchestrates activities with automatic retry on crash
     result = await process_payment(ctx, amount)
     return {"order_id": order_id, **result}
 
-# Simplified example - production code needs:
-# 1. await app.initialize() before starting workflows
-# 2. try-finally with await app.shutdown() for cleanup
-app = EddaApp(service_name="demo-service", db_url="sqlite:///workflow.db")
-instance_id = await order_workflow.start(order_id="ORD-123", amount=99.99)
+async def main():
+    app = EddaApp(service_name="demo-service", db_url="sqlite:///workflow.db")
+    await app.initialize()
+    try:
+        instance_id = await order_workflow.start(order_id="ORD-123", amount=99.99)
+        print(f"Started workflow: {instance_id}")
+    finally:
+        await app.shutdown()
 ```
 
 **What happens on crash?**

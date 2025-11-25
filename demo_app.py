@@ -492,10 +492,10 @@ async def order_processing_workflow(
             {"item_id": "ITEM-2", "name": "Product B", "price": 49.99, "quantity": 1}
         ],
         "shipping_address": {
-            "street": "123 Main St",
-            "city": "San Francisco",
-            "state": "CA",
-            "zip_code": "94102"
+            "street": "221B Baker Street",
+            "city": "London",
+            "state": "Greater London",
+            "zip_code": "NW1 6XE"
         }
     }
 

@@ -272,36 +272,40 @@ async def main():
     # Initialize the app (required before starting workflows)
     await app.initialize()
 
-    # Create order input
-    order = OrderInput(
-        order_id="ORD-12345",
-        customer_email="customer@example.com",
-        items=[
-            OrderItem(product_id="PROD-1", quantity=2, unit_price=29.99),
-            OrderItem(product_id="PROD-2", quantity=1, unit_price=49.99),
-        ],
-        shipping_address=ShippingAddress(
-            street="123 Main St",
-            city="San Francisco",
-            postal_code="94105",
-            country="USA"
+    try:
+        # Create order input
+        order = OrderInput(
+            order_id="ORD-12345",
+            customer_email="customer@example.com",
+            items=[
+                OrderItem(product_id="PROD-1", quantity=2, unit_price=29.99),
+                OrderItem(product_id="PROD-2", quantity=1, unit_price=49.99),
+            ],
+            shipping_address=ShippingAddress(
+                street="1-2-3 Dogenzaka",
+                city="Shibuya",
+                postal_code="150-0001",
+                country="Japan"
+            )
         )
-    )
 
-    # Start workflow
-    print("Starting order processing workflow...")
-    instance_id = await order_processing_workflow.start(input=order)
+        # Start workflow
+        print("Starting order processing workflow...")
+        instance_id = await order_processing_workflow.start(input=order)
 
-    print(f"\n✅ Workflow started: {instance_id}")
+        print(f"\n✅ Workflow started: {instance_id}")
 
-    # Get result
-    instance = await app.storage.get_instance(instance_id)
-    if instance["status"] == "completed":
-        result = instance["output_data"]
-        print(f"📊 Order completed:")
-        print(f"   - Order ID: {result['order_id']}")
-        print(f"   - Total: ${result['total_amount']:.2f}")
-        print(f"   - Tracking: {result['confirmation_number']}")
+        # Get result
+        instance = await app.storage.get_instance(instance_id)
+        if instance["status"] == "completed":
+            result = instance["output_data"]
+            print(f"📊 Order completed:")
+            print(f"   - Order ID: {result['order_id']}")
+            print(f"   - Total: ${result['total_amount']:.2f}")
+            print(f"   - Tracking: {result['confirmation_number']}")
+
+    finally:
+        await app.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -322,7 +326,7 @@ Starting order processing workflow...
 
 📦 Reserving inventory for ORD-12345: $109.97
 💳 Processing payment for ORD-12345: $109.97
-🚚 Shipping ORD-12345 to San Francisco, USA
+🚚 Shipping ORD-12345 to Shibuya, Japan
 
 ✅ Workflow started: <instance_id>
 📊 Order completed:
@@ -364,7 +368,7 @@ uv run python order_workflow.py
 ```
 📦 Reserving inventory for ORD-12345: $109.97
 💳 Processing payment for ORD-12345: $109.97
-🚚 Shipping ORD-12345 to San Francisco, USA
+🚚 Shipping ORD-12345 to Shibuya, Japan
 💥 Exception: Shipping service unavailable!
 
 ❌ Refunding payment for ORD-12345: $109.97

@@ -6,11 +6,10 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
-from edda.workflow import workflow
+from edda.workflow import Workflow, workflow
 
 if TYPE_CHECKING:
     from edda.integrations.mcp.server import EddaMCPServer
-    from edda.workflow import Workflow
 
 
 def create_durable_tool(
@@ -98,7 +97,7 @@ def create_durable_tool(
     async def status_tool(instance_id: str) -> dict[str, Any]:
         """Check workflow status."""
         try:
-            instance = await server._edda_app.storage.get_instance(instance_id)
+            instance = await server.storage.get_instance(instance_id)
             if instance is None:
                 return {
                     "content": [
@@ -142,7 +141,7 @@ def create_durable_tool(
     async def result_tool(instance_id: str) -> dict[str, Any]:
         """Get workflow result (if completed)."""
         try:
-            instance = await server._edda_app.storage.get_instance(instance_id)
+            instance = await server.storage.get_instance(instance_id)
             if instance is None:
                 return {
                     "content": [

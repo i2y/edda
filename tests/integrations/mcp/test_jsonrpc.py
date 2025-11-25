@@ -33,7 +33,7 @@ async def mcp_server():
     await server._edda_app.initialize()
     yield server
     # Cleanup after tests
-    await server._edda_app.shutdown()
+    await server.shutdown()
 
 
 @pytest.mark.asyncio
@@ -74,7 +74,7 @@ async def test_status_tool_checks_workflow_status(mcp_server):
     instance_id = await workflow.start(name="Bob")
 
     # Check status via storage
-    instance = await mcp_server._edda_app.storage.get_instance(instance_id)
+    instance = await mcp_server.storage.get_instance(instance_id)
     status = instance["status"]
 
     # Status should be completed or running
@@ -94,7 +94,7 @@ async def test_result_tool_gets_workflow_result(mcp_server):
     await asyncio.sleep(0.2)
 
     # Get result via storage
-    instance = await mcp_server._edda_app.storage.get_instance(instance_id)
+    instance = await mcp_server.storage.get_instance(instance_id)
 
     # Verify workflow completed
     assert instance["status"] == "completed"
