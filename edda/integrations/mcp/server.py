@@ -207,7 +207,7 @@ class EddaMCPServer:
         def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
             # Use FastMCP's native prompt decorator
             prompt_desc = description or f.__doc__ or f"Prompt: {f.__name__}"
-            return self._mcp.prompt(description=prompt_desc)(f)
+            return cast(Callable[..., Any], self._mcp.prompt(description=prompt_desc)(f))
 
         if func is None:
             return decorator
