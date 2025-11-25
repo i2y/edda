@@ -59,6 +59,11 @@ mysql = [
 mcp = [
     "mcp>=1.22.0",
 ]
+opentelemetry = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+]
 
 [project.scripts]
 edda-viewer = "viewer_app:main"

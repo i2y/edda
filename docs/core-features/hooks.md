@@ -30,9 +30,10 @@ class LogfireHooks(HooksBase):
             instance_id=instance_id,
             workflow_name=workflow_name)
 
-    async def on_activity_complete(self, instance_id, step, activity_name, result, cache_hit):
+    async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
         logfire.info("activity.complete",
             instance_id=instance_id,
+            activity_id=activity_id,
             activity_name=activity_name,
             cache_hit=cache_hit
         )
@@ -69,9 +70,9 @@ The `WorkflowHooks` Protocol defines these methods (all optional):
 | `on_workflow_complete` | `instance_id`, `workflow_name`, `result` | Called when a workflow completes successfully |
 | `on_workflow_failed` | `instance_id`, `workflow_name`, `error` | Called when a workflow fails with an exception |
 | `on_workflow_cancelled` | `instance_id`, `workflow_name` | Called when a workflow is cancelled |
-| `on_activity_start` | `instance_id`, `step`, `activity_name`, `is_replaying` | Called before an activity executes |
-| `on_activity_complete` | `instance_id`, `step`, `activity_name`, `result`, `cache_hit` | Called after an activity completes successfully |
-| `on_activity_failed` | `instance_id`, `step`, `activity_name`, `error` | Called when an activity fails with an exception |
+| `on_activity_start` | `instance_id`, `activity_id`, `activity_name`, `is_replaying` | Called before an activity executes |
+| `on_activity_complete` | `instance_id`, `activity_id`, `activity_name`, `result`, `cache_hit` | Called after an activity completes successfully |
+| `on_activity_failed` | `instance_id`, `activity_id`, `activity_name`, `error` | Called when an activity fails with an exception |
 | `on_event_sent` | `event_type`, `event_source`, `event_data` | Called when an event is sent (transactional outbox) |
 | `on_event_received` | `instance_id`, `event_type`, `event_data` | Called when a workflow receives an awaited event |
 
@@ -150,8 +151,9 @@ class LogfireHooks(HooksBase):
             instance_id=instance_id,
             workflow_name=workflow_name)
 
-    async def on_activity_complete(self, instance_id, step, activity_name, result, cache_hit):
+    async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
         logfire.info("activity.complete",
+            activity_id=activity_id,
             activity_name=activity_name,
             cache_hit=cache_hit)
 
@@ -181,7 +183,7 @@ class DatadogHooks(HooksBase):
             span.set_tag("workflow.name", workflow_name)
             span.set_tag("instance.id", instance_id)
 
-    async def on_activity_complete(self, instance_id, step, activity_name, result, cache_hit):
+    async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
         statsd.increment('edda.activity.completed',
             tags=[f'activity:{activity_name}', f'cache_hit:{cache_hit}'])
 ```
@@ -199,7 +201,7 @@ class PrometheusHooks(HooksBase):
     async def on_workflow_start(self, instance_id, workflow_name, input_data):
         workflow_started.labels(workflow_name=workflow_name).inc()
 
-    async def on_activity_complete(self, instance_id, step, activity_name, result, cache_hit):
+    async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
         activity_executed.labels(activity_name=activity_name, cache_hit=str(cache_hit)).inc()
 ```
 
@@ -218,17 +220,50 @@ class SentryHooks(HooksBase):
             })
             sentry_sdk.capture_exception(error)
 
-    async def on_activity_failed(self, instance_id, step, activity_name, error):
+    async def on_activity_failed(self, instance_id, activity_id, activity_name, error):
         with sentry_sdk.push_scope() as scope:
             scope.set_context("activity", {
                 "instance_id": instance_id,
+                "activity_id": activity_id,
                 "activity_name": activity_name,
             })
             sentry_sdk.capture_exception(error)
 ```
 
+### OpenTelemetry (Official Integration)
+
+Edda provides an official OpenTelemetry integration with full tracing, optional metrics, and W3C Trace Context propagation.
+
+```python
+from edda import EddaApp
+from edda.integrations.opentelemetry import OpenTelemetryHooks
+
+hooks = OpenTelemetryHooks(
+    service_name="order-service",
+    otlp_endpoint="http://localhost:4317",  # Optional
+    enable_metrics=True,  # Optional
+)
+
+app = EddaApp(
+    service_name="order-service",
+    db_url="sqlite:///workflow.db",
+    hooks=hooks,
+)
+```
+
+**Features:**
+
+- ✅ Distributed tracing with parent-child span relationships
+- ✅ Optional metrics (counters, histograms)
+- ✅ W3C Trace Context propagation via CloudEvents
+- ✅ Automatic context inheritance from ASGI/WSGI middleware
+
+👉 **See [OpenTelemetry Integration](../integrations/opentelemetry.md) for full documentation.**
+
 ## See Also
 
+- **[OpenTelemetry Integration](../integrations/opentelemetry.md)**: Official OpenTelemetry integration with full documentation
 - **[Complete Logfire Example](https://github.com/i2y/edda/blob/main/examples/observability_with_logfire.py)**: Full implementation with multiple workflows
+- **[Complete OpenTelemetry Example](https://github.com/i2y/edda/blob/main/examples/observability_with_opentelemetry.py)**: Full implementation with tracing, optional metrics, and CloudEvents context propagation
 - **[Observability Guide](https://github.com/i2y/edda/blob/main/examples/README_observability.md)**: Detailed guide with more integration examples
 - **[API Reference](https://github.com/i2y/edda/blob/main/edda/hooks.py)**: WorkflowHooks Protocol definition

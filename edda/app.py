@@ -238,7 +238,9 @@ class EddaApp:
         Register a default CloudEvent handler for a workflow.
 
         The default handler extracts the CloudEvent data and passes it
-        as kwargs to workflow.start().
+        as kwargs to workflow.start(). If the CloudEvent contains
+        traceparent/tracestate extension attributes (for distributed tracing),
+        they are automatically injected into _trace_context.
 
         Args:
             event_type: CloudEvent type (same as workflow name)
@@ -250,11 +252,24 @@ class EddaApp:
             # Extract data from CloudEvent
             data = event.get_data()
 
+            # Extract trace context from CloudEvent extension attributes
+            # (W3C Trace Context: traceparent, tracestate)
+            trace_context: dict[str, str] = {}
+            attrs = event.get_attributes()
+            if "traceparent" in attrs:
+                trace_context["traceparent"] = str(attrs["traceparent"])
+            if "tracestate" in attrs:
+                trace_context["tracestate"] = str(attrs["tracestate"])
+
             # Start workflow with data as kwargs
             if isinstance(data, dict):
+                # Inject trace context if present
+                if trace_context:
+                    data = {**data, "_trace_context": trace_context}
                 await wf.start(**data)
             else:
                 # If data is not a dict, start without arguments
+                # (trace context cannot be injected)
                 await wf.start()
 
         # Register the handler

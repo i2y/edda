@@ -12,8 +12,8 @@ Example:
     ...     async def on_workflow_start(self, instance_id, workflow_name, input_data):
     ...         print(f"Workflow {workflow_name} started: {instance_id}")
     ...
-    ...     async def on_activity_complete(self, instance_id, step, activity_name, result, cache_hit):
-    ...         print(f"Activity {activity_name} completed (cache_hit={cache_hit})")
+    ...     async def on_activity_complete(self, instance_id, activity_id, activity_name, result, cache_hit):
+    ...         print(f"Activity {activity_name} ({activity_id}) completed (cache_hit={cache_hit})")
     >>>
     >>> app = EddaApp(service_name="my-service", db_url="...", hooks=MyHooks())
 """
@@ -86,7 +86,7 @@ class WorkflowHooks(Protocol):
     async def on_activity_start(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         is_replaying: bool,
     ) -> None:
@@ -95,7 +95,7 @@ class WorkflowHooks(Protocol):
 
         Args:
             instance_id: Unique workflow instance ID
-            step: Step number in the workflow
+            activity_id: Activity ID (e.g., "reserve_inventory:1")
             activity_name: Name of the activity function
             is_replaying: True if this is a replay (cached result)
         """
@@ -104,7 +104,7 @@ class WorkflowHooks(Protocol):
     async def on_activity_complete(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         result: Any,
         cache_hit: bool,
@@ -114,7 +114,7 @@ class WorkflowHooks(Protocol):
 
         Args:
             instance_id: Unique workflow instance ID
-            step: Step number in the workflow
+            activity_id: Activity ID (e.g., "reserve_inventory:1")
             activity_name: Name of the activity function
             result: Return value from the activity
             cache_hit: True if result was retrieved from cache (replay)
@@ -124,7 +124,7 @@ class WorkflowHooks(Protocol):
     async def on_activity_failed(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         error: Exception,
     ) -> None:
@@ -133,7 +133,7 @@ class WorkflowHooks(Protocol):
 
         Args:
             instance_id: Unique workflow instance ID
-            step: Step number in the workflow
+            activity_id: Activity ID (e.g., "reserve_inventory:1")
             activity_name: Name of the activity function
             error: Exception that caused the failure
         """
@@ -231,7 +231,7 @@ class HooksBase(WorkflowHooks, ABC):
     async def on_activity_start(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         is_replaying: bool,
     ) -> None:
@@ -240,7 +240,7 @@ class HooksBase(WorkflowHooks, ABC):
     async def on_activity_complete(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         result: Any,
         cache_hit: bool,
@@ -250,7 +250,7 @@ class HooksBase(WorkflowHooks, ABC):
     async def on_activity_failed(
         self,
         instance_id: str,
-        step: int,
+        activity_id: str,
         activity_name: str,
         error: Exception,
     ) -> None:
