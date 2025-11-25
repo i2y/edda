@@ -5,12 +5,11 @@ import pytest
 # Skip all tests if mcp is not installed
 pytest.importorskip("mcp")
 
-from edda import WorkflowContext, activity
-from edda.integrations.mcp import EddaMCPServer
-
-# Import prompt types from MCP
 from mcp.server.fastmcp.prompts.base import UserMessage  # type: ignore[import-not-found]
 from mcp.types import TextContent  # type: ignore[import-not-found]
+
+from edda import WorkflowContext, activity
+from edda.integrations.mcp import EddaMCPServer
 
 
 @pytest.fixture

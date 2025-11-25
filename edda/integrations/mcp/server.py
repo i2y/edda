@@ -107,7 +107,7 @@ class EddaMCPServer:
         self._workflows: dict[str, Workflow] = {}
 
     @property
-    def storage(self) -> "StorageProtocol":
+    def storage(self) -> StorageProtocol:
         """
         Access workflow storage for querying instances and history.
 
