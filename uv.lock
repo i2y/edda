@@ -668,7 +668,7 @@ wheels = [
 
 [[package]]
 name = "edda-framework"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "a2wsgi" },
