@@ -53,8 +53,8 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies (all database drivers)
-        run: uv sync --extra dev --extra postgresql --extra mysql
+      - name: Install dependencies (all database drivers and opentelemetry)
+        run: uv sync --extra dev --extra postgresql --extra mysql --extra opentelemetry
 
       - name: Run tests (all databases)
         env:
