@@ -653,7 +653,7 @@ def process_payment(ctx: WorkflowContext, amount: float) -> dict:
 @workflow
 async def payment_workflow(ctx: WorkflowContext, order_id: str) -> dict:
     # Workflows still use async (for deterministic replay)
-    result = await process_payment(ctx, 99.99, activity_id="pay:1")
+    result = await process_payment(ctx, 99.99)
     return result
 ```
 
@@ -692,13 +692,14 @@ if __name__ == "__main__":
 
 ### Auto-Generated Tools
 
-Each `@durable_tool` automatically generates **three MCP tools**:
+Each `@durable_tool` automatically generates **four MCP tools**:
 
 1. **Main tool** (`process_order`): Starts the workflow, returns instance ID
-2. **Status tool** (`process_order_status`): Checks workflow progress
+2. **Status tool** (`process_order_status`): Checks workflow progress with completed activity count and suggested poll interval
 3. **Result tool** (`process_order_result`): Gets final result when completed
+4. **Cancel tool** (`process_order_cancel`): Cancels workflow if running or waiting, executes compensation handlers
 
-This enables AI assistants to work with workflows that take minutes, hours, or even days to complete.
+This enables AI assistants to work with workflows that take minutes, hours, or even days to complete, with full control over the workflow lifecycle.
 
 ### MCP Prompts
 

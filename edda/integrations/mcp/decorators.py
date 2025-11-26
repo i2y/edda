@@ -19,14 +19,15 @@ def create_durable_tool(
     description: str = "",
 ) -> Workflow:
     """
-    Create a durable workflow tool with auto-generated status/result tools.
+    Create a durable workflow tool with auto-generated status/result/cancel tools.
 
     This function:
     1. Wraps the function as an Edda @workflow
-    2. Registers three MCP tools:
+    2. Registers four MCP tools:
        - {name}: Start workflow, return instance_id
        - {name}_status: Check workflow status
        - {name}_result: Get workflow result
+       - {name}_cancel: Cancel workflow (if running or waiting)
 
     Args:
         server: EddaMCPServer instance
@@ -93,9 +94,9 @@ def create_durable_tool(
     status_tool_name = f"{workflow_name}_status"
     status_tool_description = f"Check status of {workflow_name} workflow"
 
-    @server._mcp.tool(name=status_tool_name, description=status_tool_description)  # type: ignore[misc]
+    @server._mcp.tool(name=status_tool_name, description=status_tool_description)
     async def status_tool(instance_id: str) -> dict[str, Any]:
-        """Check workflow status."""
+        """Check workflow status with progress metadata."""
         try:
             instance = await server.storage.get_instance(instance_id)
             if instance is None:
@@ -112,9 +113,22 @@ def create_durable_tool(
             status = instance["status"]
             current_activity_id = instance.get("current_activity_id", "N/A")
 
+            # Get history to count completed activities
+            history = await server.storage.get_history(instance_id)
+            completed_activities = len(
+                [h for h in history if h["event_type"] == "ActivityCompleted"]
+            )
+
+            # Suggest poll interval based on status
+            # Running workflows need more frequent polling (5s)
+            # Waiting workflows need less frequent polling (10s)
+            suggested_poll_interval_ms = 5000 if status == "running" else 10000
+
             status_text = (
                 f"Workflow Status: {status}\n"
                 f"Current Activity: {current_activity_id}\n"
+                f"Completed Activities: {completed_activities}\n"
+                f"Suggested Poll Interval: {suggested_poll_interval_ms}ms\n"
                 f"Instance ID: {instance_id}"
             )
 
@@ -137,7 +151,7 @@ def create_durable_tool(
     result_tool_name = f"{workflow_name}_result"
     result_tool_description = f"Get result of {workflow_name} workflow (if completed)"
 
-    @server._mcp.tool(name=result_tool_name, description=result_tool_description)  # type: ignore[misc]
+    @server._mcp.tool(name=result_tool_name, description=result_tool_description)
     async def result_tool(instance_id: str) -> dict[str, Any]:
         """Get workflow result (if completed)."""
         try:
@@ -179,6 +193,88 @@ def create_durable_tool(
                     {
                         "type": "text",
                         "text": f"Error getting result: {str(e)}",
+                    }
+                ],
+                "isError": True,
+            }
+
+    # 5. Generate cancel tool
+    cancel_tool_name = f"{workflow_name}_cancel"
+    cancel_tool_description = f"Cancel {workflow_name} workflow (if running or waiting)"
+
+    @server._mcp.tool(name=cancel_tool_name, description=cancel_tool_description)
+    async def cancel_tool(instance_id: str) -> dict[str, Any]:
+        """Cancel a running or waiting workflow."""
+        try:
+            # Check if instance exists
+            instance = await server.storage.get_instance(instance_id)
+            if instance is None:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Workflow instance not found: {instance_id}",
+                        }
+                    ],
+                    "isError": True,
+                }
+
+            current_status = instance["status"]
+
+            # Check if replay_engine is available
+            if server.replay_engine is None:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Server not initialized. Call server.initialize() first.",
+                        }
+                    ],
+                    "isError": True,
+                }
+
+            # Try to cancel
+            success = await server.replay_engine.cancel_workflow(
+                instance_id=instance_id,
+                cancelled_by="mcp_user",
+            )
+
+            if success:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Workflow '{workflow_name}' cancelled successfully.\n"
+                                f"Instance ID: {instance_id}\n"
+                                f"Compensations executed.\n\n"
+                                f"The workflow has been stopped and any side effects "
+                                f"have been rolled back."
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                }
+            else:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Cannot cancel workflow: {instance_id}\n"
+                                f"Current status: {current_status}\n"
+                                f"Only running or waiting workflows can be cancelled."
+                            ),
+                        }
+                    ],
+                    "isError": True,
+                }
+        except Exception as e:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Error cancelling workflow: {str(e)}",
                     }
                 ],
                 "isError": True,

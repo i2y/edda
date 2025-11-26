@@ -54,7 +54,7 @@ async def test_prompt_with_workflow_state(mcp_server):
 
     @mcp_server.durable_tool(description="Test workflow")
     async def test_workflow(ctx: WorkflowContext, value: str):
-        result = await test_activity(ctx, value, activity_id="test:1")
+        result = await test_activity(ctx, value)
         return result
 
     # Start workflow
@@ -182,8 +182,8 @@ async def test_prompt_accesses_workflow_history(mcp_server):
 
     @mcp_server.durable_tool(description="Multi-step workflow")
     async def multi_step(ctx: WorkflowContext):
-        await step_one(ctx, activity_id="step1:1")
-        await step_two(ctx, activity_id="step2:1")
+        await step_one(ctx)
+        await step_two(ctx)
         return {"completed": True}
 
     # Start and complete workflow

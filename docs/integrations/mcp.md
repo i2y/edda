@@ -7,10 +7,11 @@ Edda provides seamless integration with the [Model Context Protocol (MCP)](https
 MCP is a standardized protocol for AI tool integration. Edda's MCP integration automatically converts your durable workflows into MCP-compliant tools that:
 
 - **Start workflows** and return instance IDs immediately
-- **Check workflow status** to monitor progress
+- **Check workflow status** to monitor progress with completed activity count and suggested poll interval
 - **Retrieve results** when workflows complete
+- **Cancel workflows** if running or waiting, with automatic compensation execution
 
-This enables AI assistants to work with long-running processes that may take minutes, hours, or even days to complete.
+This enables AI assistants to work with long-running processes that may take minutes, hours, or even days to complete, with full control over the workflow lifecycle.
 
 ## Installation
 
@@ -97,7 +98,7 @@ Add to your MCP client configuration (e.g., Claude Desktop: `~/Library/Applicati
 
 ## Auto-Generated Tools
 
-Each `@durable_tool` automatically generates **three MCP tools**:
+Each `@durable_tool` automatically generates **four MCP tools**:
 
 ### 1. Main Tool: Start Workflow
 
@@ -125,11 +126,15 @@ Input: {"instance_id": "abc123..."}
 Output: {
   "content": [{
     "type": "text",
-    "text": "Workflow Status: running\nCurrent Activity: payment:1\nInstance ID: abc123..."
+    "text": "Workflow Status: running\nCurrent Activity: payment:1\nCompleted Activities: 1\nSuggested Poll Interval: 5000ms\nInstance ID: abc123..."
   }],
   "isError": false
 }
 ```
+
+The status tool provides progress metadata for efficient polling:
+- **Completed Activities**: Number of activities that have finished
+- **Suggested Poll Interval**: Recommended wait time before checking again (5000ms for running, 10000ms for waiting)
 
 ### 3. Result Tool: Get Final Result
 
@@ -146,6 +151,27 @@ Output: {
   "isError": false
 }
 ```
+
+### 4. Cancel Tool: Stop Workflow
+
+```
+Tool Name: process_order_cancel
+Description: Cancel process_order workflow (if running or waiting)
+
+Input: {"instance_id": "abc123..."}
+Output: {
+  "content": [{
+    "type": "text",
+    "text": "Workflow 'process_order' cancelled successfully.\nInstance ID: abc123...\nCompensations executed.\n\nThe workflow has been stopped and any side effects have been rolled back."
+  }],
+  "isError": false
+}
+```
+
+The cancel tool:
+- Only works on workflows with status `running`, `waiting_for_event`, or `waiting_for_timer`
+- Automatically executes SAGA compensation transactions to roll back side effects
+- Returns an error for already completed, failed, or cancelled workflows
 
 ## Advanced Configuration
 

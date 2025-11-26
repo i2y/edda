@@ -26,7 +26,7 @@ async def mcp_server():
 
     @server.durable_tool(description="Greet a user")
     async def greet_workflow(ctx: WorkflowContext, name: str):
-        result = await greet_user(ctx, name, activity_id="greet:1")
+        result = await greet_user(ctx, name)
         return result
 
     # Initialize the EddaApp

@@ -9,10 +9,11 @@ from edda.app import EddaApp
 from edda.workflow import Workflow
 
 if TYPE_CHECKING:
+    from edda.replay import ReplayEngine
     from edda.storage.protocol import StorageProtocol
 
 try:
-    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+    from mcp.server.fastmcp import FastMCP
 except ImportError as e:
     raise ImportError(
         "MCP Python SDK is required for MCP integration. "
@@ -68,10 +69,11 @@ class EddaMCPServer:
             asyncio.run(main())
         ```
 
-    The server automatically generates three MCP tools for each @durable_tool:
+    The server automatically generates four MCP tools for each @durable_tool:
     - `tool_name`: Start the workflow, returns instance_id
     - `tool_name_status`: Check workflow status
     - `tool_name_result`: Get workflow result (if completed)
+    - `tool_name_cancel`: Cancel workflow (if running or waiting)
     """
 
     def __init__(
@@ -122,6 +124,24 @@ class EddaMCPServer:
         """
         return self._edda_app.storage
 
+    @property
+    def replay_engine(self) -> ReplayEngine | None:
+        """
+        Access replay engine for workflow operations (cancel, resume, etc.).
+
+        Returns:
+            ReplayEngine or None if not initialized
+
+        Example:
+            ```python
+            # Cancel a running workflow
+            success = await server.replay_engine.cancel_workflow(
+                instance_id, "mcp_user"
+            )
+            ```
+        """
+        return self._edda_app.replay_engine
+
     def durable_tool(
         self,
         func: Callable[..., Any] | None = None,
@@ -131,10 +151,11 @@ class EddaMCPServer:
         """
         Decorator to define a durable workflow tool.
 
-        Automatically generates three MCP tools:
+        Automatically generates four MCP tools:
         1. Main tool: Starts the workflow, returns instance_id
         2. Status tool: Checks workflow status
         3. Result tool: Gets workflow result (if completed)
+        4. Cancel tool: Cancels workflow (if running or waiting)
 
         Args:
             func: Workflow function (async)
@@ -207,7 +228,7 @@ class EddaMCPServer:
         def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
             # Use FastMCP's native prompt decorator
             prompt_desc = description or f.__doc__ or f"Prompt: {f.__name__}"
-            return cast(Callable[..., Any], self._mcp.prompt(description=prompt_desc)(f))
+            return self._mcp.prompt(description=prompt_desc)(f)
 
         if func is None:
             return decorator
@@ -228,8 +249,8 @@ class EddaMCPServer:
         Returns:
             ASGI callable (Starlette app)
         """
-        from starlette.requests import Request  # type: ignore[import-not-found]
-        from starlette.responses import Response  # type: ignore[import-not-found]
+        from starlette.requests import Request
+        from starlette.responses import Response
 
         # Get MCP's Starlette app (Issue #1367 workaround: use directly)
         app = self._mcp.streamable_http_app()
@@ -270,14 +291,13 @@ class EddaMCPServer:
         app.router.add_route("/cancel/{instance_id}", edda_cancel_handler, methods=["POST"])
 
         # Add authentication middleware if token_verifier provided (AFTER adding routes)
+        result_app: Any = app
         if self._token_verifier is not None:
-            from starlette.middleware.base import (  # type: ignore[import-not-found]
-                BaseHTTPMiddleware,
-            )
+            from starlette.middleware.base import BaseHTTPMiddleware
 
-            class AuthMiddleware(BaseHTTPMiddleware):  # type: ignore[misc]
-                def __init__(self, app: Any, token_verifier: Callable[[str], bool]):
-                    super().__init__(app)
+            class AuthMiddleware(BaseHTTPMiddleware):
+                def __init__(self, app_inner: Any, token_verifier: Callable[[str], bool]) -> None:
+                    super().__init__(app_inner)
                     self.token_verifier = token_verifier
 
                 async def dispatch(
@@ -288,12 +308,13 @@ class EddaMCPServer:
                         token = auth_header[7:]
                         if not self.token_verifier(token):
                             return Response("Unauthorized", status_code=401)
-                    return await call_next(request)
+                    response: Response = await call_next(request)
+                    return response
 
             # Wrap app with auth middleware
-            app = AuthMiddleware(app, self._token_verifier)
+            result_app = AuthMiddleware(app, self._token_verifier)
 
-        return cast(Callable[..., Any], app)
+        return cast(Callable[..., Any], result_app)
 
     async def initialize(self) -> None:
         """

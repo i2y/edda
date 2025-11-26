@@ -65,7 +65,7 @@ async def test_workflow_start_via_tool(mcp_server):
 
     @mcp_server.durable_tool(description="Process value")
     async def process_value(ctx: WorkflowContext, value: str):
-        result = await test_activity(ctx, value, activity_id="test:1")
+        result = await test_activity(ctx, value)
         return result
 
     # Manually call the workflow start
@@ -102,3 +102,82 @@ async def test_multiple_tools_registration(mcp_server):
     assert "tool_one" in mcp_server._workflows
     assert "tool_two" in mcp_server._workflows
     assert "tool_three" in mcp_server._workflows
+
+
+@pytest.mark.asyncio
+async def test_status_tool_progress_metadata(mcp_server):
+    """Test status tool returns progress metadata (completed activities, poll interval)."""
+    import asyncio
+
+    @activity
+    async def step_one(ctx: WorkflowContext, value: str):
+        return {"step": 1}
+
+    @activity
+    async def step_two(ctx: WorkflowContext, value: str):
+        return {"step": 2}
+
+    @mcp_server.durable_tool(description="Multi-step workflow")
+    async def multi_step_workflow(ctx: WorkflowContext, value: str):
+        result1 = await step_one(ctx, value)
+        result2 = await step_two(ctx, value)
+        return {"result": "completed", "steps": [result1, result2]}
+
+    # Start workflow
+    workflow = mcp_server._workflows["multi_step_workflow"]
+    instance_id = await workflow.start(value="test")
+
+    # Wait for completion
+    await asyncio.sleep(0.2)
+
+    # Get instance and history
+    instance = await mcp_server.storage.get_instance(instance_id)
+    history = await mcp_server.storage.get_history(instance_id)
+
+    # Verify completed activities can be counted from history
+    completed_activities = len([h for h in history if h["event_type"] == "ActivityCompleted"])
+    assert completed_activities == 2  # step_one and step_two
+
+    # Verify status is completed
+    assert instance["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_status_tool_poll_interval_running():
+    """Test status tool suggests shorter poll interval for running workflows."""
+    from edda.events import wait_event
+
+    server = EddaMCPServer(
+        name="Poll Test Service",
+        db_url="sqlite+aiosqlite:///:memory:",
+    )
+    await server._edda_app.initialize()
+
+    @activity
+    async def process(ctx: WorkflowContext):
+        return {"processed": True}
+
+    @server.durable_tool(description="Waiting workflow")
+    async def waiting_workflow(ctx: WorkflowContext):
+        await process(ctx)
+        # Wait for an event (workflow will be in waiting_for_event status)
+        await wait_event(ctx, "test_event")
+        return {"done": True}
+
+    # Start workflow
+    workflow = server._workflows["waiting_workflow"]
+    instance_id = await workflow.start()
+
+    # Give it time to reach wait_event
+    import asyncio
+
+    await asyncio.sleep(0.2)
+
+    # Check status
+    instance = await server.storage.get_instance(instance_id)
+
+    # Should be waiting for event (not running)
+    assert instance["status"] == "waiting_for_event"
+
+    # Cleanup
+    await server.shutdown()

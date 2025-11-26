@@ -26,7 +26,7 @@ async def mcp_server_with_tool():
 
     @server.durable_tool(description="Process input value")
     async def process_value(ctx: WorkflowContext, value: str):
-        result = await process_step(ctx, value, activity_id="process:1")
+        result = await process_step(ctx, value)
         return result
 
     # Initialize the EddaApp
@@ -132,7 +132,7 @@ async def test_result_tool_before_completion(mcp_server_with_tool):
 
     @server.durable_tool(description="Long workflow")
     async def long_workflow(ctx: WorkflowContext):
-        result = await long_running_step(ctx, activity_id="long:1")
+        result = await long_running_step(ctx)
         return result
 
     workflow = server._workflows["long_workflow"]
