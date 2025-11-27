@@ -684,11 +684,13 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "black" },
+    { name = "mcp" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "starlette" },
     { name = "testcontainers", extra = ["mysql"] },
     { name = "tsuno" },
 ]
@@ -729,6 +731,7 @@ requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=25.9.0" },
     { name = "cloudevents", specifier = ">=1.12.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.22.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.22.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.18.2" },
     { name = "nicegui", marker = "extra == 'viewer'", specifier = ">=2.8.0" },
@@ -741,6 +744,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
+    { name = "starlette", marker = "extra == 'dev'", specifier = ">=0.40.0" },
     { name = "testcontainers", extras = ["mysql"], marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "testcontainers", extras = ["postgres"], marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "tsuno", marker = "extra == 'dev'", specifier = ">=0.1.3" },
