@@ -74,6 +74,7 @@ nav = [
   ]},
   { "Integrations" = [
     { "MCP Integration" = "integrations/mcp.md" },
+    { "OpenTelemetry Integration" = "integrations/opentelemetry.md" },
   ]},
   { "Viewer UI" = [
     { "Setup" = "viewer-ui/setup.md" },

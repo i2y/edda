@@ -46,6 +46,7 @@ Edda's waiting functions make it ideal for time-based and event-driven business 
 - **📦 Scheduled Notifications**: Shipping updates, subscription renewals, appointment reminders
 
 **Waiting functions**:
+
 - `wait_timer(duration_seconds)`: Wait for a relative duration
 - `wait_until(until_time)`: Wait until an absolute datetime (e.g., campaign end date)
 - `wait_event(event_type)`: Wait for external events (near real-time response)

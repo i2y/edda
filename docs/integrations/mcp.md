@@ -133,6 +133,7 @@ Output: {
 ```
 
 The status tool provides progress metadata for efficient polling:
+
 - **Completed Activities**: Number of activities that have finished
 - **Suggested Poll Interval**: Recommended wait time before checking again (5000ms for running, 10000ms for waiting)
 
@@ -169,6 +170,7 @@ Output: {
 ```
 
 The cancel tool:
+
 - Only works on workflows with status `running`, `waiting_for_event`, or `waiting_for_timer`
 - Automatically executes SAGA compensation transactions to roll back side effects
 - Returns an error for already completed, failed, or cancelled workflows

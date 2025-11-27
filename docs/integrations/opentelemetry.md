@@ -76,11 +76,13 @@ workflow:order_workflow (parent)
 ## Span Attributes
 
 **Workflow Spans**:
+
 - `edda.workflow.instance_id`
 - `edda.workflow.name`
 - `edda.workflow.cancelled` (when cancelled)
 
 **Activity Spans**:
+
 - `edda.activity.id` (e.g., "reserve_inventory:1")
 - `edda.activity.name`
 - `edda.activity.is_replaying`
@@ -107,10 +109,12 @@ When `enable_metrics=True`:
 OpenTelemetryHooks automatically inherits trace context from multiple sources, with the following priority:
 
 1. **Explicit `_trace_context` in input_data** (highest priority)
+
    - Extracted from CloudEvents extension attributes
    - Useful for cross-service trace propagation
 
 2. **Current active span** (e.g., from ASGI/WSGI middleware)
+
    - Automatically detected using `trace.get_current_span()`
    - Works with OpenTelemetry instrumentation middleware
 
