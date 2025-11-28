@@ -774,11 +774,17 @@ class SQLAlchemyStorage:
     async def list_instances(
         self,
         limit: int = 50,
+        page_token: str | None = None,
         status_filter: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """List workflow instances with optional filtering."""
+        workflow_name_filter: str | None = None,
+        instance_id_filter: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> dict[str, Any]:
+        """List workflow instances with cursor-based pagination and filtering."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
+            # Base query with JOIN
             stmt = (
                 select(WorkflowInstance, WorkflowDefinition.source_code)
                 .join(
@@ -788,17 +794,105 @@ class SQLAlchemyStorage:
                         WorkflowInstance.source_hash == WorkflowDefinition.source_hash,
                     ),
                 )
-                .order_by(WorkflowInstance.started_at.desc())
-                .limit(limit)
+                .order_by(
+                    WorkflowInstance.started_at.desc(),
+                    WorkflowInstance.instance_id.desc(),
+                )
             )
 
+            # Apply cursor-based pagination (page_token format: "ISO_DATETIME||INSTANCE_ID")
+            if page_token:
+                # Parse page_token: || separates datetime and instance_id
+                separator = "||"
+                if separator in page_token:
+                    cursor_time_str, cursor_id = page_token.split(separator, 1)
+                    cursor_time = datetime.fromisoformat(cursor_time_str)
+                    # Use _make_datetime_comparable for SQLite compatibility
+                    started_at_comparable = self._make_datetime_comparable(
+                        WorkflowInstance.started_at
+                    )
+                    # For SQLite, also wrap the cursor_time in func.datetime()
+                    cursor_time_comparable: Any
+                    if self.engine.dialect.name == "sqlite":
+                        cursor_time_comparable = func.datetime(cursor_time_str)
+                    else:
+                        cursor_time_comparable = cursor_time
+                    # For DESC order, we want rows where (started_at, instance_id) < cursor
+                    stmt = stmt.where(
+                        or_(
+                            started_at_comparable < cursor_time_comparable,
+                            and_(
+                                started_at_comparable == cursor_time_comparable,
+                                WorkflowInstance.instance_id < cursor_id,
+                            ),
+                        )
+                    )
+
+            # Apply status filter
             if status_filter:
                 stmt = stmt.where(WorkflowInstance.status == status_filter)
+
+            # Apply workflow name and/or instance ID filter (partial match, case-insensitive)
+            # When both filters have the same value (unified search), use OR logic
+            if workflow_name_filter and instance_id_filter:
+                if workflow_name_filter == instance_id_filter:
+                    # Unified search: match either workflow name OR instance ID
+                    stmt = stmt.where(
+                        or_(
+                            WorkflowInstance.workflow_name.ilike(f"%{workflow_name_filter}%"),
+                            WorkflowInstance.instance_id.ilike(f"%{instance_id_filter}%"),
+                        )
+                    )
+                else:
+                    # Separate filters: match both (AND logic)
+                    stmt = stmt.where(
+                        WorkflowInstance.workflow_name.ilike(f"%{workflow_name_filter}%")
+                    )
+                    stmt = stmt.where(WorkflowInstance.instance_id.ilike(f"%{instance_id_filter}%"))
+            elif workflow_name_filter:
+                stmt = stmt.where(WorkflowInstance.workflow_name.ilike(f"%{workflow_name_filter}%"))
+            elif instance_id_filter:
+                stmt = stmt.where(WorkflowInstance.instance_id.ilike(f"%{instance_id_filter}%"))
+
+            # Apply date range filters (use _make_datetime_comparable for SQLite)
+            if started_after or started_before:
+                started_at_comparable = self._make_datetime_comparable(WorkflowInstance.started_at)
+                if started_after:
+                    started_after_comparable: Any
+                    if self.engine.dialect.name == "sqlite":
+                        started_after_comparable = func.datetime(started_after.isoformat())
+                    else:
+                        started_after_comparable = started_after
+                    stmt = stmt.where(started_at_comparable >= started_after_comparable)
+                if started_before:
+                    started_before_comparable: Any
+                    if self.engine.dialect.name == "sqlite":
+                        started_before_comparable = func.datetime(started_before.isoformat())
+                    else:
+                        started_before_comparable = started_before
+                    stmt = stmt.where(started_at_comparable <= started_before_comparable)
+
+            # Fetch limit+1 to determine if there are more pages
+            stmt = stmt.limit(limit + 1)
 
             result = await session.execute(stmt)
             rows = result.all()
 
-            return [
+            # Determine has_more and next_page_token
+            has_more = len(rows) > limit
+            if has_more:
+                rows = rows[:limit]  # Trim to actual limit
+
+            # Generate next_page_token from last row
+            next_page_token: str | None = None
+            if has_more and rows:
+                last_instance = rows[-1][0]
+                # Format: ISO_DATETIME||INSTANCE_ID (using || as separator)
+                next_page_token = (
+                    f"{last_instance.started_at.isoformat()}||{last_instance.instance_id}"
+                )
+
+            instances = [
                 {
                     "instance_id": instance.instance_id,
                     "workflow_name": instance.workflow_name,
@@ -819,6 +913,12 @@ class SQLAlchemyStorage:
                 }
                 for instance, source_code in rows
             ]
+
+            return {
+                "instances": instances,
+                "next_page_token": next_page_token,
+                "has_more": has_more,
+            }
 
     # -------------------------------------------------------------------------
     # Distributed Locking Methods (ALWAYS use separate session/transaction)

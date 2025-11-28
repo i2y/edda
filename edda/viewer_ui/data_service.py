@@ -5,7 +5,8 @@ Data service for retrieving workflow instance data from storage.
 import inspect
 import json
 import logging
-from typing import Any
+from datetime import datetime
+from typing import Any, cast
 
 from edda.pydantic_utils import is_pydantic_model
 from edda.storage.protocol import StorageProtocol
@@ -36,8 +37,46 @@ class WorkflowDataService:
         Returns:
             List of workflow instance dictionaries
         """
-        instances = await self.storage.list_instances(limit=limit)
-        return instances
+        result = await self.storage.list_instances(limit=limit)
+        return cast(list[dict[str, Any]], result["instances"])
+
+    async def get_instances_paginated(
+        self,
+        page_size: int = 20,
+        page_token: str | None = None,
+        status_filter: str | None = None,
+        search_query: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get workflow instances with cursor-based pagination and filtering.
+
+        Args:
+            page_size: Number of instances per page (10, 20, or 50)
+            page_token: Cursor for pagination (from previous response)
+            status_filter: Filter by status (e.g., "running", "completed", "failed")
+            search_query: Search by workflow name or instance ID (partial match)
+            started_after: Filter instances started after this datetime
+            started_before: Filter instances started before this datetime
+
+        Returns:
+            Dictionary containing:
+            - instances: List of workflow instances
+            - next_page_token: Cursor for next page, or None
+            - has_more: Boolean indicating if more pages exist
+        """
+        # Use search_query for both workflow_name_filter and instance_id_filter
+        result = await self.storage.list_instances(
+            limit=page_size,
+            page_token=page_token,
+            status_filter=status_filter,
+            workflow_name_filter=search_query,
+            instance_id_filter=search_query,
+            started_after=started_after,
+            started_before=started_before,
+        )
+        return result
 
     async def get_workflow_compensations(self, instance_id: str) -> dict[str, dict[str, Any]]:
         """

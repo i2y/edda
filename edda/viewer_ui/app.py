@@ -5,6 +5,7 @@ NiceGUI application for interactive workflow instance visualization.
 import asyncio
 import contextlib
 import json
+from datetime import datetime
 from typing import Any
 
 from nicegui import app, ui  # type: ignore[import-not-found]
@@ -1132,46 +1133,197 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
         ui.label("Click on an instance to view execution details").classes("text-gray-600 mb-4")
 
-        instances = await service.get_all_instances(limit=100)
+        # State management for pagination
+        pagination_state: dict[str, Any] = {
+            "current_token": None,
+            "token_stack": [],  # Stack for "Previous" navigation
+            "page_size": 20,
+            "status_filter": None,
+            "search_query": "",
+            "started_after": None,
+            "started_before": None,
+            "instances": [],
+            "next_page_token": None,
+            "has_more": False,
+        }
 
-        if not instances:
-            ui.label("No workflow instances found").classes("text-gray-500 italic mt-8")
-            ui.label("Run some workflows first, or click 'Start New Workflow' above!").classes(
-                "text-sm text-gray-400"
+        # Filter bar (placed below page title, above instance list)
+        with (
+            ui.card().classes("w-full mb-4 p-4"),
+            ui.row().classes("w-full items-end gap-4 flex-wrap"),
+        ):
+            # Search input
+            search_input = ui.input(
+                label="Search (name or ID)",
+                placeholder="Enter workflow name or instance ID...",
+            ).classes("w-64")
+
+            # Status filter
+            status_options = {
+                "": "All Statuses",
+                "running": "Running",
+                "completed": "Completed",
+                "failed": "Failed",
+                "waiting_for_event": "Waiting (Event)",
+                "waiting_for_timer": "Waiting (Timer)",
+                "cancelled": "Cancelled",
+            }
+            status_select = ui.select(
+                options=status_options,
+                value="",
+                label="Status",
+            ).classes("w-40")
+
+            # Page size selector
+            page_size_select = ui.select(
+                options={10: "10", 20: "20", 50: "50"},
+                value=20,
+                label="Per page",
+            ).classes("w-24")
+
+            # Date range inputs with calendar picker
+            with ui.input(label="From").classes("w-36") as date_from:
+                with ui.menu() as date_from_menu:
+                    ui.date().bind_value(date_from)
+                with date_from.add_slot("append"):
+                    ui.icon("event").classes("cursor-pointer").on(
+                        "click", lambda m=date_from_menu: m.open()
+                    )
+
+            with ui.input(label="To").classes("w-36") as date_to:
+                with ui.menu() as date_to_menu:
+                    ui.date().bind_value(date_to)
+                with date_to.add_slot("append"):
+                    ui.icon("event").classes("cursor-pointer").on(
+                        "click", lambda m=date_to_menu: m.open()
+                    )
+
+            # Refresh button
+            async def handle_refresh() -> None:
+                """Handle refresh button click."""
+                pagination_state["search_query"] = search_input.value
+                pagination_state["status_filter"] = status_select.value or None
+                pagination_state["page_size"] = page_size_select.value
+                pagination_state["started_after"] = date_from.value
+                pagination_state["started_before"] = date_to.value
+                # Reset to first page
+                pagination_state["current_token"] = None
+                pagination_state["token_stack"] = []
+                await refresh_list()
+
+            ui.button("Refresh", on_click=handle_refresh, icon="refresh").props(
+                "flat color=primary"
             )
-            return
 
-        with ui.column().classes("w-full gap-2"):
-            for inst in instances:
-                with (
-                    ui.link(target=f'/workflow/{inst["instance_id"]}').classes(
-                        "no-underline w-full"
-                    ),
-                    ui.card().classes("w-full cursor-pointer hover:shadow-lg transition-shadow"),
-                    ui.row().classes("w-full items-center justify-between"),
-                ):
-                    with ui.column():
-                        ui.label(inst["workflow_name"]).classes("text-xl font-bold")
-                        ui.label(f'ID: {inst["instance_id"][:16]}...').classes(
-                            "text-sm text-gray-500"
-                        )
-                        ui.label(f'Started: {inst["started_at"]}').classes("text-xs text-gray-400")
+        # Container for the instance list (will be refreshed)
+        list_container = ui.column().classes("w-full")
 
-                    status = inst["status"]
-                    if status == "completed":
-                        ui.badge("✅ Completed", color="green")
-                    elif status == "running":
-                        ui.badge("⏳ Running", color="yellow")
-                    elif status == "failed":
-                        ui.badge("❌ Failed", color="red")
-                    elif status == "waiting_for_event":
-                        ui.badge("⏸️ Waiting (Event)", color="blue")
-                    elif status == "waiting_for_timer":
-                        ui.badge("⏱️ Waiting (Timer)", color="cyan")
-                    elif status == "cancelled":
-                        ui.badge("🚫 Cancelled", color="orange")
-                    else:
-                        ui.badge(status, color="gray")
+        async def load_instances() -> None:
+            """Load instances with current filter settings."""
+            # Parse date filters
+            started_after = None
+            started_before = None
+            if pagination_state["started_after"]:
+                with contextlib.suppress(ValueError):
+                    started_after = datetime.fromisoformat(
+                        pagination_state["started_after"] + "T00:00:00"
+                    )
+            if pagination_state["started_before"]:
+                with contextlib.suppress(ValueError):
+                    started_before = datetime.fromisoformat(
+                        pagination_state["started_before"] + "T23:59:59"
+                    )
+
+            result = await service.get_instances_paginated(
+                page_size=pagination_state["page_size"],
+                page_token=pagination_state["current_token"],
+                status_filter=pagination_state["status_filter"],
+                search_query=pagination_state["search_query"] or None,
+                started_after=started_after,
+                started_before=started_before,
+            )
+            pagination_state["instances"] = result["instances"]
+            pagination_state["next_page_token"] = result["next_page_token"]
+            pagination_state["has_more"] = result["has_more"]
+
+        async def refresh_list() -> None:
+            """Refresh the instance list display."""
+            await load_instances()
+            list_container.clear()
+            with list_container:
+                render_instance_list()
+
+        def render_instance_list() -> None:
+            """Render the instance list cards."""
+            instances = pagination_state["instances"]
+            if not instances:
+                ui.label("No workflow instances found").classes("text-gray-500 italic mt-8")
+                ui.label("Run some workflows first, or click 'Start New Workflow' above!").classes(
+                    "text-sm text-gray-400"
+                )
+                return
+
+            with ui.column().classes("w-full gap-2"):
+                for inst in instances:
+                    with (
+                        ui.link(target=f'/workflow/{inst["instance_id"]}').classes(
+                            "no-underline w-full"
+                        ),
+                        ui.card().classes(
+                            "w-full cursor-pointer hover:shadow-lg transition-shadow"
+                        ),
+                        ui.row().classes("w-full items-center justify-between"),
+                    ):
+                        with ui.column():
+                            ui.label(inst["workflow_name"]).classes("text-xl font-bold")
+                            ui.label(f'ID: {inst["instance_id"][:16]}...').classes(
+                                "text-sm text-gray-500"
+                            )
+                            ui.label(f'Started: {inst["started_at"]}').classes(
+                                "text-xs text-gray-400"
+                            )
+
+                        status = inst["status"]
+                        if status == "completed":
+                            ui.badge("✅ Completed", color="green")
+                        elif status == "running":
+                            ui.badge("⏳ Running", color="yellow")
+                        elif status == "failed":
+                            ui.badge("❌ Failed", color="red")
+                        elif status == "waiting_for_event":
+                            ui.badge("⏸️ Waiting (Event)", color="blue")
+                        elif status == "waiting_for_timer":
+                            ui.badge("⏱️ Waiting (Timer)", color="cyan")
+                        elif status == "cancelled":
+                            ui.badge("🚫 Cancelled", color="orange")
+                        else:
+                            ui.badge(status, color="gray")
+
+        # Initial load
+        await load_instances()
+        with list_container:
+            render_instance_list()
+
+        # Pagination controls
+        with ui.row().classes("w-full justify-end gap-4 mt-4"):
+
+            async def handle_previous() -> None:
+                """Handle Previous button click."""
+                if pagination_state["token_stack"]:
+                    # Pop the last token from the stack
+                    pagination_state["current_token"] = pagination_state["token_stack"].pop()
+                    await refresh_list()
+
+            async def handle_next() -> None:
+                """Handle Next button click."""
+                if pagination_state["has_more"] and pagination_state["next_page_token"]:
+                    # Push current token to stack before moving to next page
+                    pagination_state["token_stack"].append(pagination_state["current_token"])
+                    pagination_state["current_token"] = pagination_state["next_page_token"]
+                    await refresh_list()
+
+            ui.button("← Previous", on_click=handle_previous, icon="chevron_left").props("flat")
+            ui.button("Next →", on_click=handle_next, icon="chevron_right").props("flat")
 
     # Define detail page
     @ui.page("/workflow/{instance_id}")  # type: ignore[misc]

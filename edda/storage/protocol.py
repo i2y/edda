@@ -238,20 +238,34 @@ class StorageProtocol(Protocol):
     async def list_instances(
         self,
         limit: int = 50,
+        page_token: str | None = None,
         status_filter: str | None = None,
-    ) -> list[dict[str, Any]]:
+        workflow_name_filter: str | None = None,
+        instance_id_filter: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> dict[str, Any]:
         """
-        List workflow instances with optional filtering.
+        List workflow instances with cursor-based pagination and filtering.
 
         This method JOINs workflow_instances with workflow_definitions to
         return instances along with their source code.
 
         Args:
-            limit: Maximum number of instances to return
+            limit: Maximum number of instances to return per page
+            page_token: Cursor for pagination (format: "ISO_DATETIME||INSTANCE_ID")
             status_filter: Optional status filter (e.g., "running", "completed", "failed")
+            workflow_name_filter: Optional workflow name filter (partial match, case-insensitive)
+            instance_id_filter: Optional instance ID filter (partial match, case-insensitive)
+            started_after: Filter instances started after this datetime (inclusive)
+            started_before: Filter instances started before this datetime (inclusive)
 
         Returns:
-            List of workflow instances, ordered by started_at DESC.
+            Dictionary containing:
+            - instances: List of workflow instances, ordered by started_at DESC
+            - next_page_token: Cursor for the next page, or None if no more pages
+            - has_more: Boolean indicating if there are more pages
+
             Each instance contains: instance_id, workflow_name, source_hash,
             owner_service, status, current_activity_id, started_at, updated_at,
             input_data, source_code, output_data, locked_by, locked_at
