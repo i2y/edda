@@ -29,6 +29,11 @@ site_author = "Yasushi Itoh"
 # Read more: https://zensical.org/docs/setup/basics/#site_url
 site_url = "https://i2y.github.io/edda/"
 
+# Repository URL for the GitHub link in the header
+# Read more: https://zensical.org/docs/setup/repository/
+repo_url = "https://github.com/i2y/edda"
+repo_name = "i2y/edda"
+
 # The copyright notice appears in the page footer and can contain an HTML
 # fragment.
 #
@@ -324,15 +329,8 @@ toggle.name = "Switch to light mode"
 # - https://zensical.org/docs/setup/logo-and-icons
 # - https://zensical.org/docs/authoring/icons-emojis/#search
 # ----------------------------------------------------------------------------
-#[project.theme.icon]
-#logo = "lucide/smile"
-#repo = "lucide/smile"
-
-# ----------------------------------------------------------------------------
-# Repository configuration
-# ----------------------------------------------------------------------------
-repo_url = "https://github.com/i2y/edda"
-repo_name = "i2y/edda"
+[project.theme.icon]
+repo = "fontawesome/brands/github"
 
 # ----------------------------------------------------------------------------
 # The "extra" section contains miscellaneous settings.
