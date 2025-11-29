@@ -5,11 +5,14 @@ UI components for generating interactive Mermaid diagrams.
 import json
 from typing import Any
 
+from edda.viewer_ui.theme import get_edge_color, get_mermaid_node_style, get_mermaid_style
 from edda.visualizer.ast_analyzer import WorkflowAnalyzer
 from edda.visualizer.mermaid_generator import MermaidGenerator
 
 
-def generate_interactive_mermaid(instance_id: str, history: list[dict[str, Any]]) -> str:
+def generate_interactive_mermaid(
+    instance_id: str, history: list[dict[str, Any]], is_dark: bool = False
+) -> str:
     """
     Generate interactive Mermaid diagram from execution history.
 
@@ -22,6 +25,7 @@ def generate_interactive_mermaid(instance_id: str, history: list[dict[str, Any]]
     Args:
         instance_id: Workflow instance ID
         history: List of execution activity dictionaries
+        is_dark: Whether dark mode is enabled
 
     Returns:
         Mermaid flowchart diagram code with embedded click events
@@ -40,6 +44,20 @@ def generate_interactive_mermaid(instance_id: str, history: list[dict[str, Any]]
     prev_node = "Start"
     activity_occurrences: dict[str, list[str]] = {}  # Track activity name -> list of activity_ids
     activity_index = 0
+
+    # Status icon mapping
+    status_icons = {
+        "completed": "✅",
+        "running": "⏳",
+        "failed": "❌",
+        "waiting_for_event": "⏸️",
+        "waiting_for_timer": "⏱️",
+        "cancelled": "🚫",
+        "compensated": "🔄",
+        "compensating": "🔄",
+        "compensation_failed": "⚠️",
+        "event_received": "📨",
+    }
 
     for activity_data in history:
         activity_id = activity_data.get("activity_id")
@@ -64,33 +82,13 @@ def generate_interactive_mermaid(instance_id: str, history: list[dict[str, Any]]
         label_suffix = f" ({occurrence_count}x)" if occurrence_count >= 2 else ""
 
         # Node label with status icon
-        if status == "completed":
-            label = f"✅ {activity}{label_suffix}"
-            style_color = "fill:#d4edda,stroke:#28a745,stroke-width:2px"
-        elif status == "running":
-            label = f"⏳ {activity}{label_suffix}"
-            style_color = "fill:#fff3cd,stroke:#ffc107,stroke-width:2px"
-        elif status == "failed":
-            label = f"❌ {activity}{label_suffix}"
-            style_color = "fill:#f8d7da,stroke:#dc3545,stroke-width:2px"
-        elif status == "waiting_for_event":
-            label = f"⏸️ {activity}{label_suffix}"
-            style_color = "fill:#e7f3ff,stroke:#0066cc,stroke-width:2px"
-        elif status == "cancelled":
-            label = f"🚫 {activity}{label_suffix}"
-            style_color = "fill:#fff4e6,stroke:#ff9800,stroke-width:2px"
-        elif status == "compensated":
-            label = f"🔄 {activity}{label_suffix}"
-            style_color = "fill:#ffe6f0,stroke:#e91e63,stroke-width:2px,stroke-dasharray:5"
-        elif status == "compensation_failed":
-            label = f"⚠️ {activity}{label_suffix}"
-            style_color = "fill:#ffcccc,stroke:#cc0000,stroke-width:2px"
-        elif status == "event_received":
-            label = f"📨 {activity}{label_suffix}"
-            style_color = "fill:#e6f7ff,stroke:#1890ff,stroke-width:2px"
-        else:
-            label = f"{activity}{label_suffix}"
-            style_color = "fill:#f0f0f0,stroke:#666,stroke-width:2px"
+        icon = status_icons.get(status, "")
+        label = f"{icon} {activity}{label_suffix}" if icon else f"{activity}{label_suffix}"
+
+        # Get themed style colors
+        style_color = get_mermaid_style(status, is_dark)
+        if status == "compensated":
+            style_color += ",stroke-dasharray:5"
 
         # Node definition
         lines.append(f'    {node_id}["{label}"]')
@@ -133,6 +131,7 @@ class HybridMermaidGenerator(MermaidGenerator):
         compensations: dict[str, dict[str, Any]] | None = None,
         workflow_status: str = "running",
         activity_status_map: dict[str, str] | None = None,
+        is_dark: bool = False,
     ):
         """
         Initialize hybrid Mermaid generator.
@@ -143,6 +142,7 @@ class HybridMermaidGenerator(MermaidGenerator):
             compensations: Optional mapping of activity_id -> compensation info
             workflow_status: Status of the workflow instance (running, completed, failed, etc.)
             activity_status_map: Optional mapping of activity name to status (completed, failed, etc.)
+            is_dark: Whether dark mode is enabled
         """
         super().__init__()
         self.instance_id = instance_id
@@ -150,6 +150,7 @@ class HybridMermaidGenerator(MermaidGenerator):
         self.compensations = compensations or {}
         self.workflow_status = workflow_status
         self.activity_status_map = activity_status_map or {}
+        self.is_dark = is_dark
         self.activity_id_map: dict[str, str] = {}  # Map activity name to activity_id for clicks
         self.activity_execution_counts: dict[str, int] = {}  # Map activity name to execution count
         self.edge_counter = 0  # Track edge indices for linkStyle
@@ -200,9 +201,8 @@ class HybridMermaidGenerator(MermaidGenerator):
             # Add a visual separator (compensation execution section)
             comp_start_id = self._next_node_id()
             self.lines.append(f"    {comp_start_id}[Compensation Execution]")
-            self.lines.append(
-                f"    style {comp_start_id} fill:#fff3cd,stroke:#ffc107,stroke-width:2px"
-            )
+            comp_header_style = get_mermaid_style("running", self.is_dark)
+            self.lines.append(f"    style {comp_start_id} {comp_header_style}")
             self.lines.append(f"    {end_id} -.->|rollback| {comp_start_id}")
             self.edge_counter += 1
 
@@ -217,9 +217,8 @@ class HybridMermaidGenerator(MermaidGenerator):
                 label = f"🔄 {comp_name}"
 
                 self.lines.append(f'    {comp_node_id}["{label}"]')
-                self.lines.append(
-                    f"    style {comp_node_id} fill:#f8d7da,stroke:#dc3545,stroke-width:3px"
-                )
+                comp_node_style = get_mermaid_style("compensating", self.is_dark)
+                self.lines.append(f"    style {comp_node_id} {comp_node_style},stroke-width:3px")
 
                 # Add click event for compensation activity
                 self.lines.append(
@@ -233,10 +232,11 @@ class HybridMermaidGenerator(MermaidGenerator):
 
                 prev_comp_id = comp_node_id
 
-        # Add linkStyle for executed edges (green color)
+        # Add linkStyle for executed edges
         if self.executed_edges:
             edge_indices = ",".join(str(i) for i in self.executed_edges)
-            self.lines.append(f"    linkStyle {edge_indices} stroke:#28a745,stroke-width:3px")
+            edge_color = get_edge_color("executed", self.is_dark)
+            self.lines.append(f"    linkStyle {edge_indices} stroke:{edge_color},stroke-width:3px")
 
         return "\n".join(self.lines)
 
@@ -296,21 +296,22 @@ class HybridMermaidGenerator(MermaidGenerator):
                 if has_compensation:
                     label += " ⚠"
 
-                # Style based on status
+                # Style based on status using theme colors
                 if status == "completed":
-                    style_color = "fill:#d4edda,stroke:#28a745,stroke-width:3px"  # Green
+                    style_color = get_mermaid_style("completed", self.is_dark) + ",stroke-width:3px"
                 elif status == "failed":
-                    style_color = "fill:#f8d7da,stroke:#dc3545,stroke-width:3px"  # Red
+                    style_color = get_mermaid_style("failed", self.is_dark) + ",stroke-width:3px"
                 elif status == "compensated":
                     style_color = (
-                        "fill:#ffe6f0,stroke:#e91e63,stroke-width:3px,stroke-dasharray:5"  # Pink
+                        get_mermaid_style("compensating", self.is_dark)
+                        + ",stroke-width:3px,stroke-dasharray:5"
                     )
                 elif status is not None:
-                    # Other executed statuses
-                    style_color = "fill:#fff3cd,stroke:#ffc107,stroke-width:3px"  # Yellow
+                    # Other executed statuses (running, waiting)
+                    style_color = get_mermaid_style("running", self.is_dark) + ",stroke-width:3px"
                 else:
                     # Not executed
-                    style_color = "fill:#f5f5f5,stroke:#ccc,stroke-width:1px"  # Gray
+                    style_color = get_mermaid_style("not_executed", self.is_dark)
 
                 self.lines.append(f'    {node_id}["{label}"]')
                 self.lines.append(f"    style {node_id} {style_color}")
@@ -338,7 +339,8 @@ class HybridMermaidGenerator(MermaidGenerator):
                 func_name = step.get("activity_name", step.get("function", "unknown"))
                 self.lines.append(f"    {node_id}[register_compensation:<br/>{func_name}]")
                 self.lines.append(f"    {current_id} --> {node_id}")
-                self.lines.append(f"    style {node_id} fill:#ffe6e6")
+                comp_reg_style = get_mermaid_style("compensating", self.is_dark)
+                self.lines.append(f"    style {node_id} {comp_reg_style}")
 
                 # Track compensation for reverse path
                 self.compensation_nodes.append((current_id, node_id))
@@ -357,7 +359,8 @@ class HybridMermaidGenerator(MermaidGenerator):
 
                 self.lines.append(f"    {node_id}{{{{{label}}}}}")
                 self.lines.append(f"    {current_id} --> {node_id}")
-                self.lines.append(f"    style {node_id} fill:#fff4e6")
+                wait_event_style = get_mermaid_style("waiting_event", self.is_dark)
+                self.lines.append(f"    style {node_id} {wait_event_style}")
                 current_id = node_id
 
             elif step_type == "condition":
@@ -446,13 +449,15 @@ class HybridMermaidGenerator(MermaidGenerator):
             self.executed_edges.append(self.edge_counter)
         self.edge_counter += 1
 
-        self.lines.append(f"    style {cond_id} fill:#fff3e0,stroke:#ff9800,stroke-width:2px")
+        condition_style = get_mermaid_node_style("condition", self.is_dark)
+        self.lines.append(f"    style {cond_id} {condition_style}")
 
         # Create merge node with invisible/minimal label
         merge_id = self._next_node_id()
         # Use a minimal circle node for merging (instead of showing "N4")
         self.lines.append(f"    {merge_id}(( ))")  # Small empty circle
-        self.lines.append(f"    style {merge_id} fill:#ffffff,stroke:#ddd,stroke-width:1px")
+        merge_style = get_mermaid_node_style("merge", self.is_dark)
+        self.lines.append(f"    style {merge_id} {merge_style}")
 
         # If branch
         if if_branch:
@@ -555,21 +560,22 @@ class HybridMermaidGenerator(MermaidGenerator):
             else:
                 label = f"{label_prefix}{func_name}"
 
-            # Style based on status
+            # Style based on status using theme colors
             if status == "completed":
-                style_color = "fill:#d4edda,stroke:#28a745,stroke-width:3px"  # Green
+                style_color = get_mermaid_style("completed", self.is_dark) + ",stroke-width:3px"
             elif status == "failed":
-                style_color = "fill:#f8d7da,stroke:#dc3545,stroke-width:3px"  # Red
+                style_color = get_mermaid_style("failed", self.is_dark) + ",stroke-width:3px"
             elif status == "compensated":
                 style_color = (
-                    "fill:#ffe6f0,stroke:#e91e63,stroke-width:3px,stroke-dasharray:5"  # Pink
+                    get_mermaid_style("compensating", self.is_dark)
+                    + ",stroke-width:3px,stroke-dasharray:5"
                 )
             elif status is not None:
-                # Other executed statuses
-                style_color = "fill:#fff3cd,stroke:#ffc107,stroke-width:3px"  # Yellow
+                # Other executed statuses (running, waiting)
+                style_color = get_mermaid_style("running", self.is_dark) + ",stroke-width:3px"
             else:
                 # Not executed
-                style_color = "fill:#f5f5f5,stroke:#ccc,stroke-width:1px"  # Gray
+                style_color = get_mermaid_style("not_executed", self.is_dark)
 
             self.lines.append(f'    {node_id}["{label}"]')
             self.lines.append(f"    style {node_id} {style_color}")
@@ -732,7 +738,8 @@ class HybridMermaidGenerator(MermaidGenerator):
         self.lines.append(f'    {loop_id}["{label}"]')
         self.lines.append(f"    {prev_id} --> {loop_id}")
         self.edge_counter += 1  # Edge from prev to loop
-        self.lines.append(f"    style {loop_id} fill:#fff0f0")
+        loop_style = get_mermaid_node_style("loop", self.is_dark)
+        self.lines.append(f"    style {loop_id} {loop_style}")
 
         # Check if loop body contains executed activities
         body = loop.get("body", [])
@@ -750,7 +757,8 @@ class HybridMermaidGenerator(MermaidGenerator):
         # Create exit node as small empty circle (instead of labeled node)
         exit_id = self._next_node_id()
         self.lines.append(f"    {exit_id}(( ))")  # Small empty circle
-        self.lines.append(f"    style {exit_id} fill:#ffffff,stroke:#ddd,stroke-width:1px")
+        merge_style = get_mermaid_node_style("merge", self.is_dark)
+        self.lines.append(f"    style {exit_id} {merge_style}")
         self.lines.append(f"    {loop_id} -->|exit| {exit_id}")
         self.edge_counter += 1
 
@@ -786,12 +794,14 @@ class HybridMermaidGenerator(MermaidGenerator):
         self.lines.append(f"    {match_id}{{{{match {subject}}}}}")
         self.lines.append(f"    {prev_id} --> {match_id}")
         self.edge_counter += 1
-        self.lines.append(f"    style {match_id} fill:#e8f5e9,stroke:#4caf50,stroke-width:2px")
+        match_style = get_mermaid_node_style("match", self.is_dark)
+        self.lines.append(f"    style {match_id} {match_style}")
 
         # Create merge node
         merge_id = self._next_node_id()
         self.lines.append(f"    {merge_id}(( ))")  # Small empty circle for merge
-        self.lines.append(f"    style {merge_id} fill:#ffffff,stroke:#ddd,stroke-width:1px")
+        merge_style = get_mermaid_node_style("merge", self.is_dark)
+        self.lines.append(f"    style {merge_id} {merge_style}")
 
         # Process each case
         cases = match.get("cases", [])
@@ -833,9 +843,8 @@ class HybridMermaidGenerator(MermaidGenerator):
                     self.executed_edges.append(self.edge_counter)
                 self.edge_counter += 1
 
-                self.lines.append(
-                    f"    style {case_start_id} fill:#fff,stroke:#999,stroke-width:1px"
-                )
+                case_start_style = get_mermaid_node_style("merge", self.is_dark)
+                self.lines.append(f"    style {case_start_id} {case_start_style}")
 
                 # Generate body steps starting from case_start_id
                 case_end = self._generate_steps(body, case_start_id)
@@ -875,12 +884,14 @@ class HybridMermaidGenerator(MermaidGenerator):
         self.lines.append(f"    {decision_id}{{{{if-elif-else}}}}")
         self.lines.append(f"    {prev_id} --> {decision_id}")
         self.edge_counter += 1
-        self.lines.append(f"    style {decision_id} fill:#e8f5e9,stroke:#4caf50,stroke-width:2px")
+        decision_style = get_mermaid_node_style("condition", self.is_dark)
+        self.lines.append(f"    style {decision_id} {decision_style}")
 
         # Create merge node
         merge_id = self._next_node_id()
         self.lines.append(f"    {merge_id}(( ))")  # Small empty circle for merge
-        self.lines.append(f"    style {merge_id} fill:#ffffff,stroke:#ddd,stroke-width:1px")
+        merge_style = get_mermaid_node_style("merge", self.is_dark)
+        self.lines.append(f"    style {merge_id} {merge_style}")
 
         # Process each branch
         branches = multi_cond.get("branches", [])
@@ -950,9 +961,8 @@ class HybridMermaidGenerator(MermaidGenerator):
                     self.executed_edges.append(self.edge_counter)
                 self.edge_counter += 1
 
-                self.lines.append(
-                    f"    style {branch_start_id} fill:#fff,stroke:#999,stroke-width:1px"
-                )
+                branch_start_style = get_mermaid_node_style("merge", self.is_dark)
+                self.lines.append(f"    style {branch_start_id} {branch_start_style}")
 
                 # Generate body steps starting from branch_start_id
                 branch_end = self._generate_steps(body, branch_start_id)
@@ -1006,6 +1016,7 @@ def generate_hybrid_mermaid(
     source_code: str,
     compensations: dict[str, dict[str, Any]] | None = None,
     workflow_status: str = "running",
+    is_dark: bool = False,
 ) -> str:
     """
     Generate hybrid Mermaid diagram combining static analysis and execution history.
@@ -1017,6 +1028,7 @@ def generate_hybrid_mermaid(
         source_code: Source code of the workflow function
         compensations: Optional mapping of activity_id -> compensation info
         workflow_status: Status of the workflow instance (running, completed, failed, etc.)
+        is_dark: Whether dark mode is enabled
 
     Returns:
         Mermaid flowchart diagram code with execution highlighting
@@ -1030,7 +1042,7 @@ def generate_hybrid_mermaid(
 
         if not workflows:
             # Fallback to history-only diagram
-            return generate_interactive_mermaid(instance_id, history)
+            return generate_interactive_mermaid(instance_id, history, is_dark)
 
         workflow_structure = workflows[0]
 
@@ -1079,6 +1091,7 @@ def generate_hybrid_mermaid(
             compensations,
             workflow_status,
             activity_status_map,
+            is_dark,
         )
         generator.activity_id_map = activity_id_map
         generator.activity_execution_counts = activity_execution_counts
@@ -1089,7 +1102,7 @@ def generate_hybrid_mermaid(
     except Exception as e:
         # Fallback to history-only diagram on any error
         print(f"Warning: Hybrid diagram generation failed, falling back to history-only: {e}")
-        return generate_interactive_mermaid(instance_id, history)
+        return generate_interactive_mermaid(instance_id, history, is_dark)
 
 
 def format_json_for_display(data: Any) -> str:

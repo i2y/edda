@@ -15,6 +15,7 @@ from nicegui.events import GenericEventArguments  # type: ignore[import-not-foun
 from edda import EddaApp
 from edda.viewer_ui.components import generate_hybrid_mermaid, generate_interactive_mermaid
 from edda.viewer_ui.data_service import WorkflowDataService
+from edda.viewer_ui.theme import TAILWIND_CLASSES, get_status_badge_classes
 
 
 def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> None:
@@ -43,32 +44,39 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             detail: Execution detail dictionary
         """
         status = detail["status"]
-        if status == "completed":
-            ui.badge("Completed", color="green").classes("text-lg")
-        elif status == "running":
-            ui.badge("Running", color="yellow").classes("text-lg")
-        elif status == "failed":
-            ui.badge("Failed", color="red").classes("text-lg")
-        else:
-            ui.badge(status, color="gray").classes("text-lg")
+        status_labels = {
+            "completed": "Completed",
+            "running": "Running",
+            "failed": "Failed",
+        }
+        label_text = status_labels.get(status, status)
+        ui.label(label_text).classes(f"text-lg {get_status_badge_classes(status)}")
 
-        ui.label(f"Executed: {detail['executed_at']}").classes("text-sm text-gray-600 mt-2")
+        ui.label(f"Executed: {detail['executed_at']}").classes(
+            f"text-sm mt-2 {TAILWIND_CLASSES['text_secondary']}"
+        )
 
-        ui.markdown("#### Input")
-        with ui.card().classes("w-full bg-gray-50 p-4"):
+        ui.markdown("#### Input").classes(TAILWIND_CLASSES["text_primary"])
+        with ui.card().classes(f"w-full p-4 {TAILWIND_CLASSES['code_block']}"):
             ui.code(json.dumps(detail["input"], indent=2)).classes("w-full")
 
         if detail["output"] is not None:
-            ui.markdown("#### Output")
-            with ui.card().classes("w-full bg-gray-50 p-4"):
+            ui.markdown("#### Output").classes(TAILWIND_CLASSES["text_primary"])
+            with ui.card().classes(f"w-full p-4 {TAILWIND_CLASSES['code_block']}"):
                 ui.code(json.dumps(detail["output"], indent=2)).classes("w-full")
 
         if detail["error"]:
-            ui.markdown("#### Error")
-            with ui.card().classes("w-full bg-red-50 border-red-200 p-4"):
+            ui.markdown("#### Error").classes(TAILWIND_CLASSES["text_primary"])
+            with ui.card().classes(
+                "w-full p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800"
+            ):
                 if detail.get("error_type"):
-                    ui.label(f"Type: {detail['error_type']}").classes("text-red-700 font-bold")
-                ui.label(detail["error"]).classes("text-red-700 font-mono text-sm mt-2")
+                    ui.label(f"Type: {detail['error_type']}").classes(
+                        "text-red-700 dark:text-red-400 font-bold"
+                    )
+                ui.label(detail["error"]).classes(
+                    "text-red-700 dark:text-red-400 font-mono text-sm mt-2"
+                )
 
                 # Show stack trace if available
                 if detail.get("stack_trace"):
@@ -107,11 +115,11 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                 # Header
                 if len(all_executions) > 1:
                     ui.label(f"{activity_name} (Executed {len(all_executions)} times)").classes(
-                        "text-2xl font-bold"
+                        f"text-2xl font-bold {TAILWIND_CLASSES['text_primary']}"
                     )
                 else:
-                    ui.label(f"{activity_name}: {detail['activity_id']}").classes(
-                        "text-2xl font-bold"
+                    ui.label(detail["activity_id"]).classes(
+                        f"text-2xl font-bold {TAILWIND_CLASSES['text_primary']}"
                     )
 
                 # Multiple executions: use tabs
@@ -141,7 +149,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                     # Single execution: render directly
                     _render_execution_detail(detail)
 
-            ui.notify(f"Loaded {activity_name}: {activity_id}", type="positive")
+            ui.notify(f"Loaded {activity_id}", type="positive")
 
         except Exception as e:
             ui.notify(f"Error loading activity detail: {e}", type="negative")
@@ -150,38 +158,158 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
     app.on_connect(lambda: ui.on("step_click", handle_activity_click))
     app.on_connect(lambda: ui.on("activity_click", handle_activity_click))
 
+    # Initialize dark mode from system preference on first visit
+    async def init_dark_mode() -> None:
+        if "dark_mode" not in app.storage.user:
+            # First visit: detect system preference
+            try:
+                is_dark = await ui.run_javascript(
+                    "window.matchMedia('(prefers-color-scheme: dark)').matches",
+                    timeout=1.0,
+                )
+                app.storage.user["dark_mode"] = bool(is_dark)
+            except Exception:
+                # Default to light mode if detection fails
+                app.storage.user["dark_mode"] = False
+
+    app.on_connect(init_dark_mode)
+
     # Define index page
     @ui.page("/")  # type: ignore[misc]
     async def index_page() -> None:
         """Workflow instances list page."""
-        # Header with title and start button
+        # Bind dark mode to user storage (persists across pages and sessions)
+        ui.dark_mode().bind_value(app.storage.user, "dark_mode")
+
+        # Custom CSS and JS to ensure dark mode background is applied
+        ui.add_head_html(
+            """
+        <style>
+            /* Page background */
+            body.dark, body.body--dark {
+                background-color: #0F172A !important;  /* Slate 900 */
+            }
+            body:not(.dark):not(.body--dark) {
+                background-color: #FFFFFF !important;
+            }
+            .nicegui-content, .q-page, .q-layout {
+                background-color: transparent !important;
+            }
+            /* Card backgrounds - Light mode (exclude error cards) */
+            body:not(.dark):not(.body--dark) .q-card:not(.bg-red-50) {
+                background-color: #FFFFFF !important;
+                border-color: #E2E8F0 !important;  /* Slate 200 */
+            }
+            body:not(.dark):not(.body--dark) .q-card:not(.bg-red-50):hover {
+                background-color: #F8FAFC !important;  /* Slate 50 */
+            }
+            /* Card backgrounds - Dark mode (exclude error cards) */
+            body.dark .q-card:not(.bg-red-50), body.body--dark .q-card:not(.bg-red-50) {
+                background-color: #1E293B !important;  /* Slate 800 */
+                border-color: #334155 !important;  /* Slate 700 */
+            }
+            body.dark .q-card:not(.bg-red-50):hover, body.body--dark .q-card:not(.bg-red-50):hover {
+                background-color: #334155 !important;  /* Slate 700 */
+            }
+            /* Error card backgrounds - Dark mode */
+            body.dark .q-card.bg-red-50, body.body--dark .q-card.bg-red-50 {
+                background-color: rgba(127, 29, 29, 0.3) !important;  /* Red 900/30 */
+                border-color: #991B1B !important;  /* Red 800 */
+            }
+            body.dark .bg-red-50 .text-red-700, body.body--dark .bg-red-50 .text-red-700 {
+                color: #FCA5A5 !important;  /* Red 300 */
+            }
+            /* Input fields - Light mode */
+            body:not(.dark):not(.body--dark) .q-field__control {
+                background-color: #FFFFFF !important;
+            }
+            /* Input fields - Dark mode */
+            body.dark .q-field__control, body.body--dark .q-field__control {
+                background-color: #1E293B !important;
+            }
+            body.dark .q-field__native, body.body--dark .q-field__native,
+            body.dark .q-field__input, body.body--dark .q-field__input {
+                color: #F1F5F9 !important;  /* Slate 100 */
+            }
+        </style>
+        <script>
+            function applyDarkModeStyles(isDark) {
+                // Body background
+                document.body.style.backgroundColor = isDark ? '#0F172A' : '#FFFFFF';
+                // All cards (exclude error cards with bg-red-50)
+                document.querySelectorAll('.q-card, .nicegui-card').forEach(card => {
+                    if (!card.classList.contains('bg-red-50')) {
+                        card.style.backgroundColor = isDark ? '#1E293B' : '#FFFFFF';
+                        card.style.borderColor = isDark ? '#334155' : '#E2E8F0';
+                    }
+                });
+            }
+            // Watch for dark mode class changes on body
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'class') {
+                        const isDark = document.body.classList.contains('dark') ||
+                                       document.body.classList.contains('body--dark');
+                        applyDarkModeStyles(isDark);
+                    }
+                });
+            });
+            observer.observe(document.body, { attributes: true });
+            // Initial check and periodic re-apply (for dynamically added cards)
+            const isDark = document.body.classList.contains('dark') ||
+                           document.body.classList.contains('body--dark');
+            applyDarkModeStyles(isDark);
+            setInterval(() => {
+                const isDark = document.body.classList.contains('dark') ||
+                               document.body.classList.contains('body--dark');
+                applyDarkModeStyles(isDark);
+            }, 500);
+        </script>
+        """
+        )
+
+        # Theme toggle handler (theme_button will be defined below)
+        def toggle_theme() -> None:
+            current = app.storage.user.get("dark_mode", False)
+            app.storage.user["dark_mode"] = not current
+            # Update icon: show sun in dark mode, moon in light mode
+            new_icon = "dark_mode" if current else "light_mode"
+            theme_button.props(f"icon={new_icon} flat round")
+
+        # Header with title, start button, and theme toggle
         with ui.row().classes("w-full items-center justify-between mb-4"):
-            ui.markdown("# Edda Workflow Instances")
+            ui.markdown("# Edda Workflow Instances").classes("text-slate-900 dark:text-slate-100")
 
-            # Start New Workflow button and dialog
-            with ui.dialog() as start_dialog, ui.card().style("min-width: 500px"):
-                ui.label("Start New Workflow").classes("text-xl font-bold mb-4")
+            with ui.row().classes("items-center gap-4"):
+                # Start New Workflow button and dialog
+                with (
+                    ui.dialog() as start_dialog,
+                    ui.card().classes(f"{TAILWIND_CLASSES['card']} p-6").style("min-width: 500px"),
+                ):
+                    ui.label("Start New Workflow").classes(
+                        f"text-xl font-bold mb-4 {TAILWIND_CLASSES['text_primary']}"
+                    )
 
-                # Get all available workflows
-                all_workflows = service.get_all_workflows()
-                workflow_names = list(all_workflows.keys())
+                    # Get all available workflows
+                    all_workflows = service.get_all_workflows()
+                    workflow_names = list(all_workflows.keys())
 
-                if not workflow_names:
-                    ui.label("No workflows registered").classes("text-red-500")
-                    ui.button("Close", on_click=start_dialog.close)
-                else:
-                    # Workflow selection
-                    workflow_select = ui.select(
-                        workflow_names,
-                        label="Select Workflow",
-                        value=workflow_names[0] if workflow_names else None,
-                    ).classes("w-full mb-4")
+                    if not workflow_names:
+                        ui.label("No workflows registered").classes("text-red-500")
+                        ui.button("Close", on_click=start_dialog.close)
+                    else:
+                        # Workflow selection
+                        workflow_select = ui.select(
+                            workflow_names,
+                            label="Select Workflow",
+                            value=workflow_names[0] if workflow_names else None,
+                        ).classes("w-full mb-4")
 
-                    # Container for dynamic parameter fields
-                    params_container = ui.column().classes("w-full mb-4")
+                        # Container for dynamic parameter fields
+                        params_container = ui.column().classes("w-full mb-4")
 
-                    # Store input field references
-                    param_fields: dict[str, Any] = {}
+                        # Store input field references
+                        param_fields: dict[str, Any] = {}
 
                     # Factory functions for creating field managers with proper closures
                     # These must be defined outside the loop to avoid closure issues
@@ -1124,14 +1252,25 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                         ui.button("Start", on_click=handle_start, color="positive")
                         ui.button("Cancel", on_click=start_dialog.close)
 
-            ui.button(
-                "Start New Workflow",
-                on_click=start_dialog.open,
-                icon="play_arrow",
-                color="positive",
-            )
+                ui.button(
+                    "Start New Workflow",
+                    on_click=start_dialog.open,
+                    icon="play_arrow",
+                    color="positive",
+                )
 
-        ui.label("Click on an instance to view execution details").classes("text-gray-600 mb-4")
+                # Theme toggle button (rightmost)
+                is_dark = app.storage.user.get("dark_mode", False)
+                icon = "light_mode" if is_dark else "dark_mode"
+                theme_button = (
+                    ui.button(on_click=toggle_theme)
+                    .props(f"icon={icon} flat round")
+                    .classes("text-slate-600 dark:text-slate-300")
+                )
+
+        ui.label("Click on an instance to view execution details").classes(
+            "text-slate-600 dark:text-slate-400 mb-4"
+        )
 
         # State management for pagination
         pagination_state: dict[str, Any] = {
@@ -1149,7 +1288,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
         # Filter bar (placed below page title, above instance list)
         with (
-            ui.card().classes("w-full mb-4 p-4"),
+            ui.card().classes(f"w-full mb-4 p-4 {TAILWIND_CLASSES['card']}"),
             ui.row().classes("w-full items-end gap-4 flex-wrap"),
         ):
             # Search input
@@ -1257,9 +1396,11 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             """Render the instance list cards."""
             instances = pagination_state["instances"]
             if not instances:
-                ui.label("No workflow instances found").classes("text-gray-500 italic mt-8")
+                ui.label("No workflow instances found").classes(
+                    "text-slate-500 dark:text-slate-400 italic mt-8"
+                )
                 ui.label("Run some workflows first, or click 'Start New Workflow' above!").classes(
-                    "text-sm text-gray-400"
+                    "text-sm text-slate-400 dark:text-slate-500"
                 )
                 return
 
@@ -1270,34 +1411,32 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                             "no-underline w-full"
                         ),
                         ui.card().classes(
-                            "w-full cursor-pointer hover:shadow-lg transition-shadow"
+                            f"w-full cursor-pointer hover:shadow-lg transition-shadow {TAILWIND_CLASSES['card']} {TAILWIND_CLASSES['card_hover']}"
                         ),
                         ui.row().classes("w-full items-center justify-between"),
                     ):
                         with ui.column():
-                            ui.label(inst["workflow_name"]).classes("text-xl font-bold")
+                            ui.label(inst["workflow_name"]).classes(
+                                f"text-xl font-bold {TAILWIND_CLASSES['text_primary']}"
+                            )
                             ui.label(f'ID: {inst["instance_id"][:16]}...').classes(
-                                "text-sm text-gray-500"
+                                f"text-sm {TAILWIND_CLASSES['text_secondary']}"
                             )
                             ui.label(f'Started: {inst["started_at"]}').classes(
-                                "text-xs text-gray-400"
+                                f"text-xs {TAILWIND_CLASSES['text_muted']}"
                             )
 
                         status = inst["status"]
-                        if status == "completed":
-                            ui.badge("✅ Completed", color="green")
-                        elif status == "running":
-                            ui.badge("⏳ Running", color="yellow")
-                        elif status == "failed":
-                            ui.badge("❌ Failed", color="red")
-                        elif status == "waiting_for_event":
-                            ui.badge("⏸️ Waiting (Event)", color="blue")
-                        elif status == "waiting_for_timer":
-                            ui.badge("⏱️ Waiting (Timer)", color="cyan")
-                        elif status == "cancelled":
-                            ui.badge("🚫 Cancelled", color="orange")
-                        else:
-                            ui.badge(status, color="gray")
+                        status_labels = {
+                            "completed": "✅ Completed",
+                            "running": "⏳ Running",
+                            "failed": "❌ Failed",
+                            "waiting_for_event": "⏸️ Waiting (Event)",
+                            "waiting_for_timer": "⏱️ Waiting (Timer)",
+                            "cancelled": "🚫 Cancelled",
+                        }
+                        label_text = status_labels.get(status, status)
+                        ui.label(label_text).classes(get_status_badge_classes(status))
 
         # Initial load
         await load_instances()
@@ -1329,20 +1468,120 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
     @ui.page("/workflow/{instance_id}")  # type: ignore[misc]
     async def workflow_detail_page(instance_id: str) -> None:
         """Workflow instance detail page with interactive Mermaid diagram."""
+        # Bind dark mode to user storage (persists across pages and sessions)
+        ui.dark_mode().bind_value(app.storage.user, "dark_mode")
+
+        # Custom CSS and JS to ensure dark mode background is applied
+        ui.add_head_html(
+            """
+        <style>
+            /* Page background */
+            body.dark, body.body--dark {
+                background-color: #0F172A !important;  /* Slate 900 */
+            }
+            body:not(.dark):not(.body--dark) {
+                background-color: #FFFFFF !important;
+            }
+            .nicegui-content, .q-page, .q-layout {
+                background-color: transparent !important;
+            }
+            /* Card backgrounds - Light mode (exclude error cards) */
+            body:not(.dark):not(.body--dark) .q-card:not(.bg-red-50) {
+                background-color: #FFFFFF !important;
+                border-color: #E2E8F0 !important;  /* Slate 200 */
+            }
+            body:not(.dark):not(.body--dark) .q-card:not(.bg-red-50):hover {
+                background-color: #F8FAFC !important;  /* Slate 50 */
+            }
+            /* Card backgrounds - Dark mode (exclude error cards) */
+            body.dark .q-card:not(.bg-red-50), body.body--dark .q-card:not(.bg-red-50) {
+                background-color: #1E293B !important;  /* Slate 800 */
+                border-color: #334155 !important;  /* Slate 700 */
+            }
+            body.dark .q-card:not(.bg-red-50):hover, body.body--dark .q-card:not(.bg-red-50):hover {
+                background-color: #334155 !important;  /* Slate 700 */
+            }
+            /* Error card backgrounds - Dark mode */
+            body.dark .q-card.bg-red-50, body.body--dark .q-card.bg-red-50 {
+                background-color: rgba(127, 29, 29, 0.3) !important;  /* Red 900/30 */
+                border-color: #991B1B !important;  /* Red 800 */
+            }
+            body.dark .bg-red-50 .text-red-700, body.body--dark .bg-red-50 .text-red-700 {
+                color: #FCA5A5 !important;  /* Red 300 */
+            }
+            /* Input fields - Light mode */
+            body:not(.dark):not(.body--dark) .q-field__control {
+                background-color: #FFFFFF !important;
+            }
+            /* Input fields - Dark mode */
+            body.dark .q-field__control, body.body--dark .q-field__control {
+                background-color: #1E293B !important;
+            }
+            body.dark .q-field__native, body.body--dark .q-field__native,
+            body.dark .q-field__input, body.body--dark .q-field__input {
+                color: #F1F5F9 !important;  /* Slate 100 */
+            }
+        </style>
+        <script>
+            function applyDarkModeStyles(isDark) {
+                // Body background
+                document.body.style.backgroundColor = isDark ? '#0F172A' : '#FFFFFF';
+                // All cards (exclude error cards with bg-red-50)
+                document.querySelectorAll('.q-card, .nicegui-card').forEach(card => {
+                    if (!card.classList.contains('bg-red-50')) {
+                        card.style.backgroundColor = isDark ? '#1E293B' : '#FFFFFF';
+                        card.style.borderColor = isDark ? '#334155' : '#E2E8F0';
+                    }
+                });
+            }
+            // Watch for dark mode class changes on body
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'class') {
+                        const isDark = document.body.classList.contains('dark') ||
+                                       document.body.classList.contains('body--dark');
+                        applyDarkModeStyles(isDark);
+                    }
+                });
+            });
+            observer.observe(document.body, { attributes: true });
+            // Initial check and periodic re-apply (for dynamically added cards)
+            const isDark = document.body.classList.contains('dark') ||
+                           document.body.classList.contains('body--dark');
+            applyDarkModeStyles(isDark);
+            setInterval(() => {
+                const isDark = document.body.classList.contains('dark') ||
+                               document.body.classList.contains('body--dark');
+                applyDarkModeStyles(isDark);
+            }, 500);
+        </script>
+        """
+        )
+
         data = await service.get_instance_detail(instance_id)
         instance = data.get("instance")
         history = data.get("history", [])
         compensations = data.get("compensations", {})
 
         if not instance:
-            ui.label("Workflow instance not found").classes("text-red-500 text-xl mt-8")
+            ui.label("Workflow instance not found").classes(
+                "text-red-500 dark:text-red-400 text-xl mt-8"
+            )
             ui.button("← Back to list", on_click=lambda: ui.navigate.to("/"))
             return
 
+        # Theme toggle handler (theme_button will be defined below)
+        def toggle_theme() -> None:
+            current = app.storage.user.get("dark_mode", False)
+            app.storage.user["dark_mode"] = not current
+            # Update icon: show sun in dark mode, moon in light mode
+            new_icon = "dark_mode" if current else "light_mode"
+            theme_button.props(f"icon={new_icon} flat round")
+
         # Header with back button and cancel button
         with ui.row().classes("w-full items-center justify-between mb-4"):
-            ui.markdown("# Edda Workflow Viewer")
-            with ui.row().classes("gap-2"):
+            ui.markdown("# Edda Workflow Viewer").classes("text-slate-900 dark:text-slate-100")
+            with ui.row().classes("gap-4 items-center"):
                 # Cancel button (only show for running/waiting workflows)
                 status = instance["status"]
                 if status in ["running", "waiting_for_event", "waiting_for_timer"]:
@@ -1377,33 +1616,45 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                 ui.button("← Back to List", on_click=lambda: ui.navigate.to("/")).props("flat")
 
+                # Theme toggle button (rightmost)
+                is_dark = app.storage.user.get("dark_mode", False)
+                icon = "light_mode" if is_dark else "dark_mode"
+                theme_button = (
+                    ui.button(on_click=toggle_theme)
+                    .props(f"icon={icon} flat round")
+                    .classes("text-slate-600 dark:text-slate-300")
+                )
+
         # Workflow basic info card (full width at top)
-        with ui.card().classes("w-full mb-4"):
-            ui.label(instance["workflow_name"]).classes("text-2xl font-bold")
+        with ui.card().classes(f"w-full mb-4 {TAILWIND_CLASSES['card']}"):
+            ui.label(instance["workflow_name"]).classes(
+                f"text-2xl font-bold {TAILWIND_CLASSES['text_primary']}"
+            )
 
             with ui.row().classes("gap-4 items-center flex-wrap"):
                 status = instance["status"]
-                if status == "completed":
-                    ui.badge("✅ Completed", color="green")
-                elif status == "running":
-                    ui.badge("⏳ Running", color="yellow")
-                elif status == "failed":
-                    ui.badge("❌ Failed", color="red")
-                elif status == "waiting_for_event":
-                    ui.badge("⏸️ Waiting (Event)", color="blue")
-                elif status == "waiting_for_timer":
-                    ui.badge("⏱️ Waiting (Timer)", color="cyan")
-                elif status == "cancelled":
-                    ui.badge("🚫 Cancelled", color="orange")
-                elif status == "compensating":
-                    ui.badge("🔄 Compensating", color="purple")
-                else:
-                    ui.badge(status, color="gray")
+                status_labels = {
+                    "completed": "✅ Completed",
+                    "running": "⏳ Running",
+                    "failed": "❌ Failed",
+                    "waiting_for_event": "⏸️ Waiting (Event)",
+                    "waiting_for_timer": "⏱️ Waiting (Timer)",
+                    "cancelled": "🚫 Cancelled",
+                    "compensating": "🔄 Compensating",
+                }
+                label_text = status_labels.get(status, status)
+                ui.label(label_text).classes(get_status_badge_classes(status))
 
-                ui.label(f"Started: {instance['started_at']}").classes("text-sm text-gray-600")
-                ui.label(f"Updated: {instance['updated_at']}").classes("text-sm text-gray-600")
+                ui.label(f"Started: {instance['started_at']}").classes(
+                    f"text-sm {TAILWIND_CLASSES['text_secondary']}"
+                )
+                ui.label(f"Updated: {instance['updated_at']}").classes(
+                    f"text-sm {TAILWIND_CLASSES['text_secondary']}"
+                )
 
-            ui.label(f"Instance ID: {instance_id}").classes("text-xs text-gray-500 font-mono mt-2")
+            ui.label(f"Instance ID: {instance_id}").classes(
+                f"text-xs {TAILWIND_CLASSES['text_muted']} font-mono mt-2"
+            )
 
             # Input Parameters section
             input_data = instance.get("input_data")
@@ -1493,9 +1744,9 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
         with ui.row().style("width: 100%; height: calc(100vh - 250px); gap: 1rem; display: flex;"):
             # Left pane: Execution Flow
             with ui.column().style("flex: 1; overflow: auto; padding-right: 1rem;"):
-                ui.markdown("## Execution Flow")
+                ui.markdown("## Execution Flow").classes(TAILWIND_CLASSES["text_primary"])
                 ui.label("Click on an activity to view details →").classes(
-                    "text-gray-600 text-sm mb-2"
+                    f"text-sm mb-2 {TAILWIND_CLASSES['text_secondary']}"
                 )
 
                 if history:
@@ -1526,15 +1777,17 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                     ui.mermaid(mermaid_code, config={"securityLevel": "loose"}).classes("w-full")
                 else:
-                    ui.label("No execution history available").classes("text-gray-500 italic")
+                    ui.label("No execution history available").classes(
+                        f"{TAILWIND_CLASSES['text_muted']} italic"
+                    )
 
             # Right pane: Activity Details
-            with ui.column().style(
-                "flex: 1; overflow: auto; padding: 1rem; background: #f9fafb; border-left: 2px solid #e5e7eb; border-radius: 0.5rem;"
+            with ui.column().classes(
+                f"flex-1 overflow-auto p-4 rounded-lg {TAILWIND_CLASSES['surface']} {TAILWIND_CLASSES['border']} border-l-2"
             ):
-                ui.markdown("## Activity Details")
+                ui.markdown("## Activity Details").classes(TAILWIND_CLASSES["text_primary"])
                 ui.label("Click on an activity in the diagram to view details").classes(
-                    "text-gray-500 italic mb-4"
+                    f"{TAILWIND_CLASSES['text_muted']} italic mb-4"
                 )
 
                 detail_container = ui.column().classes("w-full")
@@ -1548,4 +1801,9 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
     app.on_shutdown(shutdown_handler)
 
     # Start server
-    ui.run(port=port, title="Edda Workflow Viewer", reload=reload)
+    ui.run(
+        port=port,
+        title="Edda Workflow Viewer",
+        reload=reload,
+        storage_secret="edda_viewer_secret",
+    )

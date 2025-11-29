@@ -99,3 +99,4 @@ site/
 
 # Cache directories
 .cache/
+.nicegui/
