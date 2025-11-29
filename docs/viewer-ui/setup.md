@@ -44,6 +44,16 @@ Then open http://localhost:8080 in your browser.
 
 *The Viewer UI shows all workflow instances with status badges and action buttons*
 
+**Pydantic Form Generation:**
+
+![Pydantic Form Generation](images/start-workflow-form-pydantic.png)
+
+*Auto-generated form fields based on Pydantic model type hints (str, float, int)*
+
+![Workflow Selection](images/workflow-selection-dropdown.png)
+
+*Dropdown showing all registered workflows with event_handler=True*
+
 ## Three Ways to Run the Viewer
 
 ### Method 1: Command Line (Recommended)
@@ -295,7 +305,7 @@ lsof -ti:8080 | xargs kill -9
 
 Once workflows appear, you'll see them with color-coded status badges:
 
-![Status Badges Example](images/status-badges-example.png)
+![Status Badges Example](images/workflow-list-view.png)
 
 *Workflow instances displayed with status badges (Completed ✅, Running ⏳, Failed ❌, Waiting ⏸️, Cancelled 🚫, etc.)*
 

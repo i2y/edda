@@ -34,14 +34,21 @@ The Edda Viewer UI provides workflow visualization and monitoring.
 
 Workflows with conditional logic (if/else, match/case) are visualized with labeled branches:
 
-![Conditional Branching Diagram](images/conditional-branching-diagram.png)
+![Workflow Detail Page](images/detail-page-loan-approval.png)
 
-*Example: `loan_approval_workflow` showing conditional branches based on credit score ("sufficient" vs "insufficient" paths)*
+*Example: `loan_approval_workflow` detail page. Note the **Execution Flow diagram** (bottom left) showing conditional branches with "sufficient" vs "insufficient" paths based on credit score.*
 
 The diagram clearly shows:
+
 - Decision points (diamond shapes in some diagrams)
 - Branch labels indicating conditions
 - Different execution paths based on runtime data
+
+**Match/Case Pattern:**
+
+![Match Case Workflow](images/detail-page-match-case.png)
+
+*Example: `match_case_workflow` showing multiple case branches with different handlers*
 
 ## Viewing Workflows
 
@@ -68,42 +75,46 @@ The main page shows all workflow instances:
 - 🚫 **Cancelled**: Manually cancelled (orange)
 - 🔄 **Compensating**: Executing compensations (purple)
 
-![Status Badges Example](images/status-badges-example.png)
+![Status Badges Example](images/workflow-list-view.png)
 
 ### Workflow List View
 
-The main page displays workflow instances as interactive cards:
+The main page displays workflow instances as interactive cards with search and filter capabilities:
 
 ![Workflow List View](images/workflow-list-view.png)
 
+*Workflow list with search filter bar, status filter, date range picker, and pagination controls*
+
 ### Workflow Detail Page
 
-Click on a workflow instance to see:
+Click on a workflow instance to see the detail page:
 
-1. **Overview Panel**:
-   - Instance ID, status, timestamps
-   - Input parameters (JSON)
-   - Output result (if completed)
+![Workflow Detail Page](images/detail-page-loan-approval.png)
 
-![Workflow Detail - Overview Panel](images/detail-overview-panel.png)
+*Workflow detail page showing the Overview Panel (top), Execution Flow diagram (bottom left), and Activity Details panel (bottom right).*
 
-2. **Hybrid Diagram**:
-   - Visual graph of workflow structure
-   - Color-coded execution status
-   - Compensation flow (if applicable)
+1. **Overview Panel** (top):
 
-![Hybrid Diagram Example](images/hybrid-diagram-example.png)
+      - Instance ID, status, timestamps
+      - Input parameters (JSON)
+      - Output result (if completed)
 
-3. **Execution History**:
-   - Step-by-step execution log
-   - Activity results
-   - Event data (for wait_event)
-   - Error messages (if failed)
+2. **Execution Flow** (bottom left):
 
-![Execution History Panel](images/execution-history-panel.png)
+      - Visual graph of workflow structure
+      - Color-coded execution status
+      - Compensation flow (if applicable)
+
+3. **Activity Details** (bottom right):
+
+      - Step-by-step execution log
+      - Activity results
+      - Event data (for wait_event)
+      - Error messages (if failed)
 
 4. **Actions**:
-   - **Cancel**: Stop running workflow
+
+      - **Cancel**: Stop running workflow
 
 ## Starting Workflows from Viewer
 
@@ -113,21 +124,15 @@ The Viewer UI can start workflows with automatic form generation:
 
 For Pydantic-based workflows, the Viewer generates input forms automatically.
 
-![Start Workflow Dialog](images/start-workflow-dialog.png)
+![Start Workflow Dialog](images/workflow-selection-dropdown.png)
 
-*Example: Workflow selection with auto-generated form*
+*Example: Workflow selection dropdown showing all registered workflows*
 
 The form generator supports various field types based on Pydantic model definitions:
 
-![Form Generation Example](images/form-generation-example.png)
-
-*Example: Auto-generated form showing different field types (text inputs, number inputs, checkboxes, etc.)*
-
-For complex workflows with nested models:
-
 ![Nested Pydantic Form](images/nested-pydantic-form.png)
 
-*Example: Auto-generated form with nested Pydantic models (OrderItem list, ShippingAddress)*
+*Auto-generated form with nested Pydantic models (items list, shipping_address) showing text inputs, number inputs, and nested model containers*
 
 ### Starting Workflow
 
@@ -166,7 +171,7 @@ When a workflow is cancelled or fails, and compensations run, the diagram shows:
 
 ![Compensation Execution](images/compensation-execution.png)
 
-*Example: `cancellable_booking` workflow after cancellation*
+*Saga compensation flow showing rollback activities (cancel_flight_ticket, cancel_hotel_room)*
 
 ## Event Waiting Visualization
 
@@ -174,7 +179,7 @@ Workflows can wait for external events using `wait_event()`. The Viewer displays
 
 ![Event Waiting Visualization](images/wait-event-visualization.png)
 
-*Example: `payment_workflow` waiting for `payment.completed` event*
+*Workflow with wait_event showing event type, timeout, and activity details panel*
 
 The diagram shows:
 - Hexagon node: Event wait point

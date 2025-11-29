@@ -195,6 +195,21 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             .nicegui-content, .q-page, .q-layout {
                 background-color: transparent !important;
             }
+            /* Fixed layout for index page - filter bar at top, pager at bottom, list scrolls */
+            .nicegui-content {
+                display: flex !important;
+                flex-direction: column !important;
+                height: 100vh !important;
+                overflow: hidden !important;
+            }
+            .instance-list-container {
+                flex: 1 !important;
+                overflow-y: auto !important;
+                min-height: 0 !important;
+            }
+            .pagination-controls {
+                flex-shrink: 0 !important;
+            }
             /* Card backgrounds - Light mode (exclude error cards) */
             body:not(.dark):not(.body--dark) .q-card:not(.bg-red-50) {
                 background-color: #FFFFFF !important;
@@ -369,7 +384,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                                 # Create the UI
                                 with ui.column().classes(
-                                    "w-full gap-1 p-2 border rounded bg-gray-50"
+                                    "w-full gap-1 p-2 border rounded bg-gray-50 dark:bg-slate-800 dark:border-slate-700"
                                 ):
                                     dict_items_ui()
                                     ui.button(
@@ -721,7 +736,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                             for i in range(len(items)):
                                 # Each item in a bordered container
                                 with ui.column().classes(
-                                    "w-full border rounded p-2 mb-2 bg-gray-50"
+                                    "w-full border rounded p-2 mb-2 bg-gray-50 dark:bg-slate-800 dark:border-slate-700"
                                 ):
                                     with ui.row().classes(
                                         "w-full items-center justify-between mb-2"
@@ -1076,11 +1091,11 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                                 for parent_name, nested_fields in nested_groups.items():
                                     # Create a visually grouped container for nested model
                                     with ui.column().classes(
-                                        "w-full border rounded p-3 bg-gray-50 mt-2"
+                                        "w-full border rounded p-3 bg-gray-50 dark:bg-slate-800 dark:border-slate-700 mt-2"
                                     ):
                                         # Parent field label
                                         ui.label(f"{parent_name} [nested model]").classes(
-                                            "text-sm font-semibold text-gray-700 mb-2"
+                                            "text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2"
                                         )
 
                                         # Render all nested fields
@@ -1288,7 +1303,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
         # Filter bar (placed below page title, above instance list)
         with (
-            ui.card().classes(f"w-full mb-4 p-4 {TAILWIND_CLASSES['card']}"),
+            ui.card().classes(f"w-full mb-4 p-4 flex-shrink-0 {TAILWIND_CLASSES['card']}"),
             ui.row().classes("w-full items-end gap-4 flex-wrap"),
         ):
             # Search input
@@ -1355,7 +1370,8 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             )
 
         # Container for the instance list (will be refreshed)
-        list_container = ui.column().classes("w-full")
+        # Uses instance-list-container class for scroll behavior (CSS defined above)
+        list_container = ui.column().classes("w-full instance-list-container")
 
         async def load_instances() -> None:
             """Load instances with current filter settings."""
@@ -1415,15 +1431,15 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                         ),
                         ui.row().classes("w-full items-center justify-between"),
                     ):
-                        with ui.column():
+                        with ui.column().classes("flex-1 min-w-0"):
                             ui.label(inst["workflow_name"]).classes(
-                                f"text-xl font-bold {TAILWIND_CLASSES['text_primary']}"
+                                f"text-xl font-bold truncate {TAILWIND_CLASSES['text_primary']}"
                             )
-                            ui.label(f'ID: {inst["instance_id"][:16]}...').classes(
-                                f"text-sm {TAILWIND_CLASSES['text_secondary']}"
+                            ui.label(f'ID: {inst["instance_id"]}').classes(
+                                f"text-sm truncate {TAILWIND_CLASSES['text_secondary']}"
                             )
                             ui.label(f'Started: {inst["started_at"]}').classes(
-                                f"text-xs {TAILWIND_CLASSES['text_muted']}"
+                                f"text-sm truncate {TAILWIND_CLASSES['text_secondary']}"
                             )
 
                         status = inst["status"]
@@ -1443,8 +1459,8 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
         with list_container:
             render_instance_list()
 
-        # Pagination controls
-        with ui.row().classes("w-full justify-end gap-4 mt-4"):
+        # Pagination controls (fixed at bottom via pagination-controls class)
+        with ui.row().classes("w-full justify-end gap-4 mt-4 pagination-controls"):
 
             async def handle_previous() -> None:
                 """Handle Previous button click."""
