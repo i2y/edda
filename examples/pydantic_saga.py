@@ -13,6 +13,7 @@ Features demonstrated:
 """
 
 from datetime import UTC, datetime
+
 from pydantic import BaseModel, Field
 
 from edda import EddaApp, workflow

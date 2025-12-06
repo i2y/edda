@@ -33,7 +33,7 @@ import sys
 
 import uvloop
 
-from edda import EddaApp, WorkflowContext, activity, workflow, wait_event
+from edda import EddaApp, WorkflowContext, activity, wait_event, workflow
 
 # Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
 if sys.version_info >= (3, 12):
@@ -97,15 +97,15 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str, amount: float) -
 
     # Step 2: Wait for payment confirmation event
     print("\n[Workflow] ⏸️  Waiting for payment confirmation event...")
-    print(f"[Workflow] Expected event type: 'payment.completed'")
+    print("[Workflow] Expected event type: 'payment.completed'")
     print(f"[Workflow] Expected data: order_id = '{order_id}'")
     print("\n💡 To send the event, run:")
-    print(f"curl -X POST http://localhost:8002/events \\")
-    print(f'  -H "Content-Type: application/json" \\')
-    print(f'  -H "CE-Type: payment.completed" \\')
-    print(f'  -H "CE-Source: payment-service" \\')
-    print(f'  -H "CE-ID: $(uuidgen)" \\')
-    print(f'  -H "CE-SpecVersion: 1.0" \\')
+    print("curl -X POST http://localhost:8002/events \\")
+    print('  -H "Content-Type: application/json" \\')
+    print('  -H "CE-Type: payment.completed" \\')
+    print('  -H "CE-Source: payment-service" \\')
+    print('  -H "CE-ID: $(uuidgen)" \\')
+    print('  -H "CE-SpecVersion: 1.0" \\')
     print(f"  -d '{{\"order_id\": \"{order_id}\", \"payment_id\": \"PAY-123\", \"status\": \"success\", \"amount\": {amount}}}'\n")
 
     payment_event = await wait_event(
@@ -121,7 +121,7 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str, amount: float) -
     print(f"[Workflow] ✅ Order completed: {final_result}")
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Payment workflow completed successfully!")
+    print("[Workflow] Payment workflow completed successfully!")
     print(f"{'='*60}\n")
 
     return final_result

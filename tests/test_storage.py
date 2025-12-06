@@ -255,38 +255,62 @@ class TestCompensations:
         assert len(compensations) == 0
 
 
-class TestEventSubscriptions:
-    """Tests for event subscriptions (wait_event)."""
+class TestMessageSubscriptions:
+    """Tests for message subscriptions (wait_message/wait_event).
 
-    async def test_add_event_subscription(self, sqlite_storage, sample_workflow_data):
-        """Test adding an event subscription."""
+    Note: CloudEvents (wait_event) internally uses Message Passing (wait_message),
+    so all event/message subscriptions use the message subscription API.
+    """
+
+    async def test_register_message_subscription(self, sqlite_storage, sample_workflow_data):
+        """Test registering a message subscription via atomic method."""
         await sqlite_storage.create_instance(**sample_workflow_data)
+        instance_id = sample_workflow_data["instance_id"]
 
-        await sqlite_storage.add_event_subscription(
-            sample_workflow_data["instance_id"],
-            event_type="payment.completed",
+        # Acquire lock first (required for register_message_subscription_and_release_lock)
+        acquired = await sqlite_storage.try_acquire_lock(
+            instance_id, "worker-1", timeout_seconds=30
+        )
+        assert acquired is True
+
+        # Register message subscription atomically (releases lock)
+        await sqlite_storage.register_message_subscription_and_release_lock(
+            instance_id=instance_id,
+            worker_id="worker-1",
+            channel="payment.completed",
+            timeout_at=None,
+            activity_id="wait_message_payment.completed:1",
         )
 
-        # Find waiting instances
-        waiting = await sqlite_storage.find_waiting_instances("payment.completed")
+        # Find waiting instances by channel
+        waiting = await sqlite_storage.find_waiting_instances_by_channel("payment.completed")
         assert len(waiting) == 1
-        assert waiting[0]["instance_id"] == sample_workflow_data["instance_id"]
+        assert waiting[0]["instance_id"] == instance_id
 
-    async def test_remove_event_subscription(self, sqlite_storage, sample_workflow_data):
-        """Test removing an event subscription."""
+        # Verify lock was released
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance["locked_by"] is None
+
+    async def test_remove_message_subscription(self, sqlite_storage, sample_workflow_data):
+        """Test removing a message subscription."""
         await sqlite_storage.create_instance(**sample_workflow_data)
+        instance_id = sample_workflow_data["instance_id"]
 
-        await sqlite_storage.add_event_subscription(
-            sample_workflow_data["instance_id"], event_type="payment.completed"
+        # Acquire lock and register subscription
+        await sqlite_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
+        await sqlite_storage.register_message_subscription_and_release_lock(
+            instance_id=instance_id,
+            worker_id="worker-1",
+            channel="payment.completed",
+            timeout_at=None,
+            activity_id="wait_message_payment.completed:1",
         )
 
         # Remove subscription
-        await sqlite_storage.remove_event_subscription(
-            sample_workflow_data["instance_id"], "payment.completed"
-        )
+        await sqlite_storage.remove_message_subscription(instance_id, "payment.completed")
 
         # Verify removed
-        waiting = await sqlite_storage.find_waiting_instances("payment.completed")
+        waiting = await sqlite_storage.find_waiting_instances_by_channel("payment.completed")
         assert len(waiting) == 0
 
 

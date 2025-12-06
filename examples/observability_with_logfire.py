@@ -21,7 +21,7 @@ from typing import Any
 
 import logfire
 
-from edda import EddaApp, WorkflowContext, HooksBase, activity, workflow
+from edda import EddaApp, HooksBase, WorkflowContext, activity, workflow
 
 
 # Step 1: Implement WorkflowHooks for Logfire
@@ -46,7 +46,7 @@ class LogfireHooks(HooksBase):
         )
 
     async def on_workflow_complete(
-        self, instance_id: str, workflow_name: str, result: Any
+        self, instance_id: str, workflow_name: str, _result: Any
     ) -> None:
         """Log workflow completion with Logfire."""
         logfire.info(
@@ -98,7 +98,7 @@ class LogfireHooks(HooksBase):
         instance_id: str,
         activity_id: str,
         activity_name: str,
-        result: Any,
+        _result: Any,
         cache_hit: bool,
     ) -> None:
         """Log activity completion with Logfire."""
@@ -130,7 +130,7 @@ class LogfireHooks(HooksBase):
 
 # Step 2: Define your workflow with activities
 @activity
-async def reserve_inventory(ctx: WorkflowContext, order_id: str, items: list[str]) -> dict:
+async def reserve_inventory(_ctx: WorkflowContext, order_id: str, items: list[str]) -> dict:
     """Reserve inventory for an order."""
     print(f"[Activity] Reserving inventory for order {order_id}: {items}")
     await asyncio.sleep(0.1)  # Simulate API call
@@ -138,7 +138,7 @@ async def reserve_inventory(ctx: WorkflowContext, order_id: str, items: list[str
 
 
 @activity
-async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) -> dict:
+async def process_payment(_ctx: WorkflowContext, order_id: str, amount: float) -> dict:
     """Process payment for an order."""
     print(f"[Activity] Processing payment for order {order_id}: ${amount}")
     await asyncio.sleep(0.1)  # Simulate API call
@@ -146,7 +146,7 @@ async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) ->
 
 
 @activity
-async def ship_order(ctx: WorkflowContext, order_id: str, address: str) -> dict:
+async def ship_order(_ctx: WorkflowContext, order_id: str, address: str) -> dict:
     """Ship the order."""
     print(f"[Activity] Shipping order {order_id} to {address}")
     await asyncio.sleep(0.1)  # Simulate API call

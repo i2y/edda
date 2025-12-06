@@ -13,9 +13,9 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from edda.channels import WaitForChannelMessageException, WaitForTimerException
 from edda.compensation import execute_compensations
 from edda.context import WorkflowContext
-from edda.events import WaitForEventException, WaitForTimerException
 from edda.locking import workflow_lock
 from edda.pydantic_utils import (
     enum_value_to_enum,
@@ -25,6 +25,7 @@ from edda.pydantic_utils import (
     to_json_dict,
 )
 from edda.storage.protocol import StorageProtocol
+from edda.workflow import RecurException
 
 logger = logging.getLogger(__name__)
 
@@ -243,38 +244,6 @@ class ReplayEngine:
 
                 return instance_id
 
-            except WaitForEventException as exc:
-                # Workflow is waiting for an event
-                # Before marking as waiting_for_event, check if workflow was cancelled
-                instance = await ctx.storage.get_instance(instance_id)
-                if instance and instance.get("status") == "cancelled":
-                    from edda.exceptions import WorkflowCancelledException
-
-                    raise WorkflowCancelledException(
-                        f"Workflow {instance_id} was cancelled"
-                    ) from None
-
-                # Atomically register event subscription and release lock (distributed coroutines)
-                # This ensures subscription is registered and lock is released in a single transaction
-                # so ANY worker can resume the workflow when the event arrives
-                from datetime import UTC, datetime, timedelta
-
-                timeout_at = None
-                if exc.timeout_seconds is not None:
-                    timeout_at = datetime.now(UTC) + timedelta(seconds=exc.timeout_seconds)
-
-                await self.storage.register_event_subscription_and_release_lock(
-                    instance_id=instance_id,
-                    worker_id=self.worker_id,
-                    event_type=exc.event_type,
-                    timeout_at=timeout_at,
-                    activity_id=exc.activity_id,
-                )
-
-                # Update status to waiting_for_event
-                await ctx._update_status("waiting_for_event")
-                return instance_id
-
             except WaitForTimerException as exc:
                 # Workflow is waiting for a timer
                 # Before marking as waiting_for_timer, check if workflow was cancelled
@@ -303,18 +272,81 @@ class ReplayEngine:
                 # by register_timer_subscription_and_release_lock()
                 return instance_id
 
+            except WaitForChannelMessageException as exc:
+                # Workflow is waiting for a message on a channel
+                # Before marking as waiting_for_message, check if workflow was cancelled
+                instance = await ctx.storage.get_instance(instance_id)
+                if instance and instance.get("status") == "cancelled":
+                    from edda.exceptions import WorkflowCancelledException
+
+                    raise WorkflowCancelledException(
+                        f"Workflow {instance_id} was cancelled"
+                    ) from None
+
+                # Atomically register channel receive and release lock (distributed coroutines)
+                # This ensures subscription is registered and lock is released in a single transaction
+                # so ANY worker can resume the workflow when the message arrives
+                await self.storage.register_channel_receive_and_release_lock(
+                    instance_id=instance_id,
+                    worker_id=self.worker_id,
+                    channel=exc.channel,
+                    activity_id=exc.activity_id,
+                    timeout_seconds=exc.timeout_seconds,
+                )
+
+                # Status is updated to 'waiting_for_message' atomically
+                # by register_channel_receive_and_release_lock()
+                return instance_id
+
+            except RecurException as exc:
+                # Workflow is recurring (Erlang-style tail recursion pattern)
+                # This resets history growth in long-running loops by:
+                # 1. Completing the current instance (marking as "recurred")
+                # 2. Archiving the current history
+                # 3. Cleaning up subscriptions
+                # 4. Starting a new instance with the provided arguments
+                # 5. Linking new instance to old via `continued_from`
+
+                logger.info(f"Workflow {instance_id} recurring with args: {exc.kwargs}")
+
+                # Mark current workflow as "recurred"
+                await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
+
+                # Archive history (move to archive table)
+                archived_count = await self.storage.archive_history(instance_id)
+                logger.info(f"Archived {archived_count} history entries for {instance_id}")
+
+                # Clean up all subscriptions (event/timer/message)
+                # This prevents old subscriptions from receiving events meant for the new instance
+                await self.storage.cleanup_instance_subscriptions(instance_id)
+
+                # Clear compensations (fresh start)
+                await ctx._clear_compensations()
+
+                # Create and start a new workflow instance
+                new_instance_id = await self._start_recurred_workflow(
+                    workflow_name=workflow_name,
+                    workflow_func=workflow_func,
+                    input_data=exc.kwargs,
+                    continued_from=instance_id,
+                    lock_timeout_seconds=lock_timeout_seconds,
+                )
+
+                logger.info(f"Workflow {instance_id} recurred to {new_instance_id}")
+                return new_instance_id
+
             except Exception as error:
                 # Check if this is a cancellation exception
                 from edda.exceptions import WorkflowCancelledException
 
                 if isinstance(error, WorkflowCancelledException):
                     # Workflow was cancelled during execution
-                    print(f"[Workflow] {instance_id} was cancelled during execution")
+                    logger.info("Workflow %s was cancelled during execution", instance_id)
 
                     # Execute compensations (idempotent - already executed ones will be skipped)
                     # This ensures all compensations are executed, even if some were already
                     # executed by cancel_workflow() in a concurrent process
-                    print(f"[Workflow] Executing compensations for {instance_id}")
+                    logger.debug("Executing compensations for %s", instance_id)
                     await execute_compensations(ctx)
 
                     # Ensure status is "cancelled"
@@ -448,26 +480,6 @@ class ReplayEngine:
             # Mark as completed
             await ctx._update_status("completed", {"result": result_dict})
 
-        except WaitForEventException as exc:
-            # Workflow is waiting for an event (again)
-            # Atomically register event subscription and release lock (distributed coroutines)
-            from datetime import UTC, datetime, timedelta
-
-            timeout_at = None
-            if exc.timeout_seconds is not None:
-                timeout_at = datetime.now(UTC) + timedelta(seconds=exc.timeout_seconds)
-
-            await self.storage.register_event_subscription_and_release_lock(
-                instance_id=instance_id,
-                worker_id=self.worker_id,
-                event_type=exc.event_type,
-                timeout_at=timeout_at,
-                activity_id=exc.activity_id,
-            )
-
-            # Update status to waiting_for_event
-            await ctx._update_status("waiting_for_event")
-
         except WaitForTimerException as exc:
             # Workflow is waiting for a timer (again)
             # Atomically register timer subscription and release lock (distributed coroutines)
@@ -484,18 +496,70 @@ class ReplayEngine:
             # Status is updated to 'waiting_for_timer' atomically
             # by register_timer_subscription_and_release_lock()
 
+        except WaitForChannelMessageException as exc:
+            # Workflow is waiting for a message on a channel (again)
+            # Atomically register channel receive and release lock (distributed coroutines)
+            await self.storage.register_channel_receive_and_release_lock(
+                instance_id=instance_id,
+                worker_id=self.worker_id,
+                channel=exc.channel,
+                activity_id=exc.activity_id,
+                timeout_seconds=exc.timeout_seconds,
+            )
+
+            # Status is updated to 'waiting_for_message' atomically
+            # by register_channel_receive_and_release_lock()
+
+        except RecurException as exc:
+            # Workflow is recurring (Erlang-style tail recursion pattern)
+            # This resets history growth in long-running loops by:
+            # 1. Completing the current instance (marking as "recurred")
+            # 2. Archiving the current history
+            # 3. Cleaning up subscriptions
+            # 4. Starting a new instance with the provided arguments
+            # 5. Linking new instance to old via `continued_from`
+
+            logger.info(f"Workflow {instance_id} recurring with args: {exc.kwargs}")
+
+            # Mark current workflow as "recurred"
+            await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
+
+            # Archive history (move to archive table)
+            archived_count = await self.storage.archive_history(instance_id)
+            logger.info(f"Archived {archived_count} history entries for {instance_id}")
+
+            # Clean up all subscriptions (event/timer/message)
+            # This prevents old subscriptions from receiving events meant for the new instance
+            await self.storage.cleanup_instance_subscriptions(instance_id)
+
+            # Clear compensations (fresh start)
+            await ctx._clear_compensations()
+
+            # Create and start a new workflow instance
+            # Note: we don't return the new instance_id here since _execute_workflow_logic returns None
+            # The new workflow will execute in its own context
+            await self._start_recurred_workflow(
+                workflow_name=instance["workflow_name"],
+                workflow_func=workflow_func,
+                input_data=exc.kwargs,
+                continued_from=instance_id,
+                lock_timeout_seconds=instance.get("lock_timeout_seconds"),
+            )
+
+            logger.info(f"Workflow {instance_id} recurred successfully")
+
         except Exception as error:
             # Check if this is a cancellation exception
             from edda.exceptions import WorkflowCancelledException
 
             if isinstance(error, WorkflowCancelledException):
                 # Workflow was cancelled during execution
-                print(f"[Workflow] {instance_id} was cancelled during execution")
+                logger.info("Workflow %s was cancelled during execution", instance_id)
 
                 # Execute compensations (idempotent - already executed ones will be skipped)
                 # This ensures all compensations are executed, even if some were already
                 # executed by cancel_workflow() in a concurrent process
-                print(f"[Workflow] Executing compensations for {instance_id}")
+                logger.debug("Executing compensations for %s", instance_id)
                 await execute_compensations(ctx)
 
                 # Ensure status is "cancelled"
@@ -559,6 +623,171 @@ class ReplayEngine:
         await self.resume_workflow(
             instance_id=instance_id, workflow_func=workflow_obj.func, already_locked=already_locked
         )
+
+    async def _start_recurred_workflow(
+        self,
+        workflow_name: str,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+        continued_from: str,
+        lock_timeout_seconds: int | None = None,
+    ) -> str:
+        """
+        Start a new workflow instance as a recurrence of an existing workflow.
+
+        This is an internal helper method used by the RecurException handler.
+        It creates a new workflow instance linked to the previous one via continued_from.
+
+        Args:
+            workflow_name: Name of the workflow
+            workflow_func: The workflow function to execute
+            input_data: Input parameters for the workflow (from recur() kwargs)
+            continued_from: Instance ID of the workflow that is recurring
+            lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
+
+        Returns:
+            Instance ID of the new workflow
+        """
+        # Generate new instance ID
+        new_instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
+
+        # Extract source code for visualization
+        try:
+            source_code = inspect.getsource(workflow_func)
+        except (OSError, TypeError) as e:
+            logger.warning(
+                f"Could not extract source code for workflow '{workflow_name}': {e}. "
+                "Hybrid diagram visualization will not be available."
+            )
+            source_code = f"# Source code not available\n# Workflow: {workflow_name}\n# Error: {e}"
+
+        # Calculate source code hash
+        source_hash = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+
+        # Store workflow definition (idempotent)
+        await self.storage.upsert_workflow_definition(
+            workflow_name=workflow_name,
+            source_hash=source_hash,
+            source_code=source_code,
+        )
+
+        # Create workflow instance in storage with continued_from reference
+        await self.storage.create_instance(
+            instance_id=new_instance_id,
+            workflow_name=workflow_name,
+            source_hash=source_hash,
+            owner_service=self.service_name,
+            input_data=input_data,
+            lock_timeout_seconds=lock_timeout_seconds,
+            continued_from=continued_from,
+        )
+
+        # Execute the new workflow with distributed lock
+        async with workflow_lock(self.storage, new_instance_id, self.worker_id):
+            # Create context for new execution
+            ctx = WorkflowContext(
+                instance_id=new_instance_id,
+                workflow_name=workflow_name,
+                storage=self.storage,
+                worker_id=self.worker_id,
+                is_replaying=False,
+                hooks=self.hooks,
+            )
+            # Set default retry policy for activity resolution
+            ctx._app_retry_policy = self.default_retry_policy
+
+            try:
+                # Call hook: workflow start
+                if self.hooks and hasattr(self.hooks, "on_workflow_start"):
+                    await self.hooks.on_workflow_start(new_instance_id, workflow_name, input_data)
+
+                # Prepare input: convert JSON dicts to Pydantic models based on type hints
+                processed_input = self._prepare_workflow_input(workflow_func, input_data)
+
+                # Execute workflow function
+                result = await workflow_func(ctx, **processed_input)
+
+                # Convert Pydantic model result to JSON dict for storage
+                result_dict = to_json_dict(result)
+
+                # Mark as completed
+                await ctx._update_status("completed", {"result": result_dict})
+
+                # Call hook: workflow complete
+                if self.hooks and hasattr(self.hooks, "on_workflow_complete"):
+                    await self.hooks.on_workflow_complete(new_instance_id, workflow_name, result)
+
+                return new_instance_id
+
+            except WaitForTimerException as exc:
+                # Workflow is waiting for a timer
+                await self.storage.register_timer_subscription_and_release_lock(
+                    instance_id=new_instance_id,
+                    worker_id=self.worker_id,
+                    timer_id=exc.timer_id,
+                    expires_at=exc.expires_at,
+                    activity_id=exc.activity_id,
+                )
+                return new_instance_id
+
+            except WaitForChannelMessageException as exc:
+                # Workflow is waiting for a message
+                await self.storage.register_channel_receive_and_release_lock(
+                    instance_id=new_instance_id,
+                    worker_id=self.worker_id,
+                    channel=exc.channel,
+                    activity_id=exc.activity_id,
+                    timeout_seconds=exc.timeout_seconds,
+                )
+                return new_instance_id
+
+            except RecurException as exc:
+                # Recur again immediately (nested recur)
+                logger.info(
+                    f"Workflow {new_instance_id} recurring immediately with args: {exc.kwargs}"
+                )
+
+                await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
+                archived_count = await self.storage.archive_history(new_instance_id)
+                logger.info(f"Archived {archived_count} history entries for {new_instance_id}")
+
+                # Clean up all subscriptions (event/timer/message)
+                await self.storage.cleanup_instance_subscriptions(new_instance_id)
+
+                await ctx._clear_compensations()
+
+                # Recursively start another recurred workflow
+                return await self._start_recurred_workflow(
+                    workflow_name=workflow_name,
+                    workflow_func=workflow_func,
+                    input_data=exc.kwargs,
+                    continued_from=new_instance_id,
+                    lock_timeout_seconds=lock_timeout_seconds,
+                )
+
+            except Exception as error:
+                # Execute compensations before marking as failed
+                await execute_compensations(ctx)
+
+                import traceback
+
+                stack_trace = "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
+                )
+
+                await ctx._update_status(
+                    "failed",
+                    {
+                        "error_message": str(error),
+                        "error_type": type(error).__name__,
+                        "stack_trace": stack_trace,
+                    },
+                )
+
+                if self.hooks and hasattr(self.hooks, "on_workflow_failed"):
+                    await self.hooks.on_workflow_failed(new_instance_id, workflow_name, error)
+
+                raise
 
     async def execute_with_lock(
         self,
@@ -640,7 +869,12 @@ class ReplayEngine:
         current_status = instance["status"]
 
         # Only cancel running or waiting workflows
-        if current_status not in ("running", "waiting_for_event", "waiting_for_timer"):
+        if current_status not in (
+            "running",
+            "waiting_for_event",
+            "waiting_for_timer",
+            "waiting_for_message",
+        ):
             return False
 
         # Try to acquire lock with short timeout (5 seconds)
@@ -659,10 +893,10 @@ class ReplayEngine:
 
             try:
                 # Re-fetch instance data AFTER acquiring lock
-                print(f"[Cancel] Fetching instance data for {instance_id}")
+                logger.debug("Fetching instance data for %s", instance_id)
                 instance_locked = await self.storage.get_instance(instance_id)
                 if instance_locked is None:
-                    print(f"[Cancel] Instance {instance_id} not found after lock acquisition")
+                    logger.warning("Instance %s not found after lock acquisition", instance_id)
                     return False
 
                 # Create context for compensation execution
@@ -678,7 +912,7 @@ class ReplayEngine:
                 ctx._app_retry_policy = self.default_retry_policy
 
                 # Execute compensations to clean up
-                print(f"[Cancel] Executing compensations for {instance_id}")
+                logger.debug("Executing compensations for %s", instance_id)
                 await execute_compensations(ctx)
 
                 # Mark as cancelled in storage
@@ -692,10 +926,7 @@ class ReplayEngine:
 
         except Exception as error:
             # Log error but don't propagate
-            import traceback
-
-            print(f"[Cancel] Error cancelling workflow {instance_id}: {error}")
-            traceback.print_exc()
+            logger.error("Error cancelling workflow %s: %s", instance_id, error, exc_info=True)
             return False
 
     async def resume_compensating_workflow(self, instance_id: str) -> bool:
@@ -712,7 +943,7 @@ class ReplayEngine:
         Returns:
             True if compensations completed successfully, False otherwise
         """
-        print(f"[ResumeCompensating] Starting compensation recovery for {instance_id}")
+        logger.info("Starting compensation recovery for %s", instance_id)
 
         try:
             # Acquire lock
@@ -723,21 +954,23 @@ class ReplayEngine:
             )
 
             if not locked:
-                print(f"[ResumeCompensating] Could not acquire lock for {instance_id}")
+                logger.debug("Could not acquire lock for %s", instance_id)
                 return False
 
             try:
                 # Get instance data
                 instance = await self.storage.get_instance(instance_id)
                 if instance is None:
-                    print(f"[ResumeCompensating] Instance {instance_id} not found")
+                    logger.warning("Instance %s not found", instance_id)
                     return False
 
                 # Check current status
                 current_status = instance["status"]
                 if current_status != "compensating":
-                    print(
-                        f"[ResumeCompensating] Instance {instance_id} is not in compensating state (status={current_status})"
+                    logger.debug(
+                        "Instance %s is not in compensating state (status=%s)",
+                        instance_id,
+                        current_status,
                     )
                     return False
 
@@ -745,15 +978,12 @@ class ReplayEngine:
                 # If we can't determine, default to "failed"
                 target_status = "failed"
 
-                # Check history for cancellation markers
-                history = await self.storage.get_history(instance_id)
-                for event in history:
-                    event_type = event.get("event_type", "")
-                    if event_type == "WorkflowCancelled" or "cancel" in event_type.lower():
-                        target_status = "cancelled"
-                        break
+                # Check history for cancellation markers (LIMIT 1 optimization)
+                cancellation_event = await self.storage.find_first_cancellation_event(instance_id)
+                if cancellation_event is not None:
+                    target_status = "cancelled"
 
-                print(f"[ResumeCompensating] Target status after compensation: {target_status}")
+                logger.debug("Target status after compensation: %s", target_status)
 
                 # Create context for compensation execution
                 ctx = WorkflowContext(
@@ -768,18 +998,18 @@ class ReplayEngine:
                 ctx._app_retry_policy = self.default_retry_policy
 
                 # Re-execute compensations (idempotent - skips already executed)
-                print(f"[ResumeCompensating] Re-executing compensations for {instance_id}")
+                logger.debug("Re-executing compensations for %s", instance_id)
                 await execute_compensations(ctx)
 
                 # Mark with target status
                 if target_status == "cancelled":
                     success = await self.storage.cancel_instance(instance_id, "crash_recovery")
-                    print(f"[ResumeCompensating] Marked {instance_id} as cancelled")
+                    logger.info("Marked %s as cancelled", instance_id)
                 else:
                     await ctx._update_status(
                         "failed", {"error": "Workflow failed before compensation"}
                     )
-                    print(f"[ResumeCompensating] Marked {instance_id} as failed")
+                    logger.info("Marked %s as failed", instance_id)
                     success = True
 
                 return success
@@ -790,10 +1020,10 @@ class ReplayEngine:
 
         except Exception as error:
             # Log error but don't propagate
-            import traceback
-
-            print(
-                f"[ResumeCompensating] Error resuming compensating workflow {instance_id}: {error}"
+            logger.error(
+                "Error resuming compensating workflow %s: %s",
+                instance_id,
+                error,
+                exc_info=True,
             )
-            traceback.print_exc()
             return False

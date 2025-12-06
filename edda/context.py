@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
-from edda.events import ReceivedEvent
+from edda.channels import ChannelMessage, ReceivedEvent
 from edda.storage.protocol import StorageProtocol
 
 if TYPE_CHECKING:
@@ -191,6 +191,28 @@ class WorkflowContext:
                     extensions=extensions,
                 )
                 self._history_cache[activity_id] = received_event
+            elif event_type == "ChannelMessageReceived":
+                # Cache the message data for receive() replay
+                from datetime import UTC, datetime
+
+                raw_data = event_data.get("data", event_data.get("payload", {}))
+                data: dict[str, Any] | bytes = (
+                    raw_data if isinstance(raw_data, (dict, bytes)) else {}
+                )
+                # Parse published_at if available, otherwise use current time
+                published_at_str = event_data.get("published_at")
+                if published_at_str:
+                    published_at = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
+                else:
+                    published_at = datetime.now(UTC)
+                message = ChannelMessage(
+                    data=data,
+                    channel=event_data.get("channel", "unknown"),
+                    id=event_data.get("id", "unknown"),
+                    metadata=event_data.get("metadata") or {},
+                    published_at=published_at,
+                )
+                self._history_cache[activity_id] = message
             elif event_type == "TimerExpired":
                 # Cache the timer result for wait_timer replay
                 # Timer returns None, so we cache the result field
@@ -340,56 +362,6 @@ class WorkflowContext:
         """
         await self.storage.update_instance_status(self.instance_id, status, output_data)
 
-    async def _register_event_subscription(
-        self,
-        event_type: str,
-        timeout_seconds: int | None = None,
-        activity_id: str | None = None,
-    ) -> None:
-        """
-        Register an event subscription for wait_event (internal use only).
-
-        This is called when a workflow calls wait_event() and needs to pause
-        until a matching event arrives.
-
-        Args:
-            event_type: CloudEvent type to wait for
-            timeout_seconds: Optional timeout in seconds
-            activity_id: The activity ID where wait_event was called
-        """
-        from datetime import UTC, datetime, timedelta
-
-        timeout_at = None
-        if timeout_seconds is not None:
-            timeout_at = datetime.now(UTC) + timedelta(seconds=timeout_seconds)
-
-        await self.storage.add_event_subscription(
-            instance_id=self.instance_id,
-            event_type=event_type,
-            timeout_at=timeout_at,
-        )
-
-        # Update current activity ID
-        if activity_id is not None:
-            await self.storage.update_instance_activity(self.instance_id, activity_id)
-
-    async def _record_event_received(self, activity_id: str, event_data: dict[str, Any]) -> None:
-        """
-        Record that an event was received during wait_event (internal use only).
-
-        This is called when resuming a workflow after an event arrives.
-
-        Args:
-            activity_id: The activity ID where wait_event was called
-            event_data: The received event data
-        """
-        await self.storage.append_history(
-            instance_id=self.instance_id,
-            activity_id=activity_id,
-            event_type="EventReceived",
-            event_data={"event_data": event_data},
-        )
-
     async def _push_compensation(self, compensation_action: Any, activity_id: str) -> None:
         """
         Register a compensation action for this workflow (internal use only).
@@ -478,6 +450,60 @@ class WorkflowContext:
                 await send_event_transactional(ctx, "order.created", ...)
         """
         return self.storage.in_transaction()
+
+    async def recur(self, **kwargs: Any) -> None:
+        """
+        Restart the workflow with fresh history (Erlang-style tail recursion).
+
+        This method prevents unbounded history growth in long-running loops by:
+        1. Completing the current workflow instance (marking as "recurred")
+        2. Archiving the current history (not deleted)
+        3. Starting a new workflow instance with the provided arguments
+        4. Linking the new instance to the old one via `continued_from`
+
+        This is similar to Erlang's tail recursion pattern where calling the same
+        function at the end of a loop prevents stack growth. In Edda, `recur()`
+        prevents history growth.
+
+        Args:
+            **kwargs: Arguments to pass to the new workflow instance.
+                     These become the input parameters for the next iteration.
+
+        Raises:
+            RecurException: Always raised to signal the ReplayEngine to handle
+                           the recur operation. This exception should not be caught.
+
+        Example:
+            >>> @workflow
+            ... async def notification_service(ctx: WorkflowContext, processed_count: int = 0):
+            ...     await join_group(ctx, group="order_watchers")
+            ...
+            ...     count = 0
+            ...     while True:
+            ...         msg = await wait_message(ctx, channel="order.completed")
+            ...         await send_notification(ctx, msg.data, activity_id=f"notify:{msg.id}")
+            ...
+            ...         count += 1
+            ...         if count >= 1000:
+            ...             # Reset history every 1000 iterations
+            ...             await ctx.recur(processed_count=processed_count + count)
+            ...             # Code after recur() is never executed
+
+        Note:
+            - Group memberships are NOT automatically transferred. You must re-join
+              groups in the new iteration if needed.
+            - The old workflow's history is archived, not deleted.
+            - The new instance has a `continued_from` field pointing to the old instance.
+            - During replay, if recur() was already called, this raises immediately
+              without re-executing previous activities.
+        """
+        from edda.pydantic_utils import to_json_dict
+        from edda.workflow import RecurException
+
+        # Convert Pydantic models and Enums to JSON-compatible values
+        processed_kwargs = {k: to_json_dict(v) for k, v in kwargs.items()}
+
+        raise RecurException(kwargs=processed_kwargs)
 
     def __repr__(self) -> str:
         """String representation of the context."""

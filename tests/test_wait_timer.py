@@ -18,8 +18,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from edda import workflow
+from edda.channels import WaitForTimerException, wait_timer
 from edda.context import WorkflowContext
-from edda.events import WaitForTimerException, wait_timer
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
 
@@ -57,13 +57,13 @@ class TestWaitTimer:
         with pytest.raises(WaitForTimerException) as exc_info:
             await wait_timer(
                 ctx,
-                duration_seconds=60,
+                seconds=60,
             )
 
         # Verify exception details
         assert exc_info.value.duration_seconds == 60
-        assert exc_info.value.timer_id.startswith("wait_timer:")  # Auto-generated timer_id
-        assert exc_info.value.activity_id.startswith("wait_timer:")
+        assert exc_info.value.timer_id.startswith("sleep:")  # Auto-generated timer_id
+        assert exc_info.value.activity_id.startswith("sleep:")
 
     async def test_wait_timer_with_custom_timer_id(self, sqlite_storage, workflow_instance):
         """Test that wait_timer accepts custom timer_id."""
@@ -79,7 +79,7 @@ class TestWaitTimer:
         with pytest.raises(WaitForTimerException) as exc_info:
             await wait_timer(
                 ctx,
-                duration_seconds=120,
+                seconds=120,
                 timer_id="custom_timer",
             )
 
@@ -101,17 +101,17 @@ class TestWaitTimer:
 
         # First wait_timer call
         with pytest.raises(WaitForTimerException):
-            await wait_timer(ctx, duration_seconds=30)
+            await wait_timer(ctx, seconds=30)
 
         assert len(ctx.executed_activity_ids) == 1
-        assert "wait_timer:1" in ctx.executed_activity_ids
+        assert "sleep:1" in ctx.executed_activity_ids
 
         # Second wait_timer call
         with pytest.raises(WaitForTimerException):
-            await wait_timer(ctx, duration_seconds=30)
+            await wait_timer(ctx, seconds=30)
 
         assert len(ctx.executed_activity_ids) == 2
-        assert "wait_timer:2" in ctx.executed_activity_ids
+        assert "sleep:2" in ctx.executed_activity_ids
 
     async def test_wait_timer_returns_immediately_during_replay(
         self, sqlite_storage, workflow_instance
@@ -137,7 +137,7 @@ class TestWaitTimer:
         await ctx._load_history()
 
         # Should return immediately without raising exception
-        result = await wait_timer(ctx, duration_seconds=60, timer_id="test_timer")
+        result = await wait_timer(ctx, seconds=60, timer_id="test_timer")
         assert result is None  # wait_timer returns None
         assert "test_timer" in ctx.executed_activity_ids
 
@@ -261,7 +261,7 @@ class TestTimerWorkflow:
         async def timer_workflow(ctx: WorkflowContext, wait_seconds: int):
             """Workflow that waits for a timer."""
             # Wait for timer
-            await wait_timer(ctx, duration_seconds=wait_seconds, timer_id="test_timer")
+            await wait_timer(ctx, seconds=wait_seconds, timer_id="test_timer")
 
             # Continue execution after timer expires
             return {"status": "completed"}
@@ -313,7 +313,7 @@ class TestTimerWorkflow:
         @workflow
         async def cancellable_timer_workflow(ctx: WorkflowContext):
             """Workflow that waits for a long timer."""
-            await wait_timer(ctx, duration_seconds=300, timer_id="long_timer")
+            await wait_timer(ctx, seconds=300, timer_id="long_timer")
             return {"status": "completed"}
 
         # Create replay engine

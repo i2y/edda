@@ -1600,7 +1600,12 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             with ui.row().classes("gap-4 items-center"):
                 # Cancel button (only show for running/waiting workflows)
                 status = instance["status"]
-                if status in ["running", "waiting_for_event", "waiting_for_timer"]:
+                if status in [
+                    "running",
+                    "waiting_for_event",
+                    "waiting_for_timer",
+                    "waiting_for_message",
+                ]:
 
                     async def handle_cancel() -> None:
                         """Handle workflow cancellation."""

@@ -5,7 +5,7 @@ import os
 import sys
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import uvloop
 from pydantic import BaseModel, Field, field_validator
@@ -17,9 +17,14 @@ from edda import (
     activity,
     compensation,
     on_failure,
-    workflow,
+    publish,
+    receive,
+    send_to,
+    subscribe,
     wait_until,
+    workflow,
 )
+from edda.wsgi import create_wsgi_app
 
 # Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
 if sys.version_info >= (3, 12):
@@ -320,6 +325,69 @@ class ErrorHandlingResult(BaseModel):
     payment_result: PaymentProcessingResult
     email_result: dict[str, Any]
     status: str
+
+
+# ========== Channel-based Message Queue Models ==========
+
+
+class JobWorkerInput(BaseModel):
+    """Input for job_worker_workflow."""
+    worker_id: str = Field(..., min_length=1)
+
+
+class JobWorkerResult(BaseModel):
+    """Result of job_worker_workflow."""
+    worker_id: str
+    job_id: str
+    job_data: dict[str, Any]
+    status: str
+
+
+class NotificationServiceInput(BaseModel):
+    """Input for notification_service_workflow."""
+    service_id: str = Field(..., min_length=1)
+
+
+class NotificationServiceResult(BaseModel):
+    """Result of notification_service_workflow."""
+    service_id: str
+    notification_id: str
+    notification_data: dict[str, Any]
+    status: str
+
+
+class JobPublisherInput(BaseModel):
+    """Input for job_publisher_workflow."""
+    task: str = Field(..., min_length=1)
+
+
+class NotificationPublisherInput(BaseModel):
+    """Input for notification_publisher_workflow."""
+    message: str = Field(..., min_length=1)
+
+
+class DirectMessageReceiverInput(BaseModel):
+    """Input for direct_message_receiver_workflow."""
+    receiver_id: str = Field(..., min_length=1)
+
+
+class DirectMessageReceiverResult(BaseModel):
+    """Result of direct_message_receiver_workflow."""
+    receiver_id: str
+    received_message: dict[str, Any]
+
+
+class DirectMessageSenderInput(BaseModel):
+    """Input for direct_message_sender_workflow."""
+    target_instance_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1)
+
+
+class DirectMessageSenderResult(BaseModel):
+    """Result of direct_message_sender_workflow."""
+    sent: bool
+    target_instance_id: str
+    message: str
 
 
 class ScheduledShipmentInput(BaseModel):
@@ -817,7 +885,7 @@ async def refund_payment(ctx: WorkflowContext, payment_id: str, amount: float) -
 
 @activity
 @on_failure(cancel_hotel_room)
-async def reserve_hotel_room(ctx: WorkflowContext, booking_id: str) -> dict[str, str]:
+async def reserve_hotel_room(_ctx: WorkflowContext, booking_id: str) -> dict[str, str]:
     """Reserve hotel room"""
     print(f"[Hotel] Reserving hotel for booking {booking_id}")
     hotel_reservation_id = f"HOTEL-{booking_id}"
@@ -828,7 +896,7 @@ async def reserve_hotel_room(ctx: WorkflowContext, booking_id: str) -> dict[str,
 
 @activity
 @on_failure(cancel_flight_ticket)
-async def reserve_flight_ticket(ctx: WorkflowContext, booking_id: str) -> dict[str, str]:
+async def reserve_flight_ticket(_ctx: WorkflowContext, booking_id: str) -> dict[str, str]:
     """Reserve flight ticket (with delay)"""
     print(f"[Flight] Reserving flight for booking {booking_id}")
     import asyncio
@@ -966,15 +1034,16 @@ async def payment_workflow(ctx: WorkflowContext, input: PaymentWorkflowInput) ->
 
     # Step 2: Wait for payment.completed event
     print("\n[Workflow] ⏸️  Waiting for payment confirmation event...")
-    print(f"[Workflow] Expected event type: 'payment.completed'")
+    print("[Workflow] Expected event type: 'payment.completed'")
     print(f"[Workflow] Expected data: order_id = '{input.order_id}'")
-    print(f"\n💡 To complete this workflow, send payment.completed event:")
-    print(f"curl -X POST http://localhost:8001/events \\")
-    print(f'  -H "Content-Type: application/json" \\')
-    print(f'  -H "CE-Type: payment.completed" \\')
-    print(f'  -H "CE-Source: payment-service" \\')
-    print(f'  -H "CE-ID: $(uuidgen)" \\')
-    print(f'  -H "CE-SpecVersion: 1.0" \\')
+    print("\n💡 To complete this workflow, send payment.completed event:")
+    print("curl -X POST http://localhost:8001/ \\")
+    print('  -H "Content-Type: application/json" \\')
+    print('  -H "CE-Type: payment.completed" \\')
+    print('  -H "CE-Source: payment-service" \\')
+    print('  -H "CE-ID: $(uuidgen)" \\')
+    print('  -H "CE-SpecVersion: 1.0" \\')
+    print(f'  -H "CE-Eddainstanceid: {ctx.instance_id}" \\')
     print(f"  -d '{{\"order_id\": \"{input.order_id}\", \"payment_id\": \"PAY-123\", \"status\": \"success\", \"amount\": {input.amount}}}'\n")
 
     payment_event = await wait_event(
@@ -990,7 +1059,7 @@ async def payment_workflow(ctx: WorkflowContext, input: PaymentWorkflowInput) ->
     print(f"[Workflow] ✅ Order completed: {final_result}")
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Payment workflow completed successfully!")
+    print("[Workflow] Payment workflow completed successfully!")
     print(f"{'='*60}\n")
 
     return PaymentWorkflowResult(
@@ -1089,7 +1158,7 @@ async def match_case_workflow(
             print(f"[Workflow] Unknown status escalated: {result}")
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Match-case workflow completed!")
+    print("[Workflow] Match-case workflow completed!")
     print(f"{'='*60}\n")
 
     return MatchCaseResult(
@@ -1175,7 +1244,7 @@ async def advanced_types_demo_workflow(
     4. Click "Start"
     """
     print(f"\n{'='*60}")
-    print(f"[Workflow] Advanced Types Demo Workflow")
+    print("[Workflow] Advanced Types Demo Workflow")
     print(f"[Workflow] Order ID: {input.order_id}")
     print(f"[Workflow] Status: {input.status.name} ({input.status.value})")
     print(f"[Workflow] Priority: {input.priority.name} ({input.priority.value})")
@@ -1188,7 +1257,7 @@ async def advanced_types_demo_workflow(
     print(f"[Workflow] Order processed: {result}")
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Advanced Types Demo Workflow completed!")
+    print("[Workflow] Advanced Types Demo Workflow completed!")
     print(f"{'='*60}\n")
 
     return AdvancedTypesResult(
@@ -1306,7 +1375,7 @@ async def order_with_auto_cancel_workflow(
     from edda import wait_timer
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Order with Auto-Cancel Workflow")
+    print("[Workflow] Order with Auto-Cancel Workflow")
     print(f"[Workflow] Order ID: {input.order_id}")
     print(f"[Workflow] Amount: ${input.amount}")
     print(f"[Workflow] Payment timeout: {input.timeout_seconds} seconds")
@@ -1319,13 +1388,13 @@ async def order_with_auto_cancel_workflow(
 
     # Step 2: Wait for payment grace period using wait_timer
     print(f"\n[Workflow] ⏱️  Waiting for {input.timeout_seconds} seconds (payment grace period)...")
-    print(f"[Workflow] During this time, customer should complete payment")
-    print(f"[Workflow] Status will show 'waiting_for_timer' in Viewer")
-    print(f"[Workflow] Watch at: http://localhost:8080\n")
+    print("[Workflow] During this time, customer should complete payment")
+    print("[Workflow] Status will show 'waiting_for_timer' in Viewer")
+    print("[Workflow] Watch at: http://localhost:8080\n")
 
     await wait_timer(ctx, duration_seconds=input.timeout_seconds)
 
-    print(f"\n[Workflow] ⏰ Timer expired! Checking payment status...")
+    print("\n[Workflow] ⏰ Timer expired! Checking payment status...")
 
     # Step 3: Check payment status
     payment_status = await check_payment_status(ctx, input.order_id)
@@ -1344,7 +1413,7 @@ async def order_with_auto_cancel_workflow(
         final_status = "auto_cancelled"
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Order workflow completed!")
+    print("[Workflow] Order workflow completed!")
     print(f"[Workflow] Final status: {final_status}")
     print(f"{'='*60}\n")
 
@@ -1384,7 +1453,7 @@ async def validate_and_create_user(
     and displayed as beautiful stack traces in Viewer.
     """
     print(f"[Activity] Validating user data: {user_data}")
-    print(f"[Activity] User data passed Pydantic validation automatically!")
+    print("[Activity] User data passed Pydantic validation automatically!")
 
     # Since it's a Pydantic model, all validation is already complete at this point
     user_id = f"USER-{hash(user_data.email)}"
@@ -1575,7 +1644,7 @@ async def error_handling_demo_workflow(
     - Expand stack trace in the error section
     """
     print(f"\n{'='*60}")
-    print(f"[Workflow] Error Handling Demo Workflow")
+    print("[Workflow] Error Handling Demo Workflow")
     print(f"[Workflow] User: {input.user_name} ({input.user_email})")
     print(f"[Workflow] Payment: ${input.payment_amount}")
     print(f"[Workflow] Instance ID: {ctx.instance_id}")
@@ -1616,7 +1685,7 @@ async def error_handling_demo_workflow(
     print(f"[Workflow] ✅ Confirmation email sent to: {input.user_email}")
 
     print(f"\n{'='*60}")
-    print(f"[Workflow] Workflow completed successfully!")
+    print("[Workflow] Workflow completed successfully!")
     print(f"[Workflow] User ID: {user_id}")
     print(f"[Workflow] Transaction ID: {input.transaction_id}")
     print(f"{'='*60}\n")
@@ -1640,7 +1709,7 @@ async def error_handling_demo_workflow(
 
 
 @activity
-async def create_scheduled_order(ctx: WorkflowContext, order_id: str, shipment_time: str) -> dict:
+async def create_scheduled_order(_ctx: WorkflowContext, order_id: str, shipment_time: str) -> dict:
     """
     Create order and set scheduled shipment time.
 
@@ -1666,7 +1735,7 @@ async def create_scheduled_order(ctx: WorkflowContext, order_id: str, shipment_t
 
 
 @activity
-async def prepare_shipment(ctx: WorkflowContext, order_id: str) -> dict:
+async def prepare_shipment(_ctx: WorkflowContext, order_id: str) -> dict:
     """
     Prepare shipment at scheduled time.
 
@@ -1679,8 +1748,8 @@ async def prepare_shipment(ctx: WorkflowContext, order_id: str) -> dict:
     """
     print(f"\n{'='*60}")
     print(f"[PREPARE SHIPMENT] Order ID: {order_id}")
-    print(f"[PREPARE SHIPMENT] Picking items from warehouse...")
-    print(f"[PREPARE SHIPMENT] Packing order...")
+    print("[PREPARE SHIPMENT] Picking items from warehouse...")
+    print("[PREPARE SHIPMENT] Packing order...")
     print(f"{'='*60}\n")
 
     return {
@@ -1691,7 +1760,7 @@ async def prepare_shipment(ctx: WorkflowContext, order_id: str) -> dict:
 
 
 @activity
-async def dispatch_shipment(ctx: WorkflowContext, order_id: str, tracking_number: str) -> dict:
+async def dispatch_shipment(_ctx: WorkflowContext, order_id: str, tracking_number: str) -> dict:
     """
     Dispatch shipment to carrier.
 
@@ -1706,7 +1775,7 @@ async def dispatch_shipment(ctx: WorkflowContext, order_id: str, tracking_number
     print(f"\n{'='*60}")
     print(f"[DISPATCH SHIPMENT] Order ID: {order_id}")
     print(f"[DISPATCH SHIPMENT] Tracking: {tracking_number}")
-    print(f"[DISPATCH SHIPMENT] Handed over to carrier")
+    print("[DISPATCH SHIPMENT] Handed over to carrier")
     print(f"{'='*60}\n")
 
     return {
@@ -1779,7 +1848,7 @@ async def scheduled_order_shipment_workflow(
     from datetime import datetime
 
     # Step 1: Create order and set shipment schedule
-    order_details = await create_scheduled_order(ctx, input.order_id, input.shipment_datetime)
+    _ = await create_scheduled_order(ctx, input.order_id, input.shipment_datetime)
 
     # Parse ISO 8601 datetime string to datetime object
     shipment_time = datetime.fromisoformat(input.shipment_datetime.replace("Z", "+00:00"))
@@ -1787,7 +1856,7 @@ async def scheduled_order_shipment_workflow(
     print(f"\n{'='*60}")
     print(f"[WORKFLOW] Waiting until: {shipment_time.isoformat()}")
     print(f"[WORKFLOW] Current time: {datetime.now().isoformat()}")
-    print(f"[WORKFLOW] This workflow will resume at the scheduled time...")
+    print("[WORKFLOW] This workflow will resume at the scheduled time...")
     print(f"{'='*60}\n")
 
     # Step 2: Wait until scheduled shipment time (absolute time)
@@ -1795,7 +1864,7 @@ async def scheduled_order_shipment_workflow(
     await wait_until(ctx, until_time=shipment_time)
 
     print(f"\n{'='*60}")
-    print(f"[WORKFLOW] Scheduled time reached! Proceeding with shipment...")
+    print("[WORKFLOW] Scheduled time reached! Proceeding with shipment...")
     print(f"{'='*60}\n")
 
     # Step 3: Prepare shipment at scheduled time
@@ -1814,12 +1883,333 @@ async def scheduled_order_shipment_workflow(
     )
 
 
+# ========== Channel-based Message Queue Workflows ==========
+# Demonstrates Erlang/Elixir mailbox pattern with competing and broadcast modes
+
+
+@activity
+async def execute_job(ctx: WorkflowContext, job_id: str, job_data: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+    """
+    Execute a job from the competing queue.
+
+    This simulates processing a job (e.g., sending emails, generating reports).
+    """
+    print(f"[Activity] Executing job: {job_id}")
+    print(f"[Activity] Job data: {job_data}")
+    # Simulate some work
+    return {
+        "job_id": job_id,
+        "processed": True,
+        "result": f"Job {job_id} completed successfully",
+    }
+
+
+@activity
+async def send_notification(
+    ctx: WorkflowContext, notification_id: str, notification_data: dict[str, Any]  # noqa: ARG001
+) -> dict[str, Any]:
+    """
+    Send a notification (e.g., push notification, SMS, email).
+
+    This is used in broadcast mode where all subscribers receive all messages.
+    """
+    print(f"[Activity] Sending notification: {notification_id}")
+    print(f"[Activity] Notification data: {notification_data}")
+    return {
+        "notification_id": notification_id,
+        "sent": True,
+        "channel": notification_data.get("channel", "default"),
+    }
+
+
+@workflow(event_handler=True)
+async def job_worker_workflow(
+    ctx: WorkflowContext,
+    input: JobWorkerInput,
+) -> JobWorkerResult:
+    """
+    Job Worker Workflow (Competing Mode Demo).
+
+    This workflow demonstrates the competing consumer pattern where each message
+    (job) is processed by only ONE subscriber. This is useful for:
+    - Job queues / task distribution
+    - Work stealing patterns
+    - Load balancing across workers
+
+    Multiple instances of this workflow can run concurrently, each competing
+    for jobs from the "jobs" channel. When a job is published, only one
+    worker will receive and process it.
+
+    Demonstrates:
+    - subscribe() with mode="competing"
+    - receive() to get the next available job
+    - Message claiming (only one worker gets each message)
+
+    CloudEvent type: "job_worker_workflow"
+    Data: {"worker_id": "worker-1"}
+
+    How to use:
+    1. Start multiple worker instances:
+       - Start this workflow multiple times with different worker_id values
+       - Each worker will subscribe to the "jobs" channel in competing mode
+
+    2. Publish jobs to the channel:
+       curl -X POST http://localhost:8001/ \\
+         -H "Content-Type: application/cloudevents+json" \\
+         -d '{
+           "specversion": "1.0",
+           "type": "job_published",
+           "source": "demo-client",
+           "id": "job-1",
+           "datacontenttype": "application/json",
+           "data": {
+             "channel": "jobs",
+             "task": "send_report",
+             "user_id": 123
+           }
+         }'
+
+    3. Only one worker will receive and process each job
+
+    Args:
+        ctx: Workflow context
+        input: Worker configuration (worker_id)
+
+    Returns:
+        JobWorkerResult with processed job information
+    """
+    print(f"\n{'='*60}")
+    print(f"[WORKFLOW] Job Worker {input.worker_id} starting...")
+    print("[WORKFLOW] Subscribing to 'jobs' channel in COMPETING mode")
+    print(f"{'='*60}\n")
+
+    # Subscribe to the jobs channel in competing mode
+    # Each job will be processed by only ONE worker
+    await subscribe(ctx, "jobs", mode="competing")
+
+    print(f"[WORKFLOW] Worker {input.worker_id} waiting for jobs...")
+
+    # Receive a job from the queue
+    # This will block until a job is available, then return immediately
+    job_message = await receive(ctx, channel="jobs")
+
+    print(f"\n{'='*60}")
+    print(f"[WORKFLOW] Worker {input.worker_id} received job!")
+    print(f"[WORKFLOW] Job ID: {job_message.id}")
+    print(f"[WORKFLOW] Job data: {job_message.data}")
+    print(f"{'='*60}\n")
+
+    # Cast data to dict (we know it's a dict in this demo, not bytes)
+    job_data = cast(dict[str, Any], job_message.data)
+
+    # Process the job (activity_id auto-generated: "execute_job:1")
+    await execute_job(ctx, job_message.id, job_data)
+
+    return JobWorkerResult(
+        worker_id=input.worker_id,
+        job_id=job_message.id,
+        job_data=job_data,
+        status="completed",
+    )
+
+
+@workflow(event_handler=True)
+async def notification_service_workflow(
+    ctx: WorkflowContext,
+    input: NotificationServiceInput,
+) -> NotificationServiceResult:
+    """
+    Notification Service Workflow (Broadcast Mode Demo).
+
+    This workflow demonstrates the broadcast (fan-out) pattern where ALL
+    subscribers receive ALL messages. This is useful for:
+    - Event notifications
+    - Audit logging
+    - Real-time updates to multiple services
+
+    Multiple instances of this workflow can run concurrently, and when a
+    notification is published, ALL instances will receive it.
+
+    Demonstrates:
+    - subscribe() with mode="broadcast" (default)
+    - receive() to get notifications
+    - Fan-out pattern (all subscribers get all messages)
+
+    CloudEvent type: "notification_service_workflow"
+    Data: {"service_id": "notification-handler-1"}
+
+    How to use:
+    1. Start multiple notification service instances:
+       - Start this workflow multiple times with different service_id values
+       - Each instance will subscribe to the "notifications" channel
+
+    2. Publish a notification:
+       curl -X POST http://localhost:8001/ \\
+         -H "Content-Type: application/cloudevents+json" \\
+         -d '{
+           "specversion": "1.0",
+           "type": "notification_published",
+           "source": "demo-client",
+           "id": "notification-1",
+           "datacontenttype": "application/json",
+           "data": {
+             "channel": "notifications",
+             "message": "System maintenance scheduled",
+             "priority": "high"
+           }
+         }'
+
+    3. ALL notification service instances will receive the message
+
+    Args:
+        ctx: Workflow context
+        input: Service configuration (service_id)
+
+    Returns:
+        NotificationServiceResult with notification handling information
+    """
+    print(f"\n{'='*60}")
+    print(f"[WORKFLOW] Notification Service {input.service_id} starting...")
+    print("[WORKFLOW] Subscribing to 'notifications' channel in BROADCAST mode")
+    print(f"{'='*60}\n")
+
+    # Subscribe to the notifications channel in broadcast mode (default)
+    # All subscribers will receive all messages
+    await subscribe(ctx, "notifications", mode="broadcast")
+
+    print(f"[WORKFLOW] Service {input.service_id} waiting for notifications...")
+
+    # Receive a notification
+    # All subscribers will receive this notification
+    notification = await receive(ctx, channel="notifications")
+
+    print(f"\n{'='*60}")
+    print(f"[WORKFLOW] Service {input.service_id} received notification!")
+    print(f"[WORKFLOW] Notification ID: {notification.id}")
+    print(f"[WORKFLOW] Notification data: {notification.data}")
+    print(f"{'='*60}\n")
+
+    # Cast data to dict (we know it's a dict in this demo, not bytes)
+    notification_data = cast(dict[str, Any], notification.data)
+
+    # Process the notification (activity_id auto-generated: "send_notification:1")
+    await send_notification(ctx, notification.id, notification_data)
+
+    return NotificationServiceResult(
+        service_id=input.service_id,
+        notification_id=notification.id,
+        notification_data=notification_data,
+        status="sent",
+    )
+
+
+@workflow(event_handler=True)
+async def job_publisher_workflow(
+    ctx: WorkflowContext,
+    input: JobPublisherInput,
+) -> dict[str, Any]:
+    """
+    Job Publisher Workflow.
+
+    Publishes a job to the "jobs" channel. Used with job_worker_workflow
+    to test the competing consumer pattern.
+
+    CloudEvent type: "job_publisher_workflow"
+    Data: {"task": "my-task-name"}
+    """
+    print(f"\n[PUBLISHER] Publishing job: {input.task}")
+    await publish(ctx, "jobs", {"task": input.task})
+    print(f"[PUBLISHER] Job published to 'jobs' channel")
+    return {"published": True, "channel": "jobs", "task": input.task}
+
+
+@workflow(event_handler=True)
+async def notification_publisher_workflow(
+    ctx: WorkflowContext,
+    input: NotificationPublisherInput,
+) -> dict[str, Any]:
+    """
+    Notification Publisher Workflow.
+
+    Publishes a notification to the "notifications" channel. Used with
+    notification_service_workflow to test the broadcast pattern.
+
+    CloudEvent type: "notification_publisher_workflow"
+    Data: {"message": "my-notification-message"}
+    """
+    print(f"\n[PUBLISHER] Publishing notification: {input.message}")
+    await publish(ctx, "notifications", {"message": input.message})
+    print(f"[PUBLISHER] Notification published to 'notifications' channel")
+    return {"published": True, "channel": "notifications", "message": input.message}
+
+
+# ========== Point-to-Point Messaging Workflows ==========
+
+
+@workflow(event_handler=True)
+async def direct_message_receiver_workflow(
+    ctx: WorkflowContext,
+    input: DirectMessageReceiverInput,
+) -> DirectMessageReceiverResult:
+    """
+    Point-to-Point Receiver Workflow.
+
+    Waits for a direct message from another workflow. Other workflows can send
+    messages using send_to(ctx, instance_id, data).
+
+    CloudEvent type: "direct_message_receiver_workflow"
+    Data: {"receiver_id": "my-receiver-id"}
+    """
+    print(f"\n[RECEIVER] Starting receiver: {input.receiver_id}")
+    print(f"[RECEIVER] Instance ID: {ctx.instance_id}")
+
+    # Subscribe to direct channel for this instance
+    # send_to() publishes to __direct__:{target_instance_id}
+    direct_channel = f"__direct__:{ctx.instance_id}"
+    await subscribe(ctx, direct_channel, mode="broadcast")
+
+    print(f"[RECEIVER] Waiting for direct message on {direct_channel}...")
+
+    # Wait for direct message
+    message = await receive(ctx, channel=direct_channel)
+
+    print(f"[RECEIVER] Received message: {message.data}")
+    return DirectMessageReceiverResult(
+        receiver_id=input.receiver_id,
+        received_message=cast(dict[str, Any], message.data),
+    )
+
+
+@workflow(event_handler=True)
+async def direct_message_sender_workflow(
+    ctx: WorkflowContext,
+    input: DirectMessageSenderInput,
+) -> DirectMessageSenderResult:
+    """
+    Point-to-Point Sender Workflow.
+
+    Sends a message directly to a specific workflow instance using send_to().
+
+    CloudEvent type: "direct_message_sender_workflow"
+    Data: {"target_instance_id": "...", "message": "Hello!"}
+    """
+    print(f"\n[SENDER] Sending message to: {input.target_instance_id}")
+    print(f"[SENDER] Message: {input.message}")
+
+    await send_to(ctx, input.target_instance_id, {"message": input.message})
+
+    print(f"[SENDER] Message sent!")
+    return DirectMessageSenderResult(
+        sent=True,
+        target_instance_id=input.target_instance_id,
+        message=input.message,
+    )
+
+
 # Export as ASGI application
 # No need to manually register event handlers!
 application = app
 
 # Export as WSGI application (for gunicorn, uWSGI, etc.)
 # Usage: gunicorn demo_app:wsgi_application --workers 4
-from edda.wsgi import create_wsgi_app
-
 wsgi_application = create_wsgi_app(app)

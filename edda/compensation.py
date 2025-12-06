@@ -5,8 +5,11 @@ This module provides compensation transaction support for implementing
 the Saga pattern with automatic rollback on failure.
 """
 
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
@@ -197,12 +200,12 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
 
     # If no compensations, nothing to do
     if not compensations:
-        print(f"[Compensation] No compensations to execute for {ctx.instance_id}")
+        logger.debug("No compensations to execute for %s", ctx.instance_id)
         return
 
     # Mark as compensating BEFORE execution for crash recovery
     # This allows auto-resume to detect and restart incomplete compensation
-    print(f"[Compensation] Starting compensation execution for {ctx.instance_id}")
+    logger.debug("Starting compensation execution for %s", ctx.instance_id)
     await ctx._update_status("compensating", {"started_at": None})
 
     # Get already executed compensations to avoid duplicate execution
@@ -221,8 +224,10 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
 
         # Skip if already executed (idempotency)
         if compensation_id in executed_compensation_ids:
-            print(
-                f"[Compensation] Skipping already executed: {activity_name} (id={compensation_id})"
+            logger.debug(
+                "Skipping already executed compensation: %s (id=%s)",
+                activity_name,
+                compensation_id,
             )
             continue
 
@@ -232,20 +237,18 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
 
         # Skip if activity_name is None or not a string
         if not isinstance(activity_name, str):
-            print(f"[Compensation] Warning: Invalid activity_name: {activity_name}. Skipping.")
+            logger.warning("Invalid activity_name: %s. Skipping.", activity_name)
             continue
 
         # Log compensation execution
-        print(f"[Compensation] Executing: {activity_name} (id={compensation_id})")
+        logger.info("Executing compensation: %s (id=%s)", activity_name, compensation_id)
 
         try:
             # Look up compensation function from registry
             compensation_func = _COMPENSATION_REGISTRY.get(activity_name)
 
             if compensation_func is None:
-                print(
-                    f"[Compensation] Warning: Function '{activity_name}' not found in registry. Skipping."
-                )
+                logger.warning("Function '%s' not found in registry. Skipping.", activity_name)
                 continue
 
             # Execute the compensation function directly
@@ -271,20 +274,21 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                 # This is expected in concurrent cancellation scenarios - silently ignore
                 error_msg = str(record_error)
                 if "UNIQUE constraint" in error_msg or "UNIQUE" in error_msg:
-                    print(
-                        f"[Compensation] {activity_name} already recorded by another process, skipping duplicate record"
+                    logger.debug(
+                        "%s already recorded by another process, skipping duplicate record",
+                        activity_name,
                     )
                 else:
                     # Other errors should be logged but not break the compensation flow
-                    print(
-                        f"[Compensation] Warning: Failed to record {activity_name} execution: {record_error}"
-                    )
+                    logger.warning("Failed to record %s execution: %s", activity_name, record_error)
 
-            print(f"[Compensation] Successfully executed: {activity_name}")
+            logger.info("Successfully executed compensation: %s", activity_name)
 
         except Exception as error:
             # Log but don't fail the rollback
-            print(f"[Compensation] Failed to execute {activity_name}: {error}")
+            logger.error(
+                "Failed to execute compensation %s: %s", activity_name, error, exc_info=True
+            )
 
             # Record compensation failure in history
             try:
@@ -304,13 +308,9 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                 # UNIQUE constraint error means another process already recorded this failure
                 error_msg = str(record_error)
                 if "UNIQUE constraint" in error_msg or "UNIQUE" in error_msg:
-                    print(
-                        f"[Compensation] {activity_name} failure already recorded by another process"
-                    )
+                    logger.debug("%s failure already recorded by another process", activity_name)
                 else:
-                    print(
-                        f"[Compensation] Warning: Failed to record compensation failure: {record_error}"
-                    )
+                    logger.warning("Failed to record compensation failure: %s", record_error)
 
 
 async def clear_compensations(ctx: "WorkflowContext") -> None:

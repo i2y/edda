@@ -50,7 +50,7 @@ server = EddaMCPServer(
 
 
 @activity
-async def format_greeting(ctx: WorkflowContext, name: str, style: str) -> dict:
+async def format_greeting(_ctx: WorkflowContext, name: str, style: str) -> dict:
     """Format a greeting based on style."""
     await asyncio.sleep(0.5)  # Simulate work
 
@@ -94,10 +94,10 @@ if __name__ == "__main__":
     sys.stderr.write("=" * 60 + "\n")
     sys.stderr.write("Starting Remote MCP Server...\n")
     sys.stderr.write("=" * 60 + "\n")
-    sys.stderr.write(f"Server name: Remote Greeting Service\n")
+    sys.stderr.write("Server name: Remote Greeting Service\n")
     sys.stderr.write(f"Database: {db_path}\n")
     sys.stderr.write(f"Listening on: http://{host}:{port}\n")
-    sys.stderr.write(f"Authentication: Bearer token required\n")
+    sys.stderr.write("Authentication: Bearer token required\n")
     sys.stderr.write(f"Auth token: {auth_token}\n")
     sys.stderr.write("\n")
     sys.stderr.write("Available MCP tools:\n")

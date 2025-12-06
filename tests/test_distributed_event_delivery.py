@@ -3,6 +3,9 @@ Tests for distributed event delivery.
 
 These tests verify that only ONE worker processes an event at a time,
 preventing race conditions in multi-Pod K8s environments.
+
+Note: CloudEvents internally uses Channel-based Message Queue (receive),
+so these tests use channel subscriptions for event delivery.
 """
 
 import asyncio
@@ -12,8 +15,8 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda import workflow
+from edda.channels import wait_event
 from edda.context import WorkflowContext
-from edda.events import wait_event
 from edda.replay import ReplayEngine
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
@@ -71,7 +74,7 @@ class TestDistributedEventDelivery:
         # Verify workflow is waiting
         instance = await sqlite_storage_dist.get_instance(instance_id)
         assert instance is not None
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
         assert instance["locked_by"] is None  # Lock should be released
 
         # Simulate two workers trying to deliver the same event simultaneously
@@ -135,7 +138,7 @@ class TestDistributedEventDelivery:
 
         # Verify workflow is waiting and lock is released
         instance = await sqlite_storage_dist.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
         assert instance["locked_by"] is None
 
         # Manually acquire lock (simulating another worker)
@@ -147,14 +150,19 @@ class TestDistributedEventDelivery:
         # Try to resume workflow (should fail because lock is held by other-worker)
         event_data = {"amount": 100, "currency": "USD"}
 
-        # Add event to history manually (simulating event delivery)
+        # Add message to history manually (simulating message delivery)
         await sqlite_storage_dist.append_history(
             instance_id,
-            activity_id="wait_event_payment.completed:1",
-            event_type="EventReceived",
-            event_data={"event_type": "payment.completed", "data": event_data},
+            activity_id="receive_payment.completed:1",
+            event_type="ChannelMessageReceived",
+            event_data={
+                "data": event_data,
+                "channel": "payment.completed",
+                "id": "test-msg-1",
+                "metadata": {},
+            },
         )
-        await sqlite_storage_dist.remove_event_subscription(instance_id, "payment.completed")
+        await sqlite_storage_dist.unsubscribe_from_channel(instance_id, "payment.completed")
 
         # Try to resume with a different worker (should fail due to lock)
         engine2 = ReplayEngine(
@@ -219,7 +227,7 @@ class TestDistributedEventDelivery:
         # Verify all are waiting with no locks
         for instance_id in instance_ids:
             instance = await sqlite_storage_dist.get_instance(instance_id)
-            assert instance["status"] == "waiting_for_event"
+            assert instance["status"] == "waiting_for_message"
             assert instance["locked_by"] is None
 
         # Acquire lock for first workflow
@@ -268,16 +276,21 @@ class TestDistributedEventDelivery:
 
         # Verify waiting
         instance = await sqlite_storage_dist.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
 
-        # Simulate event delivery and resume (will fail)
+        # Simulate message delivery and resume (will fail)
         await sqlite_storage_dist.append_history(
             instance_id,
-            activity_id="wait_event_test.event:1",
-            event_type="EventReceived",
-            event_data={"event_type": "test.event", "data": {"data": "test"}},
+            activity_id="receive_test.event:1",
+            event_type="ChannelMessageReceived",
+            event_data={
+                "data": {"data": "test"},
+                "channel": "test.event",
+                "id": "test-msg-2",
+                "metadata": {},
+            },
         )
-        await sqlite_storage_dist.remove_event_subscription(instance_id, "test.event")
+        await sqlite_storage_dist.unsubscribe_from_channel(instance_id, "test.event")
 
         # Try to resume (will fail with error)
         with contextlib.suppress(Exception):

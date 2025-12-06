@@ -25,7 +25,7 @@ server = EddaMCPServer(
 
 
 @activity
-async def format_greeting(ctx: WorkflowContext, name: str, style: str) -> dict:
+async def format_greeting(_ctx: WorkflowContext, name: str, style: str) -> dict:
     """Format a greeting based on style."""
     await asyncio.sleep(0.5)  # Simulate work
 

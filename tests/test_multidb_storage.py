@@ -139,35 +139,54 @@ class TestMultiDBHistory:
         assert len(history) == 0
 
 
-class TestMultiDBEventSubscriptions:
-    """Tests for event subscriptions across all databases."""
+class TestMultiDBMessageSubscriptions:
+    """Tests for message subscriptions across all databases.
+
+    Note: CloudEvents (wait_event) internally uses Message Passing (wait_message),
+    so all event/message subscriptions use the message subscription API.
+    """
 
     async def test_subscribe_and_find_waiting_workflows(self, db_storage, sample_workflow_data):
-        """Test subscribing to events and finding waiting workflows."""
+        """Test subscribing to messages and finding waiting workflows."""
         await db_storage.create_instance(**sample_workflow_data)
+        instance_id = sample_workflow_data["instance_id"]
 
-        # Subscribe to event
-        await db_storage.add_event_subscription(
-            sample_workflow_data["instance_id"], "payment.completed", None
+        # Acquire lock first (required for register_message_subscription_and_release_lock)
+        acquired = await db_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
+        assert acquired is True
+
+        # Register message subscription atomically (releases lock)
+        await db_storage.register_message_subscription_and_release_lock(
+            instance_id=instance_id,
+            worker_id="worker-1",
+            channel="payment.completed",
+            timeout_at=None,
+            activity_id="wait_message_payment.completed:1",
         )
 
-        # Find waiting workflows
-        workflows = await db_storage.find_waiting_instances("payment.completed")
+        # Find waiting workflows by channel
+        workflows = await db_storage.find_waiting_instances_by_channel("payment.completed")
         assert len(workflows) == 1
-        assert workflows[0]["instance_id"] == sample_workflow_data["instance_id"]
+        assert workflows[0]["instance_id"] == instance_id
 
-    async def test_unsubscribe_from_event(self, db_storage, sample_workflow_data):
-        """Test unsubscribing from events."""
+    async def test_unsubscribe_from_message(self, db_storage, sample_workflow_data):
+        """Test unsubscribing from messages."""
         await db_storage.create_instance(**sample_workflow_data)
+        instance_id = sample_workflow_data["instance_id"]
 
-        # Subscribe and unsubscribe
-        await db_storage.add_event_subscription(
-            sample_workflow_data["instance_id"], "payment.completed", None
+        # Acquire lock and register subscription
+        await db_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
+        await db_storage.register_message_subscription_and_release_lock(
+            instance_id=instance_id,
+            worker_id="worker-1",
+            channel="payment.completed",
+            timeout_at=None,
+            activity_id="wait_message_payment.completed:1",
         )
-        await db_storage.remove_event_subscription(
-            sample_workflow_data["instance_id"], "payment.completed"
-        )
+
+        # Unsubscribe
+        await db_storage.remove_message_subscription(instance_id, "payment.completed")
 
         # Verify unsubscribed
-        workflows = await db_storage.find_waiting_instances("payment.completed")
+        workflows = await db_storage.find_waiting_instances_by_channel("payment.completed")
         assert len(workflows) == 0

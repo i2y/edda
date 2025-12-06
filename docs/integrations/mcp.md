@@ -175,6 +175,92 @@ The cancel tool:
 - Automatically executes SAGA compensation transactions to roll back side effects
 - Returns an error for already completed, failed, or cancelled workflows
 
+## MCP Prompts
+
+Edda supports [MCP Prompts](https://modelcontextprotocol.io/docs/concepts/prompts), allowing AI assistants to access workflow state for context-aware prompts.
+
+### Defining a Prompt
+
+Use the `@server.prompt()` decorator to define prompts that can access workflow data:
+
+```python
+from edda.integrations.mcp import EddaMCPServer
+from mcp.server.fastmcp.prompts.base import UserMessage
+from mcp.types import TextContent
+
+server = EddaMCPServer(
+    name="Workflow Analysis Service",
+    db_url="sqlite:///workflow.db",
+)
+
+@server.prompt(description="Analyze a completed workflow execution")
+async def analyze_workflow(instance_id: str) -> UserMessage:
+    """Generate an analysis prompt for a workflow."""
+    # Access workflow state via server.storage
+    instance = await server.storage.get_instance(instance_id)
+    history = await server.storage.get_history(instance_id)
+
+    text = f"""**Workflow Analysis Request**
+
+**Workflow Details:**
+- Instance ID: {instance_id}
+- Status: {instance['status']}
+- Workflow: {instance['workflow_name']}
+- Activities Completed: {len(history)}
+
+**Execution History:**
+{chr(10).join(f"- {h['activity_id']}: {h['event_type']}" for h in history)}
+
+Please analyze this workflow execution and provide:
+1. Summary of what happened
+2. Any potential issues or improvements
+3. Performance observations"""
+
+    return UserMessage(content=TextContent(type="text", text=text))
+```
+
+### Accessing Workflow State
+
+Prompts can access workflow data through `server.storage`:
+
+- `server.storage.get_instance(instance_id)` - Get workflow status, input, output
+- `server.storage.get_history(instance_id)` - Get execution history (activities, events)
+
+### Example: Debug Prompt
+
+```python
+@server.prompt(description="Debug a failed workflow")
+async def debug_workflow(instance_id: str) -> UserMessage:
+    """Generate a debugging prompt for failed workflows."""
+    instance = await server.storage.get_instance(instance_id)
+    history = await server.storage.get_history(instance_id)
+
+    # Find failed activities
+    failed = [h for h in history if h.get("event_type") == "ActivityFailed"]
+
+    text = f"""**Workflow Debug Request**
+
+Status: {instance['status']}
+Error: {instance.get('error', 'None')}
+
+Failed Activities: {len(failed)}
+{chr(10).join(f"- {f['activity_id']}: {f.get('event_data', {}).get('error', 'Unknown')}" for f in failed)}
+
+Please help debug this workflow failure."""
+
+    return UserMessage(content=TextContent(type="text", text=text))
+```
+
+### Using Prompts from MCP Clients
+
+MCP clients (like Claude Desktop) can list and use prompts:
+
+1. **List available prompts**: Client discovers prompts with descriptions
+2. **Get prompt**: Client requests prompt with arguments (e.g., `instance_id`)
+3. **Use generated content**: AI assistant receives the context-rich prompt
+
+See [examples/mcp/prompts_example.py](https://github.com/i2y/edda/blob/main/examples/mcp/prompts_example.py) for a complete working example.
+
 ## Advanced Configuration
 
 ### Authentication
@@ -255,4 +341,4 @@ Edda's MCP integration follows the [MCP Tools specification](https://modelcontex
 
 ## Examples
 
-See the [examples/mcp/](../../examples/mcp/) directory for complete working examples.
+See the [examples/mcp/](https://github.com/i2y/edda/tree/main/examples/mcp/) directory for complete working examples.

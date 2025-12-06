@@ -12,9 +12,9 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda.activity import activity
+from edda.channels import wait_event
 from edda.compensation import register_compensation
 from edda.context import WorkflowContext
-from edda.events import wait_event
 from edda.locking import generate_worker_id
 from edda.replay import ReplayEngine
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
@@ -176,7 +176,7 @@ class TestWorkflowCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_waiting_workflow(
-        self, storage: SQLAlchemyStorage, replay_engine: ReplayEngine
+        self, storage: SQLAlchemyStorage, replay_engine: ReplayEngine, worker_id: str
     ) -> None:
         """Test cancelling a workflow that is waiting for an event."""
         # Create a workflow instance in waiting state
@@ -192,18 +192,24 @@ class TestWorkflowCancellation:
         # Update status to waiting_for_event
         await storage.update_instance_status(instance_id, "waiting_for_event")
 
-        # Add event subscription
+        # Add message subscription (CloudEvents uses Message Passing internally)
+        # Must acquire lock first, then register subscription atomically
         from datetime import UTC, datetime, timedelta
 
+        acquired = await storage.try_acquire_lock(instance_id, worker_id, timeout_seconds=30)
+        assert acquired is True
+
         timeout_at = datetime.now(UTC) + timedelta(seconds=60)
-        await storage.add_event_subscription(
+        await storage.register_message_subscription_and_release_lock(
             instance_id=instance_id,
-            event_type="test.event",
+            worker_id=worker_id,
+            channel="test.event",
             timeout_at=timeout_at,
+            activity_id="wait_message_test.event:1",
         )
 
         # Verify subscription exists
-        subscriptions = await storage.find_waiting_instances("test.event")
+        subscriptions = await storage.find_waiting_instances_by_channel("test.event")
         assert len(subscriptions) == 1
         assert subscriptions[0]["instance_id"] == instance_id
 
@@ -218,8 +224,8 @@ class TestWorkflowCancellation:
         assert instance is not None
         assert instance["status"] == "cancelled"
 
-        # Verify event subscription is removed
-        subscriptions = await storage.find_waiting_instances("test.event")
+        # Verify message subscription is removed
+        subscriptions = await storage.find_waiting_instances_by_channel("test.event")
         assert len(subscriptions) == 0
 
     @pytest.mark.asyncio
@@ -394,10 +400,10 @@ class TestWorkflowCancellation:
         await storage.release_lock(instance_id, other_worker_id)
 
     @pytest.mark.asyncio
-    async def test_cancel_clears_event_subscription(
-        self, storage: SQLAlchemyStorage, replay_engine: ReplayEngine
+    async def test_cancel_clears_message_subscription(
+        self, storage: SQLAlchemyStorage, replay_engine: ReplayEngine, worker_id: str
     ) -> None:
-        """Test that cancellation removes event subscriptions."""
+        """Test that cancellation removes message subscriptions."""
         # Create a workflow instance
         instance_id = "test-cancel-subscription-1"
         await storage.create_instance(
@@ -411,18 +417,24 @@ class TestWorkflowCancellation:
         # Update to waiting state
         await storage.update_instance_status(instance_id, "waiting_for_event")
 
-        # Add event subscription
+        # Add message subscription (CloudEvents uses Message Passing internally)
+        # Must acquire lock first, then register subscription atomically
         from datetime import UTC, datetime, timedelta
 
+        acquired = await storage.try_acquire_lock(instance_id, worker_id, timeout_seconds=30)
+        assert acquired is True
+
         timeout_at = datetime.now(UTC) + timedelta(seconds=120)
-        await storage.add_event_subscription(
+        await storage.register_message_subscription_and_release_lock(
             instance_id=instance_id,
-            event_type="payment.completed",
+            worker_id=worker_id,
+            channel="payment.completed",
             timeout_at=timeout_at,
+            activity_id="wait_message_payment.completed:1",
         )
 
         # Verify subscription exists
-        subscriptions_before = await storage.find_waiting_instances("payment.completed")
+        subscriptions_before = await storage.find_waiting_instances_by_channel("payment.completed")
         assert len(subscriptions_before) == 1
 
         # Cancel the workflow
@@ -432,7 +444,7 @@ class TestWorkflowCancellation:
         assert success is True
 
         # Verify subscription was removed
-        subscriptions_after = await storage.find_waiting_instances("payment.completed")
+        subscriptions_after = await storage.find_waiting_instances_by_channel("payment.completed")
         assert len(subscriptions_after) == 0
 
         # Verify status is cancelled

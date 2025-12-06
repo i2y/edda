@@ -13,18 +13,23 @@ from typing import TYPE_CHECKING, Any
 from edda.hooks import HooksBase
 
 if TYPE_CHECKING:
-    from opentelemetry.context import Context
-    from opentelemetry.trace import Span, Tracer
+    from opentelemetry.context import Context  # type: ignore[import-not-found]
+    from opentelemetry.trace import Span, Tracer  # type: ignore[import-not-found]
 
 # Check if OpenTelemetry is available
 try:
-    from opentelemetry import trace
+    from opentelemetry import trace  # type: ignore[import-not-found]
     from opentelemetry.context import Context
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.sdk.resources import Resource  # type: ignore[import-not-found]
+    from opentelemetry.sdk.trace import TracerProvider  # type: ignore[import-not-found]
+    from opentelemetry.sdk.trace.export import (  # type: ignore[import-not-found]
+        BatchSpanProcessor,
+        ConsoleSpanExporter,
+    )
     from opentelemetry.trace import Span, Status, StatusCode, Tracer
-    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+    from opentelemetry.trace.propagation.tracecontext import (  # type: ignore[import-not-found]
+        TraceContextTextMapPropagator,
+    )
 
     _OPENTELEMETRY_AVAILABLE = True
 except ImportError:
@@ -143,7 +148,7 @@ class OpenTelemetryHooks(HooksBase):
             if otlp_endpoint:
                 # Production: OTLP exporter
                 try:
-                    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (  # type: ignore[import-not-found]
                         OTLPSpanExporter,
                     )
 
@@ -165,8 +170,8 @@ class OpenTelemetryHooks(HooksBase):
         """Configure OpenTelemetry metrics (optional)."""
         try:
             from opentelemetry import metrics
-            from opentelemetry.sdk.metrics import MeterProvider
-            from opentelemetry.sdk.metrics.export import (
+            from opentelemetry.sdk.metrics import MeterProvider  # type: ignore[import-not-found]
+            from opentelemetry.sdk.metrics.export import (  # type: ignore[import-not-found]
                 ConsoleMetricExporter,
                 MetricExporter,
                 PeriodicExportingMetricReader,
@@ -175,7 +180,7 @@ class OpenTelemetryHooks(HooksBase):
             exporter: MetricExporter
             if otlp_endpoint:
                 try:
-                    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+                    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (  # type: ignore[import-not-found]
                         OTLPMetricExporter,
                     )
 

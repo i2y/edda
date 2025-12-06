@@ -34,20 +34,27 @@ async def my_workflow(ctx: WorkflowContext):
     amount = event.data["amount"]
 ```
 
-### `wait_timer()`
+### `sleep()`
 
 Wait for a specific duration:
 
 ```python
-from edda import wait_timer, WorkflowContext
+from edda import sleep, WorkflowContext
 
 async def my_workflow(ctx: WorkflowContext):
     # Wait for 60 seconds
-    await wait_timer(ctx, duration_seconds=60)
+    await sleep(ctx, seconds=60)
 
     # Continue execution after timer expires
     await process_timeout()
 ```
+
+> **Note**: `wait_timer()` and `wait_until()` are backward-compatible aliases that also work:
+>
+> ```python
+> from edda import sleep, sleep_until  # Primary names
+> from edda import wait_timer, wait_until  # Aliases (backward-compatible)
+> ```
 
 ## Detailed API Reference
 
@@ -106,12 +113,12 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str):
         return {"order_id": order_id, "payment_id": event.data.payment_id}
 ```
 
-### wait_timer()
+### sleep()
 
 ```python
-async def wait_timer(
+async def sleep(
     ctx: WorkflowContext,
-    duration_seconds: float,
+    seconds: int,
     timer_id: str | None = None
 ) -> None:
 ```
@@ -119,13 +126,13 @@ async def wait_timer(
 #### Parameters
 
 - `ctx`: The workflow context
-- `duration_seconds`: Duration to wait in seconds
+- `seconds`: Duration to wait in seconds
 - `timer_id`: Optional custom timer ID (auto-generated if not provided)
 
 #### Example
 
 ```python
-from edda import wait_timer, workflow, WorkflowContext
+from edda import sleep, workflow, WorkflowContext
 
 @workflow
 async def scheduled_task(ctx: WorkflowContext, task_id: str):
@@ -133,7 +140,7 @@ async def scheduled_task(ctx: WorkflowContext, task_id: str):
     await perform_initial_task(ctx, task_id)
 
     # Wait 1 hour
-    await wait_timer(ctx, duration_seconds=3600)
+    await sleep(ctx, seconds=3600)
 
     # Execute after delay
     await perform_delayed_task(ctx, task_id)
@@ -225,7 +232,7 @@ async def batch_processor(ctx: WorkflowContext, batch_id: str, items: list[dict]
 
         # Wait between batches (except for last batch)
         if i + batch_size < len(items):
-            await wait_timer(ctx, duration_seconds=5)
+            await sleep(ctx, seconds=5)
 
     return {"batch_id": batch_id, "results": results}
 ```

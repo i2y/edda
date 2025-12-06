@@ -7,6 +7,8 @@ application for handling CloudEvents and executing workflows.
 
 import asyncio
 import json
+import logging
+import random
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -23,6 +25,8 @@ from edda.outbox.relayer import OutboxRelayer
 from edda.replay import ReplayEngine
 from edda.retry import RetryPolicy
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
+
+logger = logging.getLogger(__name__)
 
 
 class EddaApp:
@@ -44,6 +48,13 @@ class EddaApp:
         broker_url: str = "http://broker-ingress.knative-eventing.svc.cluster.local/default/default",
         hooks: WorkflowHooks | None = None,
         default_retry_policy: "RetryPolicy | None" = None,
+        message_retention_days: int = 7,
+        # Connection pool settings (ignored for SQLite)
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: int = 30,
+        pool_recycle: int = 3600,
+        pool_pre_ping: bool = True,
     ):
         """
         Initialize Edda application.
@@ -57,6 +68,19 @@ class EddaApp:
             default_retry_policy: Default retry policy for all activities.
                                  If None, uses DEFAULT_RETRY_POLICY (5 attempts, exponential backoff).
                                  Can be overridden per-activity using @activity(retry_policy=...).
+            message_retention_days: Number of days to retain channel messages before automatic cleanup.
+                                   Defaults to 7 days. Messages older than this will be deleted
+                                   by a background task running every hour.
+            pool_size: Number of connections to keep open in the pool (default: 5).
+                      Ignored for SQLite. For production, consider 20+.
+            max_overflow: Maximum number of connections to create above pool_size (default: 10).
+                         Ignored for SQLite. For production, consider 40+.
+            pool_timeout: Seconds to wait for a connection from the pool (default: 30).
+                         Ignored for SQLite.
+            pool_recycle: Seconds before a connection is recycled (default: 3600).
+                         Helps prevent stale connections. Ignored for SQLite.
+            pool_pre_ping: If True, test connections before use (default: True).
+                          Helps detect disconnected connections. Ignored for SQLite.
         """
         self.db_url = db_url
         self.service_name = service_name
@@ -64,6 +88,14 @@ class EddaApp:
         self.broker_url = broker_url
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
+        self._message_retention_days = message_retention_days
+
+        # Connection pool settings
+        self._pool_size = pool_size
+        self._max_overflow = max_overflow
+        self._pool_timeout = pool_timeout
+        self._pool_recycle = pool_recycle
+        self._pool_pre_ping = pool_pre_ping
 
         # Generate unique worker ID for this process
         self.worker_id = generate_worker_id(service_name)
@@ -100,18 +132,35 @@ class EddaApp:
         Returns:
             SQLAlchemyStorage instance
         """
+        # Check if using SQLite (connection pool settings not applicable)
+        is_sqlite = db_url.startswith("sqlite")
+
         # Convert plain sqlite:// URLs to use aiosqlite driver
         if db_url.startswith("sqlite:///"):
             db_url = db_url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
         elif db_url == "sqlite:///:memory:" or db_url.startswith("sqlite:///:memory:"):
             db_url = "sqlite+aiosqlite:///:memory:"
 
+        # Build engine kwargs
+        engine_kwargs: dict[str, Any] = {
+            "echo": False,  # Set to True for SQL logging
+            "future": True,
+        }
+
+        # Add connection pool settings for non-SQLite databases
+        if not is_sqlite:
+            engine_kwargs.update(
+                {
+                    "pool_size": self._pool_size,
+                    "max_overflow": self._max_overflow,
+                    "pool_timeout": self._pool_timeout,
+                    "pool_recycle": self._pool_recycle,
+                    "pool_pre_ping": self._pool_pre_ping,
+                }
+            )
+
         # Create async engine
-        engine = create_async_engine(
-            db_url,
-            echo=False,  # Set to True for SQL logging
-            future=True,
-        )
+        engine = create_async_engine(db_url, **engine_kwargs)
 
         return SQLAlchemyStorage(engine)
 
@@ -194,6 +243,7 @@ class EddaApp:
             auto_resume_stale_workflows_periodically(
                 self.storage,
                 self.replay_engine,
+                self.worker_id,
                 interval=60,  # Check every 60 seconds
             )
         )
@@ -205,11 +255,29 @@ class EddaApp:
         )
         self._background_tasks.append(timer_check_task)
 
-        # Task to check expired event timeouts and fail workflows
-        event_timeout_task = asyncio.create_task(
-            self._check_expired_event_timeouts_periodically(interval=10)  # Check every 10 seconds
+        # Task to check expired message subscriptions and fail workflows
+        # Note: CloudEvents timeouts are also handled here since wait_event() uses wait_message()
+        message_timeout_task = asyncio.create_task(
+            self._check_expired_message_subscriptions_periodically(
+                interval=10
+            )  # Check every 10 seconds
         )
-        self._background_tasks.append(event_timeout_task)
+        self._background_tasks.append(message_timeout_task)
+
+        # Task to resume workflows after message delivery (fast resumption)
+        message_resume_task = asyncio.create_task(
+            self._resume_running_workflows_periodically(interval=1)  # Check every 1 second
+        )
+        self._background_tasks.append(message_resume_task)
+
+        # Task to cleanup old channel messages (orphaned messages)
+        message_cleanup_task = asyncio.create_task(
+            self._cleanup_old_messages_periodically(
+                interval=3600,  # Check every 1 hour
+                retention_days=self._message_retention_days,
+            )
+        )
+        self._background_tasks.append(message_cleanup_task)
 
     def _auto_register_workflows(self) -> None:
         """
@@ -354,11 +422,7 @@ class EddaApp:
         try:
             await handler(event)
         except Exception as e:
-            # Log error (in a real implementation, use proper logging)
-            print(f"Error handling event {event_type}: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.error("Error handling event %s: %s", event_type, e, exc_info=True)
 
     async def _deliver_event_to_waiting_workflows_safe(self, event: Any) -> None:
         """
@@ -370,35 +434,46 @@ class EddaApp:
         try:
             await self._deliver_event_to_waiting_workflows(event)
         except Exception as e:
-            print(f"Error delivering event to waiting workflows: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.error("Error delivering event to waiting workflows: %s", e, exc_info=True)
 
     async def _deliver_event_to_waiting_workflows(self, event: Any) -> None:
         """
-        Deliver event to workflows waiting for this event type.
+        Deliver CloudEvent to workflows waiting for this event type.
 
-        This method:
-        1. Finds workflows waiting for the event type
-        2. Records event data to workflow history
-        3. Removes event subscription
-        4. Resumes the workflow
+        This method supports two delivery patterns based on the 'eddainstanceid' extension:
+
+        1. **Point-to-Point** (when 'eddainstanceid' is present):
+           Delivers to a specific workflow instance only.
+
+        2. **Pub/Sub** (when 'eddainstanceid' is absent):
+           Delivers to ALL workflows waiting for this event type.
+
+        Both patterns use the Channel-based Message Queue system for delivery:
+        - Lock acquisition (Lock-First pattern)
+        - History recording (ChannelMessageReceived)
+        - Subscription cursor update (broadcast) or message deletion (competing)
+        - Status update to 'running'
+        - Lock release
+
+        Workflow resumption is handled by background task (_resume_running_workflows_periodically).
 
         Args:
             event: CloudEvent instance
         """
+        from edda.channels import publish
+
         event_type = event["type"]
         event_data = event.get_data()
 
-        # Extract CloudEvents metadata
-        event_metadata = {
-            "type": event["type"],
-            "source": event["source"],
-            "id": event["id"],
-            "time": event.get("time"),
-            "datacontenttype": event.get("datacontenttype"),
-            "subject": event.get("subject"),
+        # Extract CloudEvents metadata with ce_ prefix
+        # This allows ReceivedEvent to reconstruct CloudEvents attributes
+        metadata = {
+            "ce_type": event["type"],
+            "ce_source": event["source"],
+            "ce_id": event["id"],
+            "ce_time": event.get("time"),
+            "ce_datacontenttype": event.get("datacontenttype"),
+            "ce_subject": event.get("subject"),
         }
 
         # Extract extension attributes (any attributes not in the standard set)
@@ -414,112 +489,68 @@ class EddaApp:
             "data_base64",
         }
         extensions = {k: v for k, v in event.get_attributes().items() if k not in standard_attrs}
+        if extensions:
+            metadata["ce_extensions"] = extensions
 
-        # Find workflows waiting for this event type
-        waiting_instances = await self.storage.find_waiting_instances(event_type)
+        # Check for eddainstanceid extension attribute for Point-to-Point delivery
+        target_instance_id = extensions.get("eddainstanceid")
 
-        if not waiting_instances:
-            return  # No workflows waiting for this event
-
-        print(
-            f"[EventDelivery] Found {len(waiting_instances)} workflow(s) waiting for '{event_type}'"
-        )
-
-        for subscription in waiting_instances:
-            instance_id = subscription["instance_id"]
-
-            # Get workflow instance
-            instance = await self.storage.get_instance(instance_id)
-            if not instance:
-                print(f"[EventDelivery] Warning: Instance {instance_id} not found, skipping")
-                continue
-
-            # Check if instance is still waiting
-            if instance.get("status") != "waiting_for_event":
-                print(
-                    f"[EventDelivery] Warning: Instance {instance_id} "
-                    f"status is '{instance.get('status')}', expected 'waiting_for_event', skipping"
-                )
-                continue
-
-            # Get activity_id from the subscription (stored when wait_event was called)
-            activity_id = subscription.get("activity_id")
-            if not activity_id:
-                print(
-                    f"[EventDelivery] Warning: No activity_id in subscription for {instance_id}, skipping"
-                )
-                continue
-
-            workflow_name = instance["workflow_name"]
-
-            # Distributed Coroutines: Acquire lock FIRST to prevent race conditions
-            # This ensures only ONE pod processes this event, even if multiple pods
-            # receive the event simultaneously
-            lock_acquired = await self.storage.try_acquire_lock(
-                instance_id, self.worker_id, timeout_seconds=300
+        if target_instance_id:
+            # Point-to-Point: Deliver to specific instance only
+            logger.debug(
+                "Point-to-Point: Delivering '%s' to instance %s",
+                event_type,
+                target_instance_id,
             )
 
-            if not lock_acquired:
-                print(
-                    f"[EventDelivery] Another worker is processing {instance_id}, skipping "
-                    "(distributed coroutine - lock already held)"
-                )
-                continue
-
             try:
-                print(
-                    f"[EventDelivery] Delivering event to workflow {instance_id} (activity_id: {activity_id})"
+                await publish(
+                    self.storage,
+                    channel=event_type,
+                    data=event_data,
+                    metadata=metadata,
+                    target_instance_id=target_instance_id,
+                    worker_id=self.worker_id,
                 )
-
-                # 1. Record event data and metadata to history
-                try:
-                    await self.storage.append_history(
-                        instance_id,
-                        activity_id=activity_id,
-                        event_type="EventReceived",
-                        event_data={
-                            "payload": event_data,
-                            "metadata": event_metadata,
-                            "extensions": extensions,
-                        },
-                    )
-                except Exception as history_error:
-                    # If history entry already exists (UNIQUE constraint), this event was already
-                    # delivered by another worker in a multi-process environment.
-                    # Skip workflow resumption to prevent duplicate processing.
-                    print(
-                        f"[EventDelivery] History already exists for activity_id {activity_id}: {history_error}"
-                    )
-                    print(
-                        f"[EventDelivery] Event '{event_type}' was already delivered by another worker, skipping"
-                    )
-                    continue
-
-                # 2. Remove event subscription
-                await self.storage.remove_event_subscription(instance_id, event_type)
-
-                # 3. Resume workflow (lock already held by this worker - distributed coroutine pattern)
-                if self.replay_engine is None:
-                    print("[EventDelivery] Error: Replay engine not initialized")
-                    continue
-
-                await self.replay_engine.resume_by_name(
-                    instance_id, workflow_name, already_locked=True
-                )
-
-                print(
-                    f"[EventDelivery] ✅ Resumed workflow {instance_id} after receiving '{event_type}'"
+                logger.debug(
+                    "Published '%s' to channel (target: %s)",
+                    event_type,
+                    target_instance_id,
                 )
 
             except Exception as e:
-                print(f"[EventDelivery] ❌ Error resuming workflow {instance_id}: {e}")
-                import traceback
+                logger.error(
+                    "Error delivering to workflow %s: %s",
+                    target_instance_id,
+                    e,
+                    exc_info=True,
+                )
 
-                traceback.print_exc()
+        else:
+            # Pub/Sub: Deliver to ALL waiting instances
+            logger.debug("Pub/Sub: Publishing '%s' to channel", event_type)
 
-            finally:
-                # Always release the lock, even if an error occurred
-                await self.storage.release_lock(instance_id, self.worker_id)
+            try:
+                message_id = await publish(
+                    self.storage,
+                    channel=event_type,
+                    data=event_data,
+                    metadata=metadata,
+                    worker_id=self.worker_id,
+                )
+                logger.debug(
+                    "Published '%s' to channel (message_id: %s)",
+                    event_type,
+                    message_id,
+                )
+
+            except Exception as e:
+                logger.error(
+                    "Error publishing to channel '%s': %s",
+                    event_type,
+                    e,
+                    exc_info=True,
+                )
 
     async def _check_expired_timers(self) -> None:
         """
@@ -542,7 +573,7 @@ class EddaApp:
         if not expired_timers:
             return  # No expired timers
 
-        print(f"[TimerCheck] Found {len(expired_timers)} expired timer(s)")
+        logger.debug("Found %d expired timer(s)", len(expired_timers))
 
         for timer in expired_timers:
             instance_id = timer["instance_id"]
@@ -551,22 +582,12 @@ class EddaApp:
             activity_id = timer.get("activity_id")
 
             if not activity_id:
-                print(f"[TimerCheck] Warning: No activity_id in timer for {instance_id}, skipping")
+                logger.warning("No activity_id in timer for %s, skipping", instance_id)
                 continue
 
-            # Get workflow instance
-            instance = await self.storage.get_instance(instance_id)
-            if not instance:
-                print(f"[TimerCheck] Warning: Instance {instance_id} not found, skipping")
-                continue
-
-            # Check if instance is still waiting for timer
-            if instance.get("status") != "waiting_for_timer":
-                print(
-                    f"[TimerCheck] Warning: Instance {instance_id} "
-                    f"status is '{instance.get('status')}', expected 'waiting_for_timer', skipping"
-                )
-                continue
+            # Note: find_expired_timers() already filters by status='waiting_for_timer'
+            # and JOINs with workflow_instances, so no need for additional get_instance() call.
+            # The lock mechanism below handles race conditions.
 
             # Distributed Coroutines: Acquire lock FIRST to prevent race conditions
             # This ensures only ONE pod processes this timer, even if multiple pods
@@ -576,15 +597,18 @@ class EddaApp:
             )
 
             if not lock_acquired:
-                print(
-                    f"[TimerCheck] Another worker is processing {instance_id}, skipping "
-                    "(distributed coroutine - lock already held)"
+                logger.debug(
+                    "Another worker is processing %s, skipping (lock already held)",
+                    instance_id,
                 )
                 continue
 
             try:
-                print(
-                    f"[TimerCheck] Timer '{timer_id}' expired for workflow {instance_id} (activity_id: {activity_id})"
+                logger.debug(
+                    "Timer '%s' expired for workflow %s (activity_id: %s)",
+                    timer_id,
+                    instance_id,
+                    activity_id,
                 )
 
                 # 1. Record timer expiration to history (allows deterministic replay)
@@ -604,11 +628,14 @@ class EddaApp:
                     # If history entry already exists (UNIQUE constraint), this timer was already
                     # processed by another worker in a multi-process environment.
                     # Skip workflow resumption to prevent duplicate processing.
-                    print(
-                        f"[TimerCheck] History already exists for activity_id {activity_id}: {history_error}"
+                    logger.debug(
+                        "History already exists for activity_id %s: %s",
+                        activity_id,
+                        history_error,
                     )
-                    print(
-                        f"[TimerCheck] Timer '{timer_id}' was already processed by another worker, skipping"
+                    logger.debug(
+                        "Timer '%s' was already processed by another worker, skipping",
+                        timer_id,
                     )
                     continue
 
@@ -617,22 +644,21 @@ class EddaApp:
 
                 # 3. Resume workflow (lock already held by this worker - distributed coroutine pattern)
                 if self.replay_engine is None:
-                    print("[TimerCheck] Error: Replay engine not initialized")
+                    logger.error("Replay engine not initialized")
                     continue
 
                 await self.replay_engine.resume_by_name(
                     instance_id, workflow_name, already_locked=True
                 )
 
-                print(
-                    f"[TimerCheck] ✅ Resumed workflow {instance_id} after timer '{timer_id}' expired"
+                logger.debug(
+                    "Resumed workflow %s after timer '%s' expired",
+                    instance_id,
+                    timer_id,
                 )
 
             except Exception as e:
-                print(f"[TimerCheck] ❌ Error resuming workflow {instance_id}: {e}")
-                import traceback
-
-                traceback.print_exc()
+                logger.error("Error resuming workflow %s: %s", instance_id, e, exc_info=True)
 
             finally:
                 # Always release the lock, even if an error occurred
@@ -655,33 +681,30 @@ class EddaApp:
                 await asyncio.sleep(interval)
                 await self._check_expired_timers()
             except Exception as e:
-                print(f"[TimerCheck] Error in periodic timer check: {e}")
-                import traceback
+                logger.error("Error in periodic timer check: %s", e, exc_info=True)
 
-                traceback.print_exc()
-
-    async def _check_expired_event_timeouts(self) -> None:
+    async def _check_expired_message_subscriptions(self) -> None:
         """
-        Check for event subscriptions that have timed out and fail those workflows.
+        Check for message subscriptions that have timed out and fail those workflows.
 
         This method:
-        1. Finds all event subscriptions where timeout_at <= now
+        1. Finds all message subscriptions where timeout_at <= now
         2. For each timeout, acquires workflow lock (Lock-First pattern)
-        3. Records EventTimeout to history
-        4. Removes event subscription
-        5. Fails the workflow with EventTimeoutError
+        3. Records MessageTimeout to history
+        4. Removes message subscription
+        5. Fails the workflow with TimeoutError
         """
-        # Find all expired event subscriptions
-        expired = await self.storage.find_expired_event_subscriptions()
+        # Find all expired message subscriptions
+        expired = await self.storage.find_expired_message_subscriptions()
 
         if not expired:
             return
 
-        print(f"[EventTimeoutCheck] Found {len(expired)} expired event subscriptions")
+        logger.debug("Found %d expired message subscriptions", len(expired))
 
         for subscription in expired:
             instance_id = subscription["instance_id"]
-            event_type = subscription["event_type"]
+            channel = subscription["channel"]
             timeout_at = subscription["timeout_at"]
             created_at = subscription["created_at"]
 
@@ -689,74 +712,92 @@ class EddaApp:
             # If we can't get the lock, another worker is processing this workflow
             lock_acquired = await self.storage.try_acquire_lock(instance_id, self.worker_id)
             if not lock_acquired:
-                print(
-                    f"[EventTimeoutCheck] Could not acquire lock for workflow {instance_id}, skipping (another worker is processing)"
+                logger.debug(
+                    "Could not acquire lock for workflow %s, skipping (another worker is processing)",
+                    instance_id,
                 )
                 continue
 
             try:
-                print(
-                    f"[EventTimeoutCheck] Event '{event_type}' timed out for workflow {instance_id}"
+                logger.debug(
+                    "Message on channel '%s' timed out for workflow %s",
+                    channel,
+                    instance_id,
                 )
 
-                # Get workflow instance
-                instance = await self.storage.get_instance(instance_id)
-                if not instance:
-                    print(f"[EventTimeoutCheck] Workflow {instance_id} not found")
-                    continue
+                # Note: find_expired_message_subscriptions() JOINs with workflow_instances,
+                # so we know the instance exists. No need for separate get_instance() call.
 
-                # Get activity_id from the subscription (stored when wait_event was called)
+                # Get activity_id from the subscription (stored when wait_message was called)
                 activity_id = subscription.get("activity_id")
                 if not activity_id:
-                    print(
-                        f"[EventTimeoutCheck] Warning: No activity_id in subscription for {instance_id}, skipping"
+                    logger.warning(
+                        "No activity_id in subscription for %s, skipping",
+                        instance_id,
                     )
                     continue
 
-                # 1. Record event timeout to history
+                # 1. Record message timeout to history
                 # This allows the workflow to see what happened during replay
+                # Convert datetime to ISO string for JSON serialization
+                from datetime import datetime as dt_type
+
+                timeout_at_str = (
+                    timeout_at.isoformat() if isinstance(timeout_at, dt_type) else str(timeout_at)
+                )
                 try:
                     await self.storage.append_history(
                         instance_id,
                         activity_id=activity_id,
-                        event_type="EventTimeout",
+                        event_type="MessageTimeout",
                         event_data={
-                            "event_type": event_type,
-                            "timeout_at": timeout_at,
-                            "error_message": f"Event '{event_type}' did not arrive within timeout",
+                            "_error": True,
+                            "error_type": "TimeoutError",
+                            "error_message": f"Message on channel '{channel}' did not arrive within timeout",
+                            "channel": channel,
+                            "timeout_at": timeout_at_str,
                         },
                     )
                 except Exception as history_error:
                     # If history entry already exists, this timeout was already processed
-                    print(
-                        f"[EventTimeoutCheck] History already exists for activity_id {activity_id}: {history_error}"
+                    logger.debug(
+                        "History already exists for activity_id %s: %s",
+                        activity_id,
+                        history_error,
                     )
-                    print(
-                        f"[EventTimeoutCheck] Timeout for '{event_type}' was already processed, skipping"
+                    logger.debug(
+                        "Timeout for channel '%s' was already processed, skipping",
+                        channel,
                     )
                     continue
 
-                # 2. Remove event subscription
-                await self.storage.remove_event_subscription(instance_id, event_type)
+                # 2. Remove message subscription
+                await self.storage.remove_message_subscription(instance_id, channel)
 
-                # 3. Fail the workflow with EventTimeoutError
-                # Create error details similar to workflow failure
+                # 3. Fail the workflow with TimeoutError
                 import traceback
 
                 # Get timeout_seconds from timeout_at and created_at
-                from datetime import datetime
-
-                from edda.events import EventTimeoutError
-
+                # Handle both datetime objects and ISO strings
                 try:
-                    timeout_dt = datetime.fromisoformat(timeout_at)
-                    created_dt = datetime.fromisoformat(created_at)
+                    timeout_dt = (
+                        timeout_at
+                        if isinstance(timeout_at, dt_type)
+                        else dt_type.fromisoformat(str(timeout_at))
+                    )
+                    created_dt = (
+                        created_at
+                        if isinstance(created_at, dt_type)
+                        else dt_type.fromisoformat(str(created_at))
+                    )
                     # Calculate the original timeout duration (timeout_at - created_at)
                     timeout_seconds = int((timeout_dt - created_dt).total_seconds())
                 except Exception:
                     timeout_seconds = 0  # Fallback
 
-                error = EventTimeoutError(event_type, timeout_seconds)
+                error = TimeoutError(
+                    f"Message on channel '{channel}' did not arrive within {timeout_seconds} seconds"
+                )
                 stack_trace = "".join(
                     traceback.format_exception(type(error), error, error.__traceback__)
                 )
@@ -767,28 +808,26 @@ class EddaApp:
                     "failed",
                     {
                         "error_message": str(error),
-                        "error_type": "EventTimeoutError",
+                        "error_type": "TimeoutError",
                         "stack_trace": stack_trace,
                     },
                 )
 
-                print(
-                    f"[EventTimeoutCheck] ✅ Marked workflow {instance_id} as failed due to event timeout"
+                logger.debug(
+                    "Marked workflow %s as failed due to message timeout",
+                    instance_id,
                 )
 
             except Exception as e:
-                print(f"[EventTimeoutCheck] ❌ Error processing timeout for {instance_id}: {e}")
-                import traceback
-
-                traceback.print_exc()
+                logger.error("Error processing timeout for %s: %s", instance_id, e, exc_info=True)
 
             finally:
                 # Always release the lock
                 await self.storage.release_lock(instance_id, self.worker_id)
 
-    async def _check_expired_event_timeouts_periodically(self, interval: int = 10) -> None:
+    async def _check_expired_message_subscriptions_periodically(self, interval: int = 10) -> None:
         """
-        Background task to periodically check for expired event timeouts.
+        Background task to periodically check for expired message subscriptions.
 
         Args:
             interval: Check interval in seconds (default: 10)
@@ -799,12 +838,133 @@ class EddaApp:
         while True:
             try:
                 await asyncio.sleep(interval)
-                await self._check_expired_event_timeouts()
+                await self._check_expired_message_subscriptions()
             except Exception as e:
-                print(f"[EventTimeoutCheck] Error in periodic timeout check: {e}")
-                import traceback
+                logger.error("Error in periodic timeout check: %s", e, exc_info=True)
 
-                traceback.print_exc()
+    async def _resume_running_workflows_periodically(self, interval: int = 1) -> None:
+        """
+        Background task to resume workflows that are ready to run.
+
+        This provides fast resumption after message delivery. When deliver_message()
+        sets a workflow's status to 'running' and releases the lock, this task
+        will pick it up within 1 second and resume it.
+
+        Uses adaptive backoff to reduce DB load when no workflows are ready:
+        - When workflows are processed, uses base interval
+        - When no workflows found, exponentially backs off up to 60 seconds
+        - Always adds jitter to prevent thundering herd in multi-pod deployments
+
+        Args:
+            interval: Check interval in seconds (default: 1)
+        """
+        consecutive_empty = 0  # Track empty results for adaptive backoff
+        while True:
+            try:
+                # Adaptive backoff: longer sleep when no work available
+                jitter = random.uniform(0, interval * 0.3)
+                if consecutive_empty > 0:
+                    # Exponential backoff: 2s, 4s, 8s, 16s, 32s, max 60s
+                    backoff = min(interval * (2 ** min(consecutive_empty, 5)), 60)
+                else:
+                    backoff = interval
+                await asyncio.sleep(backoff + jitter)
+
+                count = await self._resume_running_workflows()
+                if count == 0:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
+            except Exception as e:
+                consecutive_empty = 0  # Reset on error
+                logger.error("Error in periodic resume check: %s", e, exc_info=True)
+
+    async def _resume_running_workflows(self) -> int:
+        """
+        Find and resume workflows that are ready to run.
+
+        Finds workflows with status='running' that don't have a lock,
+        acquires a lock, and resumes them.
+
+        Returns:
+            Number of workflows successfully processed (lock acquired and resumed).
+        """
+        resumable = await self.storage.find_resumable_workflows()
+        processed_count = 0
+
+        for workflow_info in resumable:
+            instance_id = workflow_info["instance_id"]
+            workflow_name = workflow_info["workflow_name"]
+
+            try:
+                # Try to acquire lock (Lock-First pattern)
+                lock_acquired = await self.storage.try_acquire_lock(instance_id, self.worker_id)
+                if not lock_acquired:
+                    # Another worker got it first, skip
+                    continue
+
+                try:
+                    # Resume the workflow
+                    if self.replay_engine is None:
+                        logger.error("ReplayEngine not initialized, skipping %s", instance_id)
+                        continue
+                    await self.replay_engine.resume_by_name(
+                        instance_id, workflow_name, already_locked=True
+                    )
+                    processed_count += 1
+                finally:
+                    # Always release lock
+                    await self.storage.release_lock(instance_id, self.worker_id)
+
+            except Exception as e:
+                logger.error("Error resuming %s: %s", instance_id, e, exc_info=True)
+
+        return processed_count
+
+    async def _cleanup_old_messages_periodically(
+        self, interval: int = 3600, retention_days: int = 7
+    ) -> None:
+        """
+        Background task to periodically cleanup old channel messages.
+
+        Messages older than `retention_days` are deleted to prevent the database
+        from growing indefinitely with orphaned messages (messages that were
+        published but never received by any subscriber).
+
+        Uses system-level locking to ensure only one pod executes cleanup at a time.
+
+        Args:
+            interval: Cleanup interval in seconds (default: 3600 = 1 hour)
+            retention_days: Number of days to retain messages (default: 7)
+
+        Note:
+            This runs indefinitely until the application is shut down.
+        """
+        while True:
+            try:
+                # Add jitter to prevent thundering herd in multi-pod deployments
+                jitter = random.uniform(0, interval * 0.3)
+                await asyncio.sleep(interval + jitter)
+
+                # Try to acquire global lock for this task
+                lock_acquired = await self.storage.try_acquire_system_lock(
+                    lock_name="cleanup_old_messages",
+                    worker_id=self.worker_id,
+                    timeout_seconds=interval,
+                )
+
+                if not lock_acquired:
+                    # Another pod is handling this task
+                    continue
+
+                try:
+                    deleted_count = await self.storage.cleanup_old_channel_messages(retention_days)
+                    if deleted_count > 0:
+                        logger.info("Cleaned up %d old channel messages", deleted_count)
+                finally:
+                    await self.storage.release_system_lock("cleanup_old_messages", self.worker_id)
+            except Exception as e:
+                logger.error("Error cleaning up old messages: %s", e, exc_info=True)
 
     # -------------------------------------------------------------------------
     # ASGI Interface
@@ -987,10 +1147,7 @@ class EddaApp:
 
             except Exception as e:
                 # Internal error - log detailed traceback
-                print(f"[Cancel] Error cancelling workflow {instance_id}: {e}")
-                import traceback
-
-                traceback.print_exc()
+                logger.error("Error cancelling workflow %s: %s", instance_id, e, exc_info=True)
 
                 status = 500
                 response_body = {"error": str(e), "type": type(e).__name__}

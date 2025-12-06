@@ -6,13 +6,17 @@ distributed locks in multi-pod deployments.
 """
 
 import asyncio
+import logging
 import os
+import random
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from edda.storage.protocol import StorageProtocol
+
+logger = logging.getLogger(__name__)
 
 
 def generate_worker_id(service_name: str) -> str:
@@ -188,6 +192,7 @@ async def _refresh_lock_periodically(
 
 async def cleanup_stale_locks_periodically(
     storage: StorageProtocol,
+    worker_id: str,
     interval: int = 60,
 ) -> None:
     """
@@ -199,30 +204,49 @@ async def cleanup_stale_locks_periodically(
     Note: This function only cleans up locks without resuming workflows.
     For automatic workflow resumption, use auto_resume_stale_workflows_periodically().
 
+    Uses system-level locking to ensure only one pod executes cleanup at a time.
+
     Example:
         >>> asyncio.create_task(
-        ...     cleanup_stale_locks_periodically(storage, interval=60)
+        ...     cleanup_stale_locks_periodically(storage, worker_id, interval=60)
         ... )
 
     Args:
         storage: Storage backend
+        worker_id: Unique identifier for this worker (for global lock coordination)
         interval: Cleanup interval in seconds (default: 60)
     """
     with suppress(asyncio.CancelledError):
         while True:
-            await asyncio.sleep(interval)
+            # Add jitter to prevent thundering herd in multi-pod deployments
+            jitter = random.uniform(0, interval * 0.3)
+            await asyncio.sleep(interval + jitter)
 
-            # Clean up stale locks
-            workflows = await storage.cleanup_stale_locks()
+            # Try to acquire global lock for this task
+            lock_acquired = await storage.try_acquire_system_lock(
+                lock_name="cleanup_stale_locks",
+                worker_id=worker_id,
+                timeout_seconds=interval,
+            )
 
-            if len(workflows) > 0:
-                # Log cleanup (in a real implementation, use proper logging)
-                print(f"Cleaned up {len(workflows)} stale locks")
+            if not lock_acquired:
+                # Another pod is handling this task
+                continue
+
+            try:
+                # Clean up stale locks
+                workflows = await storage.cleanup_stale_locks()
+
+                if len(workflows) > 0:
+                    logger.info("Cleaned up %d stale locks", len(workflows))
+            finally:
+                await storage.release_system_lock("cleanup_stale_locks", worker_id)
 
 
 async def auto_resume_stale_workflows_periodically(
     storage: StorageProtocol,
     replay_engine: Any,
+    worker_id: str,
     interval: int = 60,
 ) -> None:
     """
@@ -231,83 +255,122 @@ async def auto_resume_stale_workflows_periodically(
     This combines lock cleanup with automatic workflow resumption, ensuring
     that workflows interrupted by worker crashes are automatically recovered.
 
+    Uses system-level locking to ensure only one pod executes this task at a time,
+    preventing duplicate workflow execution (CRITICAL for safety).
+
     Example:
         >>> asyncio.create_task(
         ...     auto_resume_stale_workflows_periodically(
-        ...         storage, replay_engine, interval=60
+        ...         storage, replay_engine, worker_id, interval=60
         ...     )
         ... )
 
     Args:
         storage: Storage backend
         replay_engine: ReplayEngine instance for resuming workflows
+        worker_id: Unique identifier for this worker (for global lock coordination)
         interval: Cleanup interval in seconds (default: 60)
     """
     with suppress(asyncio.CancelledError):
         while True:
-            await asyncio.sleep(interval)
+            # Add jitter to prevent thundering herd in multi-pod deployments
+            jitter = random.uniform(0, interval * 0.3)
+            await asyncio.sleep(interval + jitter)
 
-            # Clean up stale locks and get workflows to resume
-            workflows_to_resume = await storage.cleanup_stale_locks()
+            # Try to acquire global lock for this task
+            lock_acquired = await storage.try_acquire_system_lock(
+                lock_name="auto_resume_stale_workflows",
+                worker_id=worker_id,
+                timeout_seconds=interval,
+            )
 
-            if len(workflows_to_resume) > 0:
-                # Log cleanup (in a real implementation, use proper logging)
-                print(f"Cleaned up {len(workflows_to_resume)} stale locks")
+            if not lock_acquired:
+                # Another pod is handling this task
+                continue
 
-                # Auto-resume workflows
-                for workflow in workflows_to_resume:
-                    instance_id = workflow["instance_id"]
-                    workflow_name = workflow["workflow_name"]
-                    source_hash = workflow["source_hash"]
-                    status = workflow.get("status", "running")
+            try:
+                # Clean up stale locks and get workflows to resume
+                workflows_to_resume = await storage.cleanup_stale_locks()
 
-                    try:
-                        # Special handling for workflows in compensating state
-                        if status == "compensating":
-                            # Workflow crashed during compensation execution
-                            # Only re-execute compensations, don't run workflow function
-                            print(
-                                f"Auto-resuming compensating workflow: {instance_id} "
-                                f"(compensation recovery only, no workflow execution)"
+                if len(workflows_to_resume) > 0:
+                    logger.info("Cleaned up %d stale locks", len(workflows_to_resume))
+
+                    # Auto-resume workflows
+                    for workflow in workflows_to_resume:
+                        instance_id = workflow["instance_id"]
+                        workflow_name = workflow["workflow_name"]
+                        source_hash = workflow["source_hash"]
+                        status = workflow.get("status", "running")
+
+                        try:
+                            # Special handling for workflows in compensating state
+                            if status == "compensating":
+                                # Workflow crashed during compensation execution
+                                # Only re-execute compensations, don't run workflow function
+                                logger.info(
+                                    "Auto-resuming compensating workflow: %s "
+                                    "(compensation recovery only, no workflow execution)",
+                                    instance_id,
+                                )
+                                success = await replay_engine.resume_compensating_workflow(
+                                    instance_id
+                                )
+                                if success:
+                                    logger.info(
+                                        "Successfully completed compensations for: %s",
+                                        instance_id,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Failed to complete compensations for: %s", instance_id
+                                    )
+                                continue
+
+                            # Normal workflow resumption (status='running')
+                            # Check if workflow definition matches current Saga registry
+                            # This prevents resuming workflows with outdated/incompatible code
+                            current_definition = await storage.get_current_workflow_definition(
+                                workflow_name
                             )
-                            success = await replay_engine.resume_compensating_workflow(instance_id)
-                            if success:
-                                print(f"Successfully completed compensations for: {instance_id}")
-                            else:
-                                print(f"Failed to complete compensations for: {instance_id}")
-                            continue
 
-                        # Normal workflow resumption (status='running')
-                        # Check if workflow definition matches current Saga registry
-                        # This prevents resuming workflows with outdated/incompatible code
-                        current_definition = await storage.get_current_workflow_definition(
-                            workflow_name
-                        )
+                            if current_definition is None:
+                                logger.warning(
+                                    "Skipping auto-resume for %s: "
+                                    "workflow '%s' not found in registry",
+                                    instance_id,
+                                    workflow_name,
+                                )
+                                continue
 
-                        if current_definition is None:
-                            print(
-                                f"Skipping auto-resume for {instance_id}: "
-                                f"workflow '{workflow_name}' not found in registry"
+                            if current_definition["source_hash"] != source_hash:
+                                logger.warning(
+                                    "Skipping auto-resume for %s: "
+                                    "workflow definition has changed "
+                                    "(old hash: %s..., new hash: %s...)",
+                                    instance_id,
+                                    source_hash[:8],
+                                    current_definition["source_hash"][:8],
+                                )
+                                continue
+
+                            # Hash matches - safe to resume
+                            logger.info(
+                                "Auto-resuming workflow: %s (instance: %s)",
+                                workflow_name,
+                                instance_id,
                             )
-                            continue
-
-                        if current_definition["source_hash"] != source_hash:
-                            print(
-                                f"Skipping auto-resume for {instance_id}: "
-                                f"workflow definition has changed "
-                                f"(old hash: {source_hash[:8]}..., "
-                                f"new hash: {current_definition['source_hash'][:8]}...)"
+                            await replay_engine.resume_by_name(instance_id, workflow_name)
+                            logger.info("Successfully resumed workflow: %s", instance_id)
+                        except Exception as e:
+                            # Log error but continue with other workflows
+                            logger.error(
+                                "Failed to auto-resume workflow %s: %s",
+                                instance_id,
+                                e,
+                                exc_info=True,
                             )
-                            continue
-
-                        # Hash matches - safe to resume
-                        print(f"Auto-resuming workflow: {workflow_name} (instance: {instance_id})")
-                        await replay_engine.resume_by_name(instance_id, workflow_name)
-                        print(f"Successfully resumed workflow: {instance_id}")
-                    except Exception as e:
-                        # Log error but continue with other workflows
-                        # In a real implementation, use proper logging
-                        print(f"Failed to auto-resume workflow {instance_id}: {e}")
+            finally:
+                await storage.release_system_lock("auto_resume_stale_workflows", worker_id)
 
 
 class LockNotAcquiredError(Exception):

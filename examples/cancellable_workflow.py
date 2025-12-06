@@ -27,7 +27,6 @@ from edda.compensation import register_compensation
 from edda.context import WorkflowContext
 from edda.workflow import workflow
 
-
 # Simulated external service calls
 external_reservations: dict[str, dict[str, str]] = {}
 
@@ -54,7 +53,7 @@ async def reserve_hotel(ctx: WorkflowContext, booking_id: str) -> dict[str, str]
 
 
 @activity
-async def cancel_hotel_reservation(ctx: WorkflowContext, reservation_id: str) -> None:
+async def cancel_hotel_reservation(_ctx: WorkflowContext, reservation_id: str) -> None:
     """Compensation: Cancel hotel reservation."""
     print(f"[Hotel Compensation] Cancelling hotel reservation: {reservation_id}")
 
@@ -91,7 +90,7 @@ async def reserve_flight(ctx: WorkflowContext, booking_id: str) -> dict[str, str
 
 
 @activity
-async def cancel_flight_reservation(ctx: WorkflowContext, reservation_id: str) -> None:
+async def cancel_flight_reservation(_ctx: WorkflowContext, reservation_id: str) -> None:
     """Compensation: Cancel flight reservation."""
     print(f"[Flight Compensation] Cancelling flight reservation: {reservation_id}")
 
@@ -103,7 +102,7 @@ async def cancel_flight_reservation(ctx: WorkflowContext, reservation_id: str) -
 
 
 @activity
-async def charge_payment(ctx: WorkflowContext, booking_id: str, amount: float) -> dict[str, str]:
+async def charge_payment(_ctx: WorkflowContext, booking_id: str, amount: float) -> dict[str, str]:
     """
     Charge customer payment.
 

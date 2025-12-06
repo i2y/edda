@@ -211,6 +211,7 @@ class TestStaleWorkflowRecovery:
         cleanup_task = asyncio.create_task(
             cleanup_stale_locks_periodically(
                 storage=sqlite_storage,
+                worker_id="test-worker",
                 interval=0.1,  # Fast interval for testing
             )
         )
@@ -271,6 +272,7 @@ class TestStaleWorkflowRecovery:
             auto_resume_stale_workflows_periodically(
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
+                worker_id="test-worker",
                 interval=0.1,
             )
         )
@@ -344,6 +346,7 @@ class TestStaleWorkflowRecovery:
             auto_resume_stale_workflows_periodically(
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
+                worker_id="test-worker",
                 interval=0.1,
             )
         )

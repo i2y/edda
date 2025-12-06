@@ -33,7 +33,6 @@ from edda.integrations.opentelemetry import (
     inject_trace_context,
 )
 
-
 # =============================================================================
 # Sample Activities and Workflow
 # =============================================================================
@@ -41,7 +40,7 @@ from edda.integrations.opentelemetry import (
 
 @activity
 async def reserve_inventory(
-    ctx: WorkflowContext, order_id: str, items: list[str]
+    _ctx: WorkflowContext, order_id: str, items: list[str]
 ) -> dict[str, Any]:
     """Reserve inventory for an order."""
     print(f"[Activity] Reserving inventory for order {order_id}: {items}")
@@ -51,7 +50,7 @@ async def reserve_inventory(
 
 @activity
 async def process_payment(
-    ctx: WorkflowContext, order_id: str, amount: float
+    _ctx: WorkflowContext, order_id: str, amount: float
 ) -> dict[str, Any]:
     """Process payment for an order."""
     print(f"[Activity] Processing payment for order {order_id}: ${amount}")
@@ -61,7 +60,7 @@ async def process_payment(
 
 @activity
 async def ship_order(
-    ctx: WorkflowContext, order_id: str, address: str
+    _ctx: WorkflowContext, order_id: str, address: str
 ) -> dict[str, Any]:
     """Ship the order."""
     print(f"[Activity] Shipping order {order_id} to {address}")

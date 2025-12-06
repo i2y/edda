@@ -14,6 +14,49 @@ from edda.pydantic_utils import to_json_dict
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+
+class RecurException(Exception):
+    """
+    Exception raised to signal that a workflow should recur (restart with fresh history).
+
+    This is similar to Erlang's tail recursion pattern - it prevents unbounded history
+    growth in long-running loops by completing the current workflow instance and
+    starting a new one with the provided arguments.
+
+    The workflow's history is archived (not deleted) and a new instance is created
+    with a reference to the previous instance (continued_from).
+
+    Note:
+        This exception should not be caught by user code. It is handled internally
+        by the ReplayEngine.
+
+    Example:
+        >>> @workflow
+        ... async def notification_service(ctx: WorkflowContext, processed_count: int = 0):
+        ...     await join_group(ctx, group="order_watchers")
+        ...
+        ...     count = 0
+        ...     while True:
+        ...         msg = await wait_message(ctx, channel="order.completed")
+        ...         await send_notification(ctx, msg.data, activity_id=f"notify:{msg.id}")
+        ...
+        ...         count += 1
+        ...         if count >= 1000:
+        ...             # Reset history by recurring with new state
+        ...             await ctx.recur(processed_count=processed_count + count)
+    """
+
+    def __init__(self, kwargs: dict[str, Any]):
+        """
+        Initialize RecurException.
+
+        Args:
+            kwargs: Keyword arguments to pass to the new workflow instance
+        """
+        self.kwargs = kwargs
+        super().__init__("Workflow recur requested")
+
+
 # Global registry of workflow instances (will be set by EddaApp)
 _replay_engine: Any = None
 

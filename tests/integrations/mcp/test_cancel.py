@@ -8,8 +8,8 @@ import pytest
 pytest.importorskip("mcp")
 
 from edda import WorkflowContext, activity
+from edda.channels import wait_event
 from edda.compensation import register_compensation
-from edda.events import wait_event
 from edda.integrations.mcp import EddaMCPServer
 
 
@@ -80,7 +80,7 @@ async def test_cancel_waiting_workflow(mcp_server_with_cancellable_tool):
 
     # Verify workflow is waiting
     instance = await server.storage.get_instance(instance_id)
-    assert instance["status"] == "waiting_for_event"
+    assert instance["status"] == "waiting_for_message"
 
     # Cancel the workflow
     success = await server.replay_engine.cancel_workflow(instance_id, "mcp_user")

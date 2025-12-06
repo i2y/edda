@@ -179,5 +179,5 @@ hooks = OpenTelemetryHooks(service_name="my-service")
 ## Related Documentation
 
 - [Lifecycle Hooks](../core-features/hooks.md) - Detailed hooks documentation
-- [Example](../../examples/observability_with_opentelemetry.py) - Complete working example
+- [Example](https://github.com/i2y/edda/blob/main/examples/observability_with_opentelemetry.py) - Complete working example
 - [OpenTelemetry Documentation](https://opentelemetry.io/docs/)

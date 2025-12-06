@@ -31,7 +31,7 @@ server = EddaMCPServer(
 
 
 @activity
-async def validate_order(ctx: WorkflowContext, order_id: str, items: list[dict]) -> dict:
+async def validate_order(_ctx: WorkflowContext, order_id: str, items: list[dict]) -> dict:
     """Validate order items and availability."""
     await asyncio.sleep(1.0)  # Simulate validation
 
@@ -47,7 +47,7 @@ async def validate_order(ctx: WorkflowContext, order_id: str, items: list[dict])
 
 
 @activity
-async def reserve_inventory(ctx: WorkflowContext, items: list[dict]) -> dict:
+async def reserve_inventory(_ctx: WorkflowContext, items: list[dict]) -> dict:
     """Reserve inventory for order items."""
     await asyncio.sleep(1.5)  # Simulate inventory reservation
 
@@ -61,7 +61,7 @@ async def reserve_inventory(ctx: WorkflowContext, items: list[dict]) -> dict:
 
 
 @activity
-async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) -> dict:
+async def process_payment(_ctx: WorkflowContext, order_id: str, amount: float) -> dict:
     """Process payment for the order."""
     await asyncio.sleep(2.0)  # Simulate payment processing
 
@@ -77,7 +77,7 @@ async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) ->
 
 
 @activity
-async def create_shipment(ctx: WorkflowContext, order_id: str, address: dict) -> dict:
+async def create_shipment(_ctx: WorkflowContext, order_id: str, address: dict) -> dict:
     """Create shipment for the order."""
     await asyncio.sleep(1.0)  # Simulate shipment creation
 
@@ -135,7 +135,7 @@ async def process_order(
     validation = await validate_order(ctx, order_id, items)  # Auto: "validate_order:1"
 
     # Step 2: Reserve inventory
-    reservation = await reserve_inventory(ctx, items)  # Auto: "reserve_inventory:1"
+    _ = await reserve_inventory(ctx, items)  # Auto: "reserve_inventory:1"
 
     # Step 3: Process payment
     payment = await process_payment(

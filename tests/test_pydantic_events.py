@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 
 from edda import workflow
 from edda.activity import activity
+from edda.channels import wait_event
 from edda.context import WorkflowContext
-from edda.events import wait_event
 from edda.outbox.transactional import send_event_transactional
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
@@ -60,28 +60,33 @@ class TestWaitEventPydanticReplay:
     async def test_wait_event_converts_to_pydantic_model_during_replay(
         self, sqlite_storage, workflow_instance
     ):
-        """Test that wait_event converts cached dict to Pydantic model during replay."""
-        # Add event data to history (using new format with payload/metadata)
+        """Test that wait_event converts cached dict to Pydantic model during replay.
+
+        Note: CloudEvents (wait_event) internally uses Message Passing (wait_message),
+        so the history format uses ChannelMessageReceived with CloudEvents metadata.
+        """
+        # Add message data to history (using ChannelMessageReceived format with CloudEvents metadata)
         event_data = {
-            "payload": {
+            "data": {
                 "order_id": "ORD-123",
                 "amount": 99.99,
                 "transaction_id": "TXN-456",
                 "timestamp": "2025-01-01T12:00:00",
             },
+            "channel": "payment.completed",
+            "id": "msg-001",
             "metadata": {
-                "type": "payment.completed",
-                "source": "payment-service",
-                "id": "evt-001",
-                "time": "2025-01-01T12:00:00Z",
+                "ce_type": "payment.completed",
+                "ce_source": "payment-service",
+                "ce_id": "evt-001",
+                "ce_time": "2025-01-01T12:00:00Z",
             },
-            "extensions": {},
         }
 
         await sqlite_storage.append_history(
             workflow_instance,
-            activity_id="wait_event_payment.completed:1",
-            event_type="EventReceived",
+            activity_id="receive_payment.completed:1",
+            event_type="ChannelMessageReceived",
             event_data=event_data,
         )
 
@@ -117,21 +122,22 @@ class TestWaitEventPydanticReplay:
         self, sqlite_storage, workflow_instance
     ):
         """Test that wait_event returns dict when no model parameter during replay."""
-        # Add event data to history (using new format)
+        # Add message data to history (using ChannelMessageReceived format)
         event_data = {
-            "payload": {"order_id": "ORD-456", "status": "completed"},
+            "data": {"order_id": "ORD-456", "status": "completed"},
+            "channel": "order.created",
+            "id": "msg-002",
             "metadata": {
-                "type": "order.created",
-                "source": "order-service",
-                "id": "evt-002",
+                "ce_type": "order.created",
+                "ce_source": "order-service",
+                "ce_id": "evt-002",
             },
-            "extensions": {},
         }
 
         await sqlite_storage.append_history(
             workflow_instance,
-            activity_id="wait_event_order.created:1",
-            event_type="EventReceived",
+            activity_id="receive_order.created:1",
+            event_type="ChannelMessageReceived",
             event_data=event_data,
         )
 
@@ -175,26 +181,27 @@ class TestWaitEventWithNestedPydanticModel:
 
     async def test_wait_event_with_datetime_fields(self, sqlite_storage, workflow_instance):
         """Test that wait_event correctly converts datetime fields in Pydantic models."""
-        # Add event data with ISO 8601 timestamp (using new format)
+        # Add message data with ISO 8601 timestamp (using ChannelMessageReceived format)
         event_data = {
-            "payload": {
+            "data": {
                 "order_id": "ORD-789",
                 "amount": 249.99,
                 "transaction_id": "TXN-789",
                 "timestamp": "2025-01-15T10:30:00",
             },
+            "channel": "payment.completed",
+            "id": "msg-003",
             "metadata": {
-                "type": "payment.completed",
-                "source": "payment-service",
-                "id": "evt-003",
+                "ce_type": "payment.completed",
+                "ce_source": "payment-service",
+                "ce_id": "evt-003",
             },
-            "extensions": {},
         }
 
         await sqlite_storage.append_history(
             workflow_instance,
-            activity_id="wait_event_payment.completed:1",
-            event_type="EventReceived",
+            activity_id="receive_payment.completed:1",
+            event_type="ChannelMessageReceived",
             event_data=event_data,
         )
 

@@ -3,17 +3,20 @@ Tests for event handling module.
 
 Tests cover:
 - wait_event functionality
-- Event subscription registration
+- Event subscription registration (via channel subscriptions)
 - Event-based workflow resumption
 - Event filtering
+
+Note: CloudEvents (wait_event) internally uses Channel-based Message Queue (receive),
+so these tests verify the underlying channel subscription behavior.
 """
 
 import pytest
 import pytest_asyncio
 
 from edda import workflow
+from edda.channels import WaitForChannelMessageException, wait_event
 from edda.context import WorkflowContext
-from edda.events import WaitForEventException, wait_event
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
 
@@ -38,7 +41,11 @@ class TestWaitEvent:
     async def test_wait_event_raises_exception_during_normal_execution(
         self, sqlite_storage, workflow_instance, create_test_instance
     ):
-        """Test that wait_event raises WaitForEventException during normal execution."""
+        """Test that wait_event raises WaitForChannelMessageException during normal execution.
+
+        Note: wait_event() internally uses receive(), so it raises
+        WaitForChannelMessageException instead of WaitForEventException.
+        """
         ctx = WorkflowContext(
             instance_id=workflow_instance,
             workflow_name="test_workflow",
@@ -48,15 +55,15 @@ class TestWaitEvent:
         )
 
         # Should raise exception to pause workflow
-        with pytest.raises(WaitForEventException) as exc_info:
+        with pytest.raises(WaitForChannelMessageException) as exc_info:
             await wait_event(
                 ctx,
                 event_type="payment.completed",
                 timeout_seconds=300,
             )
 
-        # Verify exception details
-        assert exc_info.value.event_type == "payment.completed"
+        # Verify exception details (channel = event_type in channel layer)
+        assert exc_info.value.channel == "payment.completed"
         assert exc_info.value.timeout_seconds == 300
 
     async def test_wait_event_raises_exception_with_subscription_details(
@@ -64,8 +71,8 @@ class TestWaitEvent:
     ):
         """Test that wait_event raises exception with subscription details.
 
-        Note: Event subscription registration is handled atomically by the
-        ReplayEngine, not by wait_event directly.
+        Note: Channel subscription registration is handled atomically by the
+        ReplayEngine, not by wait_event/receive directly.
         """
         ctx = WorkflowContext(
             instance_id=workflow_instance,
@@ -76,7 +83,7 @@ class TestWaitEvent:
         )
 
         # Call wait_event (will raise exception with subscription details)
-        with pytest.raises(WaitForEventException) as exc_info:
+        with pytest.raises(WaitForChannelMessageException) as exc_info:
             await wait_event(
                 ctx,
                 event_type="order.created",
@@ -84,20 +91,24 @@ class TestWaitEvent:
             )
 
         # Verify exception contains subscription details
-        assert exc_info.value.event_type == "order.created"
+        assert exc_info.value.channel == "order.created"
         assert exc_info.value.timeout_seconds == 600
         assert (
-            exc_info.value.activity_id == "wait_event_order.created:1"
-        )  # First auto-generated activity_id
+            exc_info.value.activity_id == "receive_order.created:1"
+        )  # First auto-generated activity_id (via receive)
 
         # Subscription is NOT registered yet (handled by ReplayEngine atomically)
-        subscriptions = await sqlite_storage.find_waiting_instances("order.created")
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("order.created")
         assert len(subscriptions) == 0
 
     async def test_wait_event_generates_activity_id(
         self, sqlite_storage, workflow_instance, create_test_instance
     ):
-        """Test that wait_event generates activity_id and tracks it."""
+        """Test that wait_event generates activity_id and tracks it.
+
+        Note: wait_event() uses receive() internally, so the activity_id
+        is generated with receive_ prefix.
+        """
         ctx = WorkflowContext(
             instance_id=workflow_instance,
             workflow_name="test_workflow",
@@ -109,27 +120,38 @@ class TestWaitEvent:
         assert len(ctx.executed_activity_ids) == 0
 
         # Call wait_event
-        with pytest.raises(WaitForEventException):
+        with pytest.raises(WaitForChannelMessageException):
             await wait_event(ctx, event_type="test.event")
 
-        # Activity ID should be tracked
+        # Activity ID should be tracked (receive_ prefix)
         assert len(ctx.executed_activity_ids) == 1
-        assert "wait_event_test.event:1" in ctx.executed_activity_ids
+        assert "receive_test.event:1" in ctx.executed_activity_ids
 
     async def test_wait_event_returns_cached_data_during_replay(
         self, sqlite_storage, workflow_instance, create_test_instance
     ):
-        """Test that wait_event returns cached event data during replay."""
-        # Add event data to history
+        """Test that wait_event returns cached event data during replay.
+
+        Note: CloudEvents use ChannelMessageReceived event type in history,
+        with CloudEvents metadata stored in the message metadata field.
+        """
+        # Add message data to history (new format with ChannelMessageReceived)
         await sqlite_storage.append_history(
             workflow_instance,
-            activity_id="wait_event_test.event:1",
-            event_type="EventReceived",
+            activity_id="receive_test.event:1",
+            event_type="ChannelMessageReceived",
             event_data={
-                "event_data": {
+                "data": {
                     "order_id": "ORDER-123",
                     "status": "completed",
-                }
+                },
+                "channel": "test.event",
+                "id": "test-msg-1",
+                "metadata": {
+                    "ce_source": "test-service",
+                    "ce_id": "test-event-123",
+                    "ce_time": "2025-10-29T12:34:56Z",
+                },
             },
         )
 
@@ -153,9 +175,10 @@ class TestWaitEvent:
             "order_id": "ORDER-123",
             "status": "completed",
         }
-        # For backward compatibility, old format still works
-        assert received_event.type == "unknown"  # Old format has no metadata
-        assert received_event.source == "unknown"
+        # CloudEvents metadata is extracted from message metadata
+        assert received_event.type == "test.event"
+        assert received_event.source == "test-service"
+        assert received_event.id == "test-event-123"
 
 
 @pytest.mark.asyncio
@@ -176,7 +199,10 @@ class TestEventBasedWorkflowResumption:
     async def test_workflow_pauses_on_wait_event(
         self, replay_engine, sqlite_storage, create_test_instance
     ):
-        """Test that workflow pauses when wait_event is called."""
+        """Test that workflow pauses when wait_event is called.
+
+        Note: CloudEvents use channel subscriptions internally.
+        """
 
         @workflow
         async def event_waiting_workflow(ctx: WorkflowContext, order_id: str) -> dict:
@@ -191,19 +217,23 @@ class TestEventBasedWorkflowResumption:
         # Start workflow
         instance_id = await event_waiting_workflow.start(order_id="ORDER-123")
 
-        # Verify workflow is in waiting_for_event status
+        # Verify workflow is in waiting_for_message status (channels use this status)
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
 
-        # Verify event subscription was registered
-        subscriptions = await sqlite_storage.find_waiting_instances("payment.completed")
+        # Verify channel subscription was registered
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("payment.completed")
         assert len(subscriptions) == 1
         assert subscriptions[0]["instance_id"] == instance_id
 
     async def test_workflow_resumes_after_event_arrives(
         self, replay_engine, sqlite_storage, create_test_instance
     ):
-        """Test that workflow resumes and completes after event arrives."""
+        """Test that workflow resumes and completes after event arrives.
+
+        Note: CloudEvents use ChannelMessageReceived event type with CloudEvents
+        metadata stored in the message metadata field.
+        """
 
         @workflow
         async def event_waiting_workflow(ctx: WorkflowContext, order_id: str) -> dict:
@@ -225,26 +255,27 @@ class TestEventBasedWorkflowResumption:
 
         # Verify workflow is waiting
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
 
-        # Simulate event arrival by recording it in history (new format with metadata)
+        # Simulate event arrival by recording it in history (ChannelMessageReceived format)
         await sqlite_storage.append_history(
             instance_id,
-            activity_id="wait_event_payment.completed:1",
-            event_type="EventReceived",
+            activity_id="receive_payment.completed:1",
+            event_type="ChannelMessageReceived",
             event_data={
-                "payload": {
+                "data": {
                     "order_id": "ORDER-456",
                     "status": "success",
                     "amount": 99.99,
                 },
+                "channel": "payment.completed",
+                "id": "test-msg-123",
                 "metadata": {
-                    "type": "payment.completed",
-                    "source": "test-service",
-                    "id": "test-event-123",
-                    "time": "2025-10-29T12:34:56Z",
+                    "ce_type": "payment.completed",
+                    "ce_source": "test-service",
+                    "ce_id": "test-event-123",
+                    "ce_time": "2025-10-29T12:34:56Z",
                 },
-                "extensions": {},
             },
         )
 
@@ -262,13 +293,18 @@ class TestEventBasedWorkflowResumption:
 
 
 @pytest.mark.asyncio
-class TestEventRecording:
-    """Test suite for event data recording."""
+class TestMessageRecording:
+    """Test suite for message data recording.
+
+    Note: CloudEvents use Channel-based Message Queue internally. Event recording
+    is handled by the storage layer's deliver_channel_message() method, not by
+    WorkflowContext directly.
+    """
 
     @pytest_asyncio.fixture
     async def workflow_instance(self, sqlite_storage, create_test_instance):
         """Create a workflow instance for testing."""
-        instance_id = "test-event-recording-001"
+        instance_id = "test-message-recording-001"
         await create_test_instance(
             instance_id=instance_id,
             workflow_name="test_workflow",
@@ -277,30 +313,52 @@ class TestEventRecording:
         )
         return instance_id
 
-    async def test_record_event_received(
+    async def test_message_delivery_records_history(
         self, sqlite_storage, workflow_instance, create_test_instance
     ):
-        """Test recording received event data."""
-        ctx = WorkflowContext(
+        """Test that message delivery records history via storage layer.
+
+        Note: Message recording is now done by storage.deliver_channel_message(),
+        not by WorkflowContext._record_event_received().
+        """
+        # First, subscribe to the channel
+        await sqlite_storage.subscribe_to_channel(
             instance_id=workflow_instance,
-            workflow_name="test_workflow",
-            storage=sqlite_storage,
-            worker_id="worker-1",
-            is_replaying=False,
+            channel="test.channel",
+            mode="broadcast",
         )
 
-        event_data = {
+        # Acquire lock and set waiting state
+        await sqlite_storage.try_acquire_lock(workflow_instance, "worker-1", timeout_seconds=300)
+        await sqlite_storage.register_channel_receive_and_release_lock(
+            instance_id=workflow_instance,
+            worker_id="worker-1",
+            channel="test.channel",
+            activity_id="receive_test.channel:1",
+        )
+
+        # Deliver a message to the workflow
+        message_data = {
             "order_id": "ORDER-789",
             "payment_id": "PAY-123",
             "amount": 199.99,
         }
 
-        # Record event (using explicit activity_id)
-        await ctx._record_event_received(activity_id="wait_event_test:1", event_data=event_data)
+        result = await sqlite_storage.deliver_channel_message(
+            instance_id=workflow_instance,
+            channel="test.channel",
+            message_id="test-msg-001",
+            data=message_data,
+            metadata={"source": "test-service"},
+            worker_id="worker-1",
+        )
+
+        # Verify message was delivered
+        assert result is not None
 
         # Verify it was recorded in history
         history = await sqlite_storage.get_history(workflow_instance)
         assert len(history) == 1
-        assert history[0]["activity_id"] == "wait_event_test:1"
-        assert history[0]["event_type"] == "EventReceived"
-        assert history[0]["event_data"]["event_data"] == event_data
+        assert history[0]["activity_id"] == "receive_test.channel:1"
+        assert history[0]["event_type"] == "ChannelMessageReceived"
+        assert history[0]["event_data"]["data"] == message_data

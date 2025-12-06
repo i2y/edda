@@ -17,21 +17,18 @@ Run:
 """
 
 import asyncio
-import random
-from datetime import datetime, UTC
 
 from edda import (
     EddaApp,
-    workflow,
+    RetryExhaustedError,
+    RetryPolicy,
+    TerminalError,
+    WorkflowContext,
     activity,
     compensation,
     on_failure,
-    WorkflowContext,
-    RetryPolicy,
-    TerminalError,
-    RetryExhaustedError,
+    workflow,
 )
-
 
 # ============================================================================
 # Simulated External Services (with failure simulation)
@@ -55,7 +52,7 @@ ship_attempts = 0
 
 @compensation
 async def cancel_inventory_reservation(
-    ctx: WorkflowContext, order_id: str, sku: str, quantity: int
+    _ctx: WorkflowContext, order_id: str, sku: str, quantity: int
 ):
     """Compensation: Cancel inventory reservation."""
     print(f"🔙 [COMPENSATION] Cancelling reservation for order {order_id}")
@@ -72,7 +69,7 @@ async def cancel_inventory_reservation(
 @activity(retry_policy=RetryPolicy(max_attempts=3, initial_interval=0.5))
 @on_failure(cancel_inventory_reservation)
 async def reserve_inventory(
-    ctx: WorkflowContext, order_id: str, sku: str, quantity: int
+    _ctx: WorkflowContext, order_id: str, sku: str, quantity: int
 ) -> dict:
     """
     Reserve inventory for an order.
@@ -109,7 +106,7 @@ async def reserve_inventory(
 
 
 @compensation
-async def refund_payment(ctx: WorkflowContext, order_id: str, amount: float):
+async def refund_payment(_ctx: WorkflowContext, order_id: str, amount: float):
     """Compensation: Refund payment."""
     print(f"🔙 [COMPENSATION] Refunding payment for order {order_id}")
     print(f"   Amount: ${amount:.2f}")
@@ -123,7 +120,7 @@ async def refund_payment(ctx: WorkflowContext, order_id: str, amount: float):
 
 @activity(retry_policy=RetryPolicy(max_attempts=5, initial_interval=1.0))
 @on_failure(refund_payment)
-async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) -> dict:
+async def process_payment(_ctx: WorkflowContext, order_id: str, amount: float) -> dict:
     """
     Process payment for an order.
 
@@ -149,14 +146,14 @@ async def process_payment(ctx: WorkflowContext, order_id: str, amount: float) ->
         "status": "completed",
     }
 
-    print(f"   ✅ Payment processed successfully")
+    print("   ✅ Payment processed successfully")
     print(f"   Transaction ID: {transaction_id}")
 
     return {"order_id": order_id, "transaction_id": transaction_id, "amount": amount}
 
 
 @compensation
-async def cancel_shipment(ctx: WorkflowContext, order_id: str, tracking_number: str):
+async def cancel_shipment(_ctx: WorkflowContext, order_id: str, tracking_number: str):
     """Compensation: Cancel shipment."""
     print(f"🔙 [COMPENSATION] Cancelling shipment for order {order_id}")
     print(f"   Tracking: {tracking_number}")
@@ -170,7 +167,7 @@ async def cancel_shipment(ctx: WorkflowContext, order_id: str, tracking_number: 
 
 @activity(retry_policy=RetryPolicy(max_attempts=3, initial_interval=1.0))
 @on_failure(cancel_shipment)
-async def ship_order(ctx: WorkflowContext, order_id: str) -> dict:
+async def ship_order(_ctx: WorkflowContext, order_id: str) -> dict:
     """
     Ship an order.
 
@@ -190,7 +187,7 @@ async def ship_order(ctx: WorkflowContext, order_id: str) -> dict:
     # This code never executes (demo purposes)
     tracking_number = f"TRACK-{order_id}"
     shipment_records[order_id] = {"tracking_number": tracking_number, "status": "shipped"}
-    print(f"   ✅ Order shipped successfully")
+    print("   ✅ Order shipped successfully")
     print(f"   Tracking: {tracking_number}")
     return {"order_id": order_id, "tracking_number": tracking_number}
 
@@ -300,10 +297,10 @@ async def terminal_error_workflow(ctx: WorkflowContext, order_id: str) -> dict:
     try:
         # Step 1: Reserve inventory for non-existent SKU
         # This will raise TerminalError immediately (no retry)
-        inventory = await reserve_inventory(ctx, order_id, sku="INVALID-SKU", quantity=100)
+        _ = await reserve_inventory(ctx, order_id, sku="INVALID-SKU", quantity=100)
 
         # This code never executes
-        payment = await process_payment(ctx, order_id, amount=199.99)
+        _ = await process_payment(ctx, order_id, amount=199.99)
 
         return {"status": "completed", "order_id": order_id}
 
@@ -342,7 +339,7 @@ async def main():
         payment_attempts = 0
         ship_attempts = 0
 
-        instance_id_1 = await successful_order_workflow.start(order_id="ORDER-SUCCESS-001")
+        _ = await successful_order_workflow.start(order_id="ORDER-SUCCESS-001")
         await asyncio.sleep(2)  # Wait for workflow to complete
 
         # ====================================================================
@@ -353,7 +350,7 @@ async def main():
         ship_attempts = 0
 
         try:
-            instance_id_2 = await failed_order_workflow.start(order_id="ORDER-FAIL-001")
+            _ = await failed_order_workflow.start(order_id="ORDER-FAIL-001")
             await asyncio.sleep(5)  # Wait for retries and compensation
         except Exception as e:
             print(f"\n✅ Workflow failed as expected: {type(e).__name__}")
@@ -366,7 +363,7 @@ async def main():
         ship_attempts = 0
 
         try:
-            instance_id_3 = await terminal_error_workflow.start(order_id="ORDER-TERMINAL-001")
+            _ = await terminal_error_workflow.start(order_id="ORDER-TERMINAL-001")
             await asyncio.sleep(1)  # Wait for workflow to complete
         except Exception as e:
             print(f"\n✅ Workflow failed as expected: {type(e).__name__}")
@@ -375,22 +372,22 @@ async def main():
         print("✅ All examples completed!")
         print("=" * 70)
         print(
-            f"\n💡 Key Takeaways:"
-            f"\n   1. Activities retry automatically (default: 5 attempts)"
-            f"\n   2. Custom retry policies can be set per activity"
-            f"\n   3. Compensation runs in reverse order on failure"
-            f"\n   4. TerminalError skips retry (for permanent errors)"
-            f"\n   5. RetryExhaustedError triggers compensation"
-            f"\n   6. Retry metadata is recorded in workflow history"
+            "\n💡 Key Takeaways:"
+            "\n   1. Activities retry automatically (default: 5 attempts)"
+            "\n   2. Custom retry policies can be set per activity"
+            "\n   3. Compensation runs in reverse order on failure"
+            "\n   4. TerminalError skips retry (for permanent errors)"
+            "\n   5. RetryExhaustedError triggers compensation"
+            "\n   6. Retry metadata is recorded in workflow history"
         )
         print(
-            f"\n💡 View workflow history in Viewer UI:"
-            f"\n   python viewer_app.py"
-            f"\n   http://localhost:8080"
+            "\n💡 View workflow history in Viewer UI:"
+            "\n   python viewer_app.py"
+            "\n   http://localhost:8080"
         )
 
         # Show final state
-        print(f"\n📊 Final State:")
+        print("\n📊 Final State:")
         print(f"   Inventory: {inventory_service}")
         print(f"   Reserved Items: {reserved_items}")
         print(f"   Payment Records: {payment_records}")

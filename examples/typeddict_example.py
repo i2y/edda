@@ -24,7 +24,6 @@ from typing import TypedDict
 
 from edda import EddaApp, WorkflowContext, activity, workflow
 
-
 # ========== TypedDict Definitions ==========
 
 

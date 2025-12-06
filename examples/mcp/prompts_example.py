@@ -10,12 +10,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-from edda import WorkflowContext, activity, workflow
-from edda.integrations.mcp import EddaMCPServer
-
 # Import prompt types from MCP
 from mcp.server.fastmcp.prompts.base import UserMessage  # type: ignore[import-not-found]
 from mcp.types import TextContent  # type: ignore[import-not-found]
+
+from edda import WorkflowContext, activity, workflow
+from edda.integrations.mcp import EddaMCPServer
 
 # Create database directory in user's home directory
 db_dir = Path.home() / ".edda"
@@ -35,14 +35,14 @@ server = EddaMCPServer(
 
 
 @activity
-async def process_data(ctx: WorkflowContext, data: str) -> dict:
+async def process_data(_ctx: WorkflowContext, data: str) -> dict:
     """Process some data."""
     await asyncio.sleep(0.3)
     return {"processed": data.upper(), "length": len(data)}
 
 
 @activity
-async def validate_result(ctx: WorkflowContext, data: dict) -> dict:
+async def validate_result(_ctx: WorkflowContext, data: dict) -> dict:
     """Validate processing result."""
     await asyncio.sleep(0.2)
     is_valid = data.get("length", 0) > 0

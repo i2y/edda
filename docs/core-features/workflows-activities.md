@@ -161,6 +161,35 @@ async def mixed_workflow(ctx: WorkflowContext, user_id: str) -> dict:
 
 **Performance note:** Async activities are recommended for I/O-bound operations (database queries, HTTP requests, file I/O) for better performance. Sync activities are executed in a thread pool to avoid blocking the event loop.
 
+### WSGI Deployment
+
+For WSGI servers (gunicorn, uWSGI), use `create_wsgi_app()`:
+
+```python
+from edda import EddaApp
+from edda.wsgi import create_wsgi_app
+
+app = EddaApp(
+    service_name="order-service",
+    db_url="sqlite:///workflow.db",
+)
+
+# Create WSGI application
+wsgi_application = create_wsgi_app(app)
+```
+
+Run with gunicorn:
+
+```bash
+gunicorn demo_app:wsgi_application --workers 4
+```
+
+Run with uWSGI:
+
+```bash
+uwsgi --http :8000 --wsgi-file demo_app.py --callable wsgi_application
+```
+
 ## Retry Policies
 
 Activities automatically retry on failure with exponential backoff. This provides resilience against transient failures like network timeouts or temporary service unavailability.
@@ -479,8 +508,7 @@ actual_timeout = (
 
 ### Related Documentation
 
-- **[Crash Recovery](durable-execution/crash-recovery.md)**: Automatic workflow resumption after crashes
-- **[Replay Mechanism](durable-execution/replay.md)**: How workflows resume from stale locks
+- **[Replay Mechanism](durable-execution/replay.md)**: How workflows resume from crashes and stale locks
 
 ## Activity IDs and Deterministic Replay
 
@@ -719,6 +747,151 @@ async def main():
 
     print(f"Workflow started: {instance_id}")
 ```
+
+## Long-Running Loops with `recur()`
+
+For workflows with infinite loops or long-running iterations, Edda provides `ctx.recur()` to prevent unbounded history growth. This is similar to Erlang's tail recursion pattern.
+
+### The Problem
+
+In long-running loops, every activity adds an entry to the workflow history. After thousands of iterations, this causes:
+
+- **Memory issues**: Loading history for replay consumes increasing memory
+- **Performance degradation**: Replay time grows with O(N) history entries
+- **Storage growth**: Database size increases continuously
+
+```python
+# ❌ Problematic: History grows forever
+@workflow
+async def notification_service(ctx: WorkflowContext):
+    await join_group(ctx, group="order_watchers")
+
+    while True:
+        msg = await wait_message(ctx, channel="order.completed")
+        await send_notification(ctx, msg.data)
+        # After 10,000 iterations: 10,000+ history entries!
+```
+
+### The Solution: `ctx.recur()`
+
+Use `ctx.recur()` to restart the workflow with fresh history while preserving state:
+
+```python
+# ✅ Good: Reset history periodically
+@workflow
+async def notification_service(ctx: WorkflowContext, processed_count: int = 0):
+    await join_group(ctx, group="order_watchers")
+
+    count = 0
+    while True:
+        msg = await wait_message(ctx, channel="order.completed")
+        await send_notification(ctx, msg.data, activity_id=f"notify:{msg.id}")
+
+        count += 1
+        if count >= 1000:
+            # Reset history every 1000 iterations
+            await ctx.recur(processed_count=processed_count + count)
+            # Code after recur() is never executed
+```
+
+### How It Works
+
+When `ctx.recur()` is called:
+
+1. **Current workflow completes** with status `"recurred"`
+2. **History is archived** (moved to archive table, not deleted)
+3. **New workflow instance starts** with provided arguments
+4. **Chain is tracked** via `continued_from` field
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Instance 1 (processed_count=0)                                      │
+│ ├─ Activity 1...1000                                                │
+│ └─ Status: "recurred" → Archive history → Instance 2 starts         │
+├─────────────────────────────────────────────────────────────────────┤
+│ Instance 2 (processed_count=1000, continued_from=Instance 1)        │
+│ ├─ Activity 1...1000                                                │
+│ └─ Status: "recurred" → Archive history → Instance 3 starts         │
+├─────────────────────────────────────────────────────────────────────┤
+│ Instance 3 (processed_count=2000, continued_from=Instance 2)        │
+│ └─ ... continues ...                                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### API Reference
+
+```python
+async def recur(self, **kwargs: Any) -> None:
+    """
+    Restart the workflow with fresh history.
+
+    Args:
+        **kwargs: Arguments to pass to the new workflow instance.
+                 These become the input parameters for the next iteration.
+
+    Raises:
+        RecurException: Always raised to signal the ReplayEngine.
+                       This exception should not be caught by user code.
+    """
+```
+
+### Complete Example
+
+```python
+from edda import workflow, WorkflowContext, subscribe, receive
+from pydantic import BaseModel
+
+class ServiceState(BaseModel):
+    total_processed: int = 0
+    errors_count: int = 0
+
+@workflow
+async def event_processor(ctx: WorkflowContext, state: ServiceState):
+    """
+    Long-running event processor that resets history every 500 events.
+    """
+    await subscribe(ctx, "events", mode="broadcast")
+
+    local_count = 0
+    local_errors = 0
+
+    while True:
+        try:
+            msg = await receive(ctx, channel="events")
+            await process_event(ctx, msg.data, activity_id=f"process:{msg.id}")
+            local_count += 1
+        except Exception:
+            local_errors += 1
+
+        # Recur every 500 events to prevent unbounded history
+        if local_count + local_errors >= 500:
+            await ctx.recur(state=ServiceState(
+                total_processed=state.total_processed + local_count,
+                errors_count=state.errors_count + local_errors,
+            ))
+```
+
+### Important Notes
+
+1. **Channel subscriptions are NOT transferred** - You must re-subscribe to channels in the new workflow iteration
+2. **Compensations are cleared** - Registered compensations do not carry over
+3. **History is archived, not deleted** - Old history is preserved for auditing
+4. **Code after `recur()` is never executed** - Always place recur at the end of a branch
+
+### When to Use
+
+✅ **Good use cases:**
+
+- Event processors that run indefinitely
+- Message queue consumers
+- Polling workers
+- Long-running monitoring services
+
+❌ **Not needed for:**
+
+- Workflows that complete after a few activities
+- One-shot batch processes
+- Workflows with bounded iterations
 
 ## Best Practices
 

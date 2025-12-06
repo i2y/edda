@@ -194,7 +194,7 @@ Edda persists all activity results to the `workflow_history` table:
 - **ActivityCompleted**: Successful activity execution
 - **ActivityFailed**: Activity raised an exception (includes error type and message)
 - **EventReceived**: Event received via `wait_event()`
-- **TimerExpired**: Timer expired via `wait_timer()`
+- **TimerExpired**: Timer expired via `sleep()`
 
 ### How Cache Works
 

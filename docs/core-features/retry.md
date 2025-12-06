@@ -610,9 +610,9 @@ async def order_workflow(ctx: WorkflowContext, order_id: str):
 
 See complete examples in:
 
-- **[examples/retry_example.py](../../examples/retry_example.py)**: Comprehensive retry demonstrations
-- **[examples/retry_with_compensation.py](../../examples/retry_with_compensation.py)**: Retry combined with compensation
-- **[README.md](../../README.md)**: Quick start examples
+- **[examples/retry_example.py](https://github.com/i2y/edda/blob/main/examples/retry_example.py)**: Comprehensive retry demonstrations
+- **[examples/retry_with_compensation.py](https://github.com/i2y/edda/blob/main/examples/retry_with_compensation.py)**: Retry combined with compensation
+- **[README.md](https://github.com/i2y/edda/blob/main/README.md)**: Quick start examples
 
 ## Next Steps
 

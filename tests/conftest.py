@@ -83,10 +83,17 @@ async def db_storage(request):
 
             yield storage
 
-            # Cleanup
+            # Cleanup (order matters due to foreign key constraints)
             async with AsyncSession(storage.engine) as session:
+                await session.execute(text("DELETE FROM channel_message_claims"))
+                await session.execute(text("DELETE FROM channel_delivery_cursors"))
+                await session.execute(text("DELETE FROM channel_messages"))
+                await session.execute(text("DELETE FROM channel_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_message_subscriptions"))
                 await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-                await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_group_memberships"))
+                await session.execute(text("DELETE FROM workflow_compensations"))
+                await session.execute(text("DELETE FROM workflow_history_archive"))
                 await session.execute(text("DELETE FROM workflow_history"))
                 await session.execute(text("DELETE FROM outbox_events"))
                 await session.execute(text("DELETE FROM workflow_instances"))
@@ -124,10 +131,17 @@ async def db_storage(request):
 
             yield storage
 
-            # Cleanup
+            # Cleanup (order matters due to foreign key constraints)
             async with AsyncSession(storage.engine) as session:
+                await session.execute(text("DELETE FROM channel_message_claims"))
+                await session.execute(text("DELETE FROM channel_delivery_cursors"))
+                await session.execute(text("DELETE FROM channel_messages"))
+                await session.execute(text("DELETE FROM channel_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_message_subscriptions"))
                 await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-                await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+                await session.execute(text("DELETE FROM workflow_group_memberships"))
+                await session.execute(text("DELETE FROM workflow_compensations"))
+                await session.execute(text("DELETE FROM workflow_history_archive"))
                 await session.execute(text("DELETE FROM workflow_history"))
                 await session.execute(text("DELETE FROM outbox_events"))
                 await session.execute(text("DELETE FROM workflow_instances"))
@@ -190,11 +204,17 @@ async def postgresql_storage():
 
         yield storage
 
-        # Cleanup: Truncate all tables
+        # Cleanup: Truncate all tables (order matters due to foreign key constraints)
         async with AsyncSession(storage.engine) as session:
+            await session.execute(text("DELETE FROM channel_message_claims"))
+            await session.execute(text("DELETE FROM channel_delivery_cursors"))
+            await session.execute(text("DELETE FROM channel_messages"))
+            await session.execute(text("DELETE FROM channel_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_message_subscriptions"))
             await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-            await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_group_memberships"))
             await session.execute(text("DELETE FROM workflow_compensations"))
+            await session.execute(text("DELETE FROM workflow_history_archive"))
             await session.execute(text("DELETE FROM workflow_history"))
             await session.execute(text("DELETE FROM outbox_events"))
             await session.execute(text("DELETE FROM workflow_instances"))
@@ -240,11 +260,17 @@ async def mysql_storage():
 
         yield storage
 
-        # Cleanup: Truncate all tables
+        # Cleanup: Truncate all tables (order matters due to foreign key constraints)
         async with AsyncSession(storage.engine) as session:
+            await session.execute(text("DELETE FROM channel_message_claims"))
+            await session.execute(text("DELETE FROM channel_delivery_cursors"))
+            await session.execute(text("DELETE FROM channel_messages"))
+            await session.execute(text("DELETE FROM channel_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_message_subscriptions"))
             await session.execute(text("DELETE FROM workflow_timer_subscriptions"))
-            await session.execute(text("DELETE FROM workflow_event_subscriptions"))
+            await session.execute(text("DELETE FROM workflow_group_memberships"))
             await session.execute(text("DELETE FROM workflow_compensations"))
+            await session.execute(text("DELETE FROM workflow_history_archive"))
             await session.execute(text("DELETE FROM workflow_history"))
             await session.execute(text("DELETE FROM outbox_events"))
             await session.execute(text("DELETE FROM workflow_instances"))

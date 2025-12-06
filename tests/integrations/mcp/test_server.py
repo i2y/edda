@@ -145,7 +145,7 @@ async def test_status_tool_progress_metadata(mcp_server):
 @pytest.mark.asyncio
 async def test_status_tool_poll_interval_running():
     """Test status tool suggests shorter poll interval for running workflows."""
-    from edda.events import wait_event
+    from edda.channels import wait_event
 
     server = EddaMCPServer(
         name="Poll Test Service",
@@ -160,7 +160,7 @@ async def test_status_tool_poll_interval_running():
     @server.durable_tool(description="Waiting workflow")
     async def waiting_workflow(ctx: WorkflowContext):
         await process(ctx)
-        # Wait for an event (workflow will be in waiting_for_event status)
+        # Wait for an event (workflow will be in waiting_for_message status)
         await wait_event(ctx, "test_event")
         return {"done": True}
 
@@ -176,8 +176,8 @@ async def test_status_tool_poll_interval_running():
     # Check status
     instance = await server.storage.get_instance(instance_id)
 
-    # Should be waiting for event (not running)
-    assert instance["status"] == "waiting_for_event"
+    # Should be waiting for message (not running)
+    assert instance["status"] == "waiting_for_message"
 
     # Cleanup
     await server.shutdown()

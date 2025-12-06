@@ -7,7 +7,7 @@ CloudEvent arrives, implementing async communication patterns.
 
 import asyncio
 
-from edda import EddaApp, WorkflowContext, activity, workflow, wait_event
+from edda import EddaApp, WorkflowContext, activity, wait_event, workflow
 
 
 # Define activities

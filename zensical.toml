@@ -62,6 +62,8 @@ nav = [
     { "Saga Pattern & Compensation" = "core-features/saga-compensation.md" },
     { "Lifecycle Hooks" = "core-features/hooks.md" },
     { "Transactional Outbox" = "core-features/transactional-outbox.md" },
+    { "Automatic Retry" = "core-features/retry.md" },
+    { "Message Passing" = "core-features/messages.md" },
     { "Durable Execution" = [
       { "Deterministic Replay" = "core-features/durable-execution/replay.md" },
     ]},

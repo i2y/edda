@@ -26,6 +26,7 @@ Edda is a lightweight durable execution framework for Python that runs as a **li
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
+- 📬 **Message Passing**: Actor-model style workflow-to-workflow communication with groups for fan-out (Erlang pg style)
 
 ## Use Cases
 
@@ -47,14 +48,14 @@ Edda's waiting functions make it ideal for time-based and event-driven business 
 
 **Waiting functions**:
 
-- `wait_timer(duration_seconds)`: Wait for a relative duration
-- `wait_until(until_time)`: Wait until an absolute datetime (e.g., campaign end date)
+- `sleep(seconds)`: Wait for a relative duration
+- `sleep_until(target_time)`: Wait until an absolute datetime (e.g., campaign end date)
 - `wait_event(event_type)`: Wait for external events (near real-time response)
 
 ```python
 @workflow
 async def onboarding_reminder(ctx: WorkflowContext, user_id: str):
-    await wait_timer(ctx, duration_seconds=3*24*60*60)  # Wait 3 days
+    await sleep(ctx, seconds=3*24*60*60)  # Wait 3 days
     if not await check_completed(ctx, user_id):
         await send_reminder(ctx, user_id)
 ```
@@ -106,7 +107,7 @@ graph TB
 
 - Multiple workers can run simultaneously across different pods/servers
 - Each workflow instance runs on only one worker at a time (automatic coordination)
-- `wait_event()` and `wait_timer()` free up worker resources while waiting, resume on any worker when event arrives or timer expires
+- `wait_event()` and `sleep()` free up worker resources while waiting, resume on any worker when event arrives or timer expires
 - Automatic crash recovery with stale lock cleanup and workflow auto-resume
 
 ## Quick Start
@@ -219,6 +220,7 @@ payment.ParseFromString(event.data)  # bytes from BLOB
 - **[Viewer UI](viewer-ui/setup.md)**: Visualize and monitor your workflows
 - **[Lifecycle Hooks](core-features/hooks.md)**: Add observability and monitoring with custom hooks
 - **[CloudEvents HTTP Binding](core-features/events/cloudevents-http-binding.md)**: CloudEvents specification compliance and error handling
+- **[Message Passing](core-features/messages.md)**: Actor-model style workflow-to-workflow communication
 
 ## License
 

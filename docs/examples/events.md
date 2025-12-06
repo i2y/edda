@@ -5,7 +5,7 @@ This example demonstrates how workflows can wait for external events without blo
 ## What This Example Shows
 
 - ✅ `wait_event()` for waiting for external events
-- ✅ `wait_timer()` for time-based waiting
+- ✅ `sleep()` for time-based waiting
 - ✅ Process-releasing behavior (workflow pauses, worker is freed)
 - ✅ Event-driven workflow continuation
 
@@ -18,7 +18,7 @@ Traditional approaches keep the async task in memory while waiting:
 await asyncio.sleep(3600)  # Workflow state held in RAM unnecessarily
 ```
 
-Edda's `wait_event()` and `wait_timer()` **persist the workflow state to the database** and release the memory, allowing the async task to be garbage collected. The worker can then handle other workflows.
+Edda's `wait_event()` and `sleep()` **persist the workflow state to the database** and release the memory, allowing the async task to be garbage collected. The worker can then handle other workflows.
 
 ## Code Overview
 
@@ -62,7 +62,7 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str):
 ### Wait for Timer
 
 ```python
-from edda import wait_timer
+from edda import sleep
 
 @workflow
 async def order_with_timeout(ctx: WorkflowContext, order_id: str):
@@ -77,7 +77,7 @@ async def order_with_timeout(ctx: WorkflowContext, order_id: str):
 
     # Step 2: Wait 60 seconds for payment
     print("⏱️  Waiting 60 seconds for payment...")
-    await wait_timer(ctx, duration_seconds=60)
+    await sleep(ctx, seconds=60)
 
     # Step 3: Check payment status (auto-generated ID: "check_payment_status:1")
     status = await check_payment_status(ctx, order_id)
@@ -109,7 +109,7 @@ async def order_with_timeout(ctx: WorkflowContext, order_id: str):
 ### ReceivedEvent Structure
 
 ```python
-from edda.events import ReceivedEvent
+from edda import ReceivedEvent
 
 event = await wait_event(ctx, "payment.completed")
 
@@ -186,7 +186,7 @@ async def bad_workflow(ctx: WorkflowContext):
 # ✅ Good: Persists state and releases memory
 @workflow
 async def good_workflow(ctx: WorkflowContext):
-    await wait_timer(ctx, duration_seconds=3600)  # Memory freed!
+    await sleep(ctx, seconds=3600)  # Memory freed!
 ```
 
 **Impact:**
@@ -279,7 +279,7 @@ See [CloudEvents HTTP Binding](../core-features/events/cloudevents-http-binding.
 Or programmatically:
 
 ```python
-from edda.events import send_event
+from edda import send_event
 
 await send_event(
     event_type="payment.completed",
@@ -312,7 +312,7 @@ See the full implementation in [examples/event_waiting_workflow.py](https://gith
 ## What You Learned
 
 - ✅ **`wait_event()`**: Wait for external events
-- ✅ **`wait_timer()`**: Wait for specific duration
+- ✅ **`sleep()`**: Wait for specific duration
 - ✅ **Process Releasing**: Workers are freed during wait
 - ✅ **ReceivedEvent**: Typed event data access
 - ✅ **CloudEvents**: Standard event format support

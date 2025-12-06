@@ -19,7 +19,7 @@ class StorageProtocol(Protocol):
 
     This protocol defines all the methods that a storage backend must implement
     to work with the Edda framework. It supports workflow instances, execution
-    history, compensations, event subscriptions, outbox events, and distributed locking.
+    history, compensations, message subscriptions, outbox events, and distributed locking.
     """
 
     async def initialize(self) -> None:
@@ -177,6 +177,7 @@ class StorageProtocol(Protocol):
         owner_service: str,
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
+        continued_from: str | None = None,
     ) -> None:
         """
         Create a new workflow instance.
@@ -188,6 +189,7 @@ class StorageProtocol(Protocol):
             owner_service: Service that owns this workflow (e.g., "order-service")
             input_data: Input parameters for the workflow (serializable dict)
             lock_timeout_seconds: Lock timeout for this workflow (None = use global default 300s)
+            continued_from: Optional instance ID this workflow continues from (for recur pattern)
         """
         ...
 
@@ -340,6 +342,47 @@ class StorageProtocol(Protocol):
         ...
 
     # -------------------------------------------------------------------------
+    # System-level Locking Methods (for background task coordination)
+    # -------------------------------------------------------------------------
+
+    async def try_acquire_system_lock(
+        self,
+        lock_name: str,
+        worker_id: str,
+        timeout_seconds: int = 60,
+    ) -> bool:
+        """
+        Try to acquire a system-level lock for coordinating background tasks.
+
+        System locks are used to coordinate operational tasks (cleanup, auto-resume)
+        across multiple pods, ensuring only one pod executes these tasks at a time.
+
+        Unlike workflow locks (which lock existing instances), system locks create
+        lock records on-demand.
+
+        Args:
+            lock_name: Unique name for this lock (e.g., "cleanup_stale_locks")
+            worker_id: Unique identifier of the worker acquiring the lock
+            timeout_seconds: Lock timeout in seconds (default: 60)
+
+        Returns:
+            True if lock was acquired, False if already locked by another worker
+        """
+        ...
+
+    async def release_system_lock(self, lock_name: str, worker_id: str) -> None:
+        """
+        Release a system-level lock.
+
+        Only the worker that holds the lock can release it.
+
+        Args:
+            lock_name: Name of the lock to release
+            worker_id: Unique identifier of the worker releasing the lock
+        """
+        ...
+
+    # -------------------------------------------------------------------------
     # History Methods (for Deterministic Replay)
     # -------------------------------------------------------------------------
 
@@ -374,6 +417,38 @@ class StorageProtocol(Protocol):
         Returns:
             List of history events, ordered by creation time.
             Each event contains: id, instance_id, activity_id, event_type, event_data, created_at
+        """
+        ...
+
+    async def archive_history(self, instance_id: str) -> int:
+        """
+        Archive workflow history for the recur pattern.
+
+        Moves all history entries from workflow_history to workflow_history_archive.
+        This is called when a workflow uses recur() to restart with fresh history.
+
+        Args:
+            instance_id: Workflow instance whose history should be archived
+
+        Returns:
+            Number of history entries archived
+        """
+        ...
+
+    async def find_first_cancellation_event(self, instance_id: str) -> dict[str, Any] | None:
+        """
+        Find the first cancellation event in workflow history.
+
+        This is an optimized query that uses LIMIT 1 to avoid loading
+        all history events when checking for cancellation status.
+
+        Args:
+            instance_id: Workflow instance ID
+
+        Returns:
+            The first cancellation event if found, None otherwise.
+            A cancellation event is any event where event_type is
+            'WorkflowCancelled' or contains 'cancel' (case-insensitive).
         """
         ...
 
@@ -426,124 +501,8 @@ class StorageProtocol(Protocol):
         ...
 
     # -------------------------------------------------------------------------
-    # Event Subscription Methods (for wait_event)
+    # Timer Subscription Methods (for wait_timer)
     # -------------------------------------------------------------------------
-
-    async def add_event_subscription(
-        self,
-        instance_id: str,
-        event_type: str,
-        timeout_at: datetime | None = None,
-    ) -> None:
-        """
-        Register an event wait subscription.
-
-        When a workflow calls wait_event(), a subscription is created
-        in the database so that incoming events can be routed to the
-        waiting workflow.
-
-        Note: filter_expr is not needed because subscriptions are uniquely
-        identified by instance_id. Events are delivered to specific workflow
-        instances, not filtered across multiple instances.
-
-        Args:
-            instance_id: Workflow instance
-            event_type: CloudEvent type to wait for (e.g., "payment.completed")
-            timeout_at: Optional timeout timestamp
-        """
-        ...
-
-    async def find_waiting_instances(self, event_type: str) -> list[dict[str, Any]]:
-        """
-        Find workflow instances waiting for a specific event type.
-
-        Called when an event arrives to find which workflows are waiting for it.
-
-        Args:
-            event_type: CloudEvent type
-
-        Returns:
-            List of waiting instances with subscription info.
-            Each item contains: instance_id, event_type, timeout_at
-        """
-        ...
-
-    async def remove_event_subscription(
-        self,
-        instance_id: str,
-        event_type: str,
-    ) -> None:
-        """
-        Remove event subscription after the event is received.
-
-        Args:
-            instance_id: Workflow instance
-            event_type: CloudEvent type
-        """
-        ...
-
-    async def cleanup_expired_subscriptions(self) -> int:
-        """
-        Clean up event subscriptions that have timed out.
-
-        Returns:
-            Number of subscriptions cleaned up
-        """
-        ...
-
-    async def find_expired_event_subscriptions(
-        self,
-    ) -> list[dict[str, Any]]:
-        """
-        Find event subscriptions that have timed out.
-
-        Returns:
-            List of dictionaries containing:
-            - instance_id: Workflow instance ID
-            - event_type: Event type that was being waited for
-            - timeout_at: Timeout timestamp (ISO 8601 string)
-            - created_at: Subscription creation timestamp (ISO 8601 string)
-
-        Note:
-            This method does NOT delete the subscriptions - it only finds them.
-            Use cleanup_expired_subscriptions() to delete them after processing.
-        """
-        ...
-
-    async def register_event_subscription_and_release_lock(
-        self,
-        instance_id: str,
-        worker_id: str,
-        event_type: str,
-        timeout_at: datetime | None = None,
-        activity_id: str | None = None,
-    ) -> None:
-        """
-        Atomically register event subscription and release workflow lock.
-
-        This method performs the following operations in a SINGLE database transaction:
-        1. Register event subscription (INSERT into workflow_event_subscriptions)
-        2. Update current activity (UPDATE workflow_instances.current_activity_id)
-        3. Release lock (UPDATE workflow_instances set locked_by=NULL)
-
-        This ensures that when a workflow calls wait_event(), the subscription is
-        registered and the lock is released atomically, preventing race conditions
-        in distributed environments (distributed coroutines pattern).
-
-        Note: filter_expr is not needed because subscriptions are uniquely identified
-        by instance_id. Events are delivered to specific workflow instances.
-
-        Args:
-            instance_id: Workflow instance ID
-            worker_id: Worker ID that currently holds the lock
-            event_type: CloudEvent type to wait for
-            timeout_at: Optional timeout timestamp
-            activity_id: Current activity ID to record
-
-        Raises:
-            RuntimeError: If the worker doesn't hold the lock (sanity check)
-        """
-        ...
 
     async def register_timer_subscription_and_release_lock(
         self,
@@ -747,5 +706,485 @@ class StorageProtocol(Protocol):
         Returns:
             True if successfully cancelled, False if already completed/failed/cancelled
             or if instance not found
+        """
+        ...
+
+    # -------------------------------------------------------------------------
+    # Message Subscription Methods (for wait_message)
+    # -------------------------------------------------------------------------
+
+    async def register_message_subscription_and_release_lock(
+        self,
+        instance_id: str,
+        worker_id: str,
+        channel: str,
+        timeout_at: datetime | None = None,
+        activity_id: str | None = None,
+    ) -> None:
+        """
+        Atomically register message subscription and release workflow lock.
+
+        This method performs the following operations in a SINGLE database transaction:
+        1. Register message subscription (INSERT into workflow_message_subscriptions)
+        2. Update current activity (UPDATE workflow_instances.current_activity_id)
+        3. Update status to 'waiting_for_event'
+        4. Release lock (UPDATE workflow_instances set locked_by=NULL)
+
+        This ensures that when a workflow calls wait_message(), the subscription is
+        registered and the lock is released atomically, preventing race conditions
+        in distributed environments (distributed coroutines pattern).
+
+        Args:
+            instance_id: Workflow instance ID
+            worker_id: Worker ID that currently holds the lock
+            channel: Channel name to wait on
+            timeout_at: Optional timeout timestamp
+            activity_id: Current activity ID to record
+
+        Raises:
+            RuntimeError: If the worker doesn't hold the lock (sanity check)
+        """
+        ...
+
+    async def find_waiting_instances_by_channel(
+        self,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Find workflow instances waiting on a specific channel.
+
+        Called when a message arrives to find which workflows are waiting for it.
+
+        Args:
+            channel: Channel name
+
+        Returns:
+            List of waiting instances with subscription info.
+            Each item contains: instance_id, channel, activity_id, timeout_at
+        """
+        ...
+
+    async def remove_message_subscription(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Remove message subscription after the message is received.
+
+        Args:
+            instance_id: Workflow instance
+            channel: Channel name
+        """
+        ...
+
+    async def deliver_message(
+        self,
+        instance_id: str,
+        channel: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any],
+        worker_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Deliver a message to a workflow instance waiting on a channel.
+
+        Uses Lock-First pattern to prevent race conditions in distributed environments:
+        1. Checks if instance is waiting on the channel
+        2. Acquires lock (Lock-First pattern) - if worker_id provided
+        3. Records message to history
+        4. Removes subscription
+        5. Updates status to 'running'
+        6. Releases lock
+
+        The workflow will be resumed by the caller or background task.
+
+        Args:
+            instance_id: Target workflow instance ID
+            channel: Channel name
+            data: Message payload (dict or bytes)
+            metadata: Message metadata
+            worker_id: Worker ID for locking. If None, skip locking (unsafe for distributed).
+
+        Returns:
+            Dict with delivery info if successful:
+                {"instance_id": str, "workflow_name": str, "activity_id": str}
+            None if message was not delivered (no subscription or lock failed)
+        """
+        ...
+
+    async def find_expired_message_subscriptions(self) -> list[dict[str, Any]]:
+        """
+        Find message subscriptions that have timed out.
+
+        Returns:
+            List of expired subscriptions with instance_id, channel, activity_id,
+            timeout_at, created_at
+        """
+        ...
+
+    # -------------------------------------------------------------------------
+    # Group Membership Methods (Erlang pg style)
+    # -------------------------------------------------------------------------
+
+    async def join_group(self, instance_id: str, group_name: str) -> None:
+        """
+        Add a workflow instance to a group.
+
+        Groups provide loose coupling for message broadcasting.
+        Senders don't need to know receiver instance IDs.
+
+        Args:
+            instance_id: Workflow instance to add
+            group_name: Group name (e.g., "order_notifications")
+        """
+        ...
+
+    async def leave_group(self, instance_id: str, group_name: str) -> None:
+        """
+        Remove a workflow instance from a group.
+
+        Args:
+            instance_id: Workflow instance to remove
+            group_name: Group name
+        """
+        ...
+
+    async def get_group_members(self, group_name: str) -> list[str]:
+        """
+        Get all instance IDs in a group.
+
+        Args:
+            group_name: Group name
+
+        Returns:
+            List of instance IDs that are members of the group
+        """
+        ...
+
+    async def leave_all_groups(self, instance_id: str) -> None:
+        """
+        Remove a workflow instance from all groups.
+
+        Called when a workflow completes or fails.
+
+        Args:
+            instance_id: Workflow instance to remove from all groups
+        """
+        ...
+
+    # -------------------------------------------------------------------------
+    # Workflow Resumption Methods
+    # -------------------------------------------------------------------------
+
+    async def find_resumable_workflows(self) -> list[dict[str, Any]]:
+        """
+        Find workflows that are ready to be resumed.
+
+        Returns workflows with status='running' that don't have an active lock.
+        These are typically workflows that:
+        - Had a message delivered (deliver_message sets status='running')
+        - Had their lock released after message delivery
+        - Haven't been picked up by auto_resume yet
+
+        This allows immediate resumption after message delivery rather than
+        waiting for the stale lock cleanup cycle (60+ seconds).
+
+        Returns:
+            List of resumable workflows.
+            Each item contains: instance_id, workflow_name
+        """
+        ...
+
+    # -------------------------------------------------------------------------
+    # Subscription Cleanup Methods (for recur())
+    # -------------------------------------------------------------------------
+
+    async def cleanup_instance_subscriptions(self, instance_id: str) -> None:
+        """
+        Remove all subscriptions for a workflow instance.
+
+        Called during recur() to clean up timer/message subscriptions
+        before archiving the history. This prevents:
+        - Message delivery to archived instances
+        - Timer expiration for non-existent workflows
+
+        Removes entries from:
+        - workflow_timer_subscriptions
+        - workflow_message_subscriptions
+        - channel_subscriptions (new)
+        - channel_message_claims (new)
+
+        Args:
+            instance_id: Workflow instance ID to clean up
+        """
+        ...
+
+    # -------------------------------------------------------------------------
+    # Channel-based Message Queue Methods
+    # -------------------------------------------------------------------------
+
+    async def publish_to_channel(
+        self,
+        channel: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """
+        Publish a message to a channel.
+
+        Messages are persisted to the channel_messages table and will be
+        available for subscribers to receive. This implements the "mailbox"
+        pattern where messages are queued even before receive() is called.
+
+        Args:
+            channel: Channel name (e.g., "orders", "payment.completed")
+            data: Message payload (dict or bytes)
+            metadata: Optional message metadata
+
+        Returns:
+            Generated message_id (UUID)
+        """
+        ...
+
+    async def subscribe_to_channel(
+        self,
+        instance_id: str,
+        channel: str,
+        mode: str,
+    ) -> None:
+        """
+        Subscribe a workflow instance to a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+            mode: Subscription mode ('broadcast' or 'competing')
+                  - broadcast: All subscribers receive all messages
+                  - competing: Each message is received by only one subscriber
+
+        Raises:
+            ValueError: If mode is not 'broadcast' or 'competing'
+        """
+        ...
+
+    async def unsubscribe_from_channel(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Unsubscribe a workflow instance from a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+        """
+        ...
+
+    async def get_channel_subscription(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> dict[str, Any] | None:
+        """
+        Get the subscription info for a workflow instance on a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+
+        Returns:
+            Subscription info dict with: mode, activity_id, cursor_message_id
+            or None if not subscribed
+        """
+        ...
+
+    async def register_channel_receive_and_release_lock(
+        self,
+        instance_id: str,
+        worker_id: str,
+        channel: str,
+        activity_id: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """
+        Atomically register that workflow is waiting for channel message and release lock.
+
+        This method performs the following operations in a SINGLE database transaction:
+        1. Update channel_subscriptions to set activity_id and timeout_at (waiting state)
+        2. Update current activity (UPDATE workflow_instances.current_activity_id)
+        3. Update status to 'waiting_for_message'
+        4. Release lock (UPDATE workflow_instances set locked_by=NULL)
+
+        Args:
+            instance_id: Workflow instance ID
+            worker_id: Worker ID that currently holds the lock
+            channel: Channel name being waited on
+            activity_id: Current activity ID to record
+            timeout_seconds: Optional timeout in seconds for the message wait
+
+        Raises:
+            RuntimeError: If the worker doesn't hold the lock
+            ValueError: If workflow is not subscribed to the channel
+        """
+        ...
+
+    async def get_pending_channel_messages(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get pending messages for a subscriber on a channel.
+
+        For broadcast mode:
+            Returns messages with id > cursor_message_id (messages not yet seen)
+
+        For competing mode:
+            Returns unclaimed messages (not in channel_message_claims)
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+
+        Returns:
+            List of pending messages, ordered by published_at ASC.
+            Each message contains: id, message_id, channel, data, metadata, published_at
+        """
+        ...
+
+    async def claim_channel_message(
+        self,
+        message_id: str,
+        instance_id: str,
+    ) -> bool:
+        """
+        Claim a message for competing consumption.
+
+        Uses SELECT FOR UPDATE SKIP LOCKED pattern to ensure only one
+        subscriber claims each message.
+
+        Args:
+            message_id: Message ID to claim
+            instance_id: Workflow instance claiming the message
+
+        Returns:
+            True if claim succeeded, False if already claimed by another instance
+        """
+        ...
+
+    async def delete_channel_message(self, message_id: str) -> None:
+        """
+        Delete a message from the channel queue.
+
+        Called after successful message processing in competing mode.
+
+        Args:
+            message_id: Message ID to delete
+        """
+        ...
+
+    async def update_delivery_cursor(
+        self,
+        channel: str,
+        instance_id: str,
+        message_id: int,
+    ) -> None:
+        """
+        Update the delivery cursor for broadcast mode.
+
+        Records the last message ID delivered to a subscriber, so the same
+        messages are not delivered again.
+
+        Args:
+            channel: Channel name
+            instance_id: Subscriber instance ID
+            message_id: Last delivered message's internal ID (channel_messages.id)
+        """
+        ...
+
+    async def get_channel_subscribers_waiting(
+        self,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get channel subscribers that are waiting (activity_id is set).
+
+        Called when a message is published to find subscribers to wake up.
+
+        Args:
+            channel: Channel name
+
+        Returns:
+            List of waiting subscribers.
+            Each item contains: instance_id, channel, mode, activity_id
+        """
+        ...
+
+    async def clear_channel_waiting_state(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Clear the waiting state for a channel subscription.
+
+        Called after a message is delivered to a waiting subscriber.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+        """
+        ...
+
+    async def deliver_channel_message(
+        self,
+        instance_id: str,
+        channel: str,
+        message_id: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        """
+        Deliver a channel message to a waiting workflow.
+
+        Uses Lock-First pattern:
+        1. Acquire lock on the workflow instance
+        2. Record message to history
+        3. Clear waiting state / update cursor / claim message
+        4. Update status to 'running'
+        5. Release lock
+
+        Args:
+            instance_id: Target workflow instance ID
+            channel: Channel name
+            message_id: Message ID being delivered
+            data: Message payload
+            metadata: Message metadata
+            worker_id: Worker ID for locking
+
+        Returns:
+            Dict with delivery info if successful:
+                {"instance_id": str, "workflow_name": str, "activity_id": str}
+            None if delivery failed (lock conflict, etc.)
+        """
+        ...
+
+    async def cleanup_old_channel_messages(self, older_than_days: int = 7) -> int:
+        """
+        Clean up old messages from channel queues.
+
+        For broadcast mode: Delete messages where all current subscribers have
+        received them (cursor is past the message).
+
+        For all modes: Delete messages older than the retention period.
+
+        Args:
+            older_than_days: Message retention period in days
+
+        Returns:
+            Number of messages deleted
         """
         ...

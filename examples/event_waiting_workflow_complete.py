@@ -13,7 +13,7 @@ Run with:
 import asyncio
 from uuid import uuid4
 
-from edda import EddaApp, WorkflowContext, activity, workflow, wait_event
+from edda import EddaApp, WorkflowContext, activity, wait_event, workflow
 
 
 # Define activities
@@ -75,7 +75,7 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str, amount: float) -
     return final_result
 
 
-async def send_payment_event(app: EddaApp, instance_id: str, order_id: str) -> None:
+async def send_payment_event(app: EddaApp, _instance_id: str, order_id: str) -> None:
     """Send a payment.completed CloudEvent to resume the workflow."""
     print("\n" + "=" * 60)
     print("Sending payment.completed event to resume workflow...")
@@ -146,7 +146,7 @@ async def main():
         await asyncio.sleep(2)
 
         # Step 3: Send the payment.completed event
-        print(f"\n>>> Step 3: Sending payment.completed event...")
+        print("\n>>> Step 3: Sending payment.completed event...")
         await send_payment_event(app, instance_id, order_id)
 
         # Step 4: Wait for workflow to complete

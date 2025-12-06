@@ -267,7 +267,7 @@ class WorkflowDataService:
         except (OSError, TypeError) as e:
             # OSError: source not available (e.g., interactive shell)
             # TypeError: not a module, class, method, function, etc.
-            print(f"Warning: Could not get source for {workflow_name}: {e}")
+            logger.warning("Could not get source for %s: %s", workflow_name, e)
             return None
 
     async def get_activity_executions(
@@ -332,8 +332,8 @@ class WorkflowDataService:
         import httpx
 
         try:
-            print(f"[Cancel] Attempting to cancel workflow: {instance_id}")
-            print(f"[Cancel] API URL: {edda_app_url}/cancel/{instance_id}")
+            logger.debug("Attempting to cancel workflow: %s", instance_id)
+            logger.debug("API URL: %s/cancel/%s", edda_app_url, instance_id)
 
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -341,8 +341,8 @@ class WorkflowDataService:
                     timeout=10.0,
                 )
 
-                print(f"[Cancel] Response status: {response.status_code}")
-                print(f"[Cancel] Response body: {response.text}")
+                logger.debug("Response status: %s", response.status_code)
+                logger.debug("Response body: %s", response.text)
 
                 if 200 <= response.status_code < 300:
                     return True, "Workflow cancelled successfully"
@@ -356,17 +356,17 @@ class WorkflowDataService:
 
         except httpx.ConnectError as e:
             error_msg = f"Cannot connect to EddaApp at {edda_app_url}. Is it running?"
-            print(f"[Cancel] Connection error: {e}")
+            logger.warning("Connection error: %s", e)
             return False, error_msg
 
         except httpx.TimeoutException as e:
             error_msg = "Request timed out. The server may be busy."
-            print(f"[Cancel] Timeout error: {e}")
+            logger.warning("Timeout error: %s", e)
             return False, error_msg
 
         except Exception as e:
             error_msg = f"Unexpected error: {type(e).__name__}: {str(e)}"
-            print(f"[Cancel] Unexpected error: {e}")
+            logger.error("Unexpected error: %s", e, exc_info=True)
             return False, error_msg
 
     def get_all_workflows(self) -> dict[str, Any]:
@@ -520,7 +520,7 @@ class WorkflowDataService:
                 }
             except Exception as e:
                 # Fallback to JSON if schema generation fails
-                print(f"Warning: Failed to generate JSON Schema for {annotation}: {e}")
+                logger.warning("Failed to generate JSON Schema for %s: %s", annotation, e)
                 return {"type": "json"}
 
         # Check if it's an Enum
@@ -856,9 +856,9 @@ class WorkflowDataService:
         from cloudevents.http import CloudEvent
 
         try:
-            print(f"[StartWorkflow] Attempting to start workflow: {workflow_name}")
-            print(f"[StartWorkflow] Sending CloudEvent to: {edda_app_url}")
-            print(f"[StartWorkflow] Params: {params}")
+            logger.debug("Attempting to start workflow: %s", workflow_name)
+            logger.debug("Sending CloudEvent to: %s", edda_app_url)
+            logger.debug("Params: %s", params)
 
             # Verify workflow exists
             all_workflows = self.get_all_workflows()
@@ -876,8 +876,8 @@ class WorkflowDataService:
             # Convert to HTTP format (structured content mode)
             headers, body = to_structured(event)
 
-            print(f"[StartWorkflow] CloudEvent ID: {attributes['id']}")
-            print(f"[StartWorkflow] CloudEvent type: {workflow_name}")
+            logger.debug("CloudEvent ID: %s", attributes["id"])
+            logger.debug("CloudEvent type: %s", workflow_name)
 
             # Send CloudEvent to EddaApp
             async with httpx.AsyncClient() as client:
@@ -888,8 +888,8 @@ class WorkflowDataService:
                     timeout=10.0,
                 )
 
-                print(f"[StartWorkflow] Response status: {response.status_code}")
-                print(f"[StartWorkflow] Response body: {response.text}")
+                logger.debug("Response status: %s", response.status_code)
+                logger.debug("Response body: %s", response.text)
 
                 if 200 <= response.status_code < 300:
                     # CloudEvent accepted (200 OK or 202 Accepted)
@@ -902,18 +902,15 @@ class WorkflowDataService:
 
         except httpx.ConnectError as e:
             error_msg = f"Cannot connect to EddaApp at {edda_app_url}. Is it running?"
-            print(f"[StartWorkflow] Connection error: {e}")
+            logger.warning("Connection error: %s", e)
             return False, error_msg, None
 
         except httpx.TimeoutException as e:
             error_msg = "Request timed out. The server may be busy."
-            print(f"[StartWorkflow] Timeout error: {e}")
+            logger.warning("Timeout error: %s", e)
             return False, error_msg, None
 
         except Exception as e:
             error_msg = f"Unexpected error: {type(e).__name__}: {str(e)}"
-            print(f"[StartWorkflow] Unexpected error: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.error("Unexpected error: %s", e, exc_info=True)
             return False, error_msg, None

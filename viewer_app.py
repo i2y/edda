@@ -45,7 +45,6 @@ Then open http://localhost:<port> in your browser.
 """
 
 import argparse
-import asyncio
 import os
 import sys
 
@@ -115,7 +114,7 @@ def main() -> None:
                     f"  ✗ Warning: Could not import module '{module_name}': {e}",
                     file=sys.stderr,
                 )
-                print(f"    Continuing without this module...", file=sys.stderr)
+                print("    Continuing without this module...", file=sys.stderr)
         print()
 
     # Step 4: Determine database URL (prioritize environment variable)
@@ -135,7 +134,7 @@ def main() -> None:
     )
 
     # Step 5: Start the viewer (storage will be initialized on startup)
-    print(f"Starting Edda Viewer...")
+    print("Starting Edda Viewer...")
     print(f"  Database: {db_display}")
     print(f"  Port: {args.port}")
     print(f"  URL: http://localhost:{args.port}")

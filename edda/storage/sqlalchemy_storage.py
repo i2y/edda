@@ -19,6 +19,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    ForeignKey,
     ForeignKeyConstraint,
     Index,
     Integer,
@@ -29,18 +30,21 @@ from sqlalchemy import (
     and_,
     delete,
     func,
+    inspect,
     or_,
     select,
     text,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 logger = logging.getLogger(__name__)
 
+
 # Declarative base for ORM models
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
 
 
 # ============================================================================
@@ -48,25 +52,25 @@ Base = declarative_base()
 # ============================================================================
 
 
-class SchemaVersion(Base):  # type: ignore[valid-type, misc]
+class SchemaVersion(Base):
     """Schema version tracking."""
 
     __tablename__ = "schema_version"
 
-    version = Column(Integer, primary_key=True)
-    applied_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    description = Column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    description: Mapped[str] = mapped_column(Text)
 
 
-class WorkflowDefinition(Base):  # type: ignore[valid-type, misc]
+class WorkflowDefinition(Base):
     """Workflow definition (source code storage)."""
 
     __tablename__ = "workflow_definitions"
 
-    workflow_name = Column(String(255), nullable=False, primary_key=True)
-    source_hash = Column(String(64), nullable=False, primary_key=True)
-    source_code = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    workflow_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    source_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_code: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("idx_definitions_name", "workflow_name"),
@@ -74,31 +78,34 @@ class WorkflowDefinition(Base):  # type: ignore[valid-type, misc]
     )
 
 
-class WorkflowInstance(Base):  # type: ignore[valid-type, misc]
+class WorkflowInstance(Base):
     """Workflow instance with distributed locking support."""
 
     __tablename__ = "workflow_instances"
 
-    instance_id = Column(String(255), primary_key=True)
-    workflow_name = Column(String(255), nullable=False)
-    source_hash = Column(String(64), nullable=False)
-    owner_service = Column(String(255), nullable=False)
-    status = Column(
-        String(50),
-        nullable=False,
-        server_default=text("'running'"),
+    instance_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    workflow_name: Mapped[str] = mapped_column(String(255))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    owner_service: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(50), server_default=text("'running'"))
+    current_activity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    continued_from: Mapped[str | None] = mapped_column(
+        String(255), ForeignKey("workflow_instances.instance_id"), nullable=True
     )
-    current_activity_id = Column(String(255), nullable=True)
-    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
-    input_data = Column(Text, nullable=False)  # JSON
-    output_data = Column(Text, nullable=True)  # JSON
-    locked_by = Column(String(255), nullable=True)
-    locked_at = Column(DateTime(timezone=True), nullable=True)
-    lock_timeout_seconds = Column(Integer, nullable=True)  # None = use global default (300s)
-    lock_expires_at = Column(DateTime(timezone=True), nullable=True)  # Absolute expiry time
+    input_data: Mapped[str] = mapped_column(Text)  # JSON
+    output_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_timeout_seconds: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # None = use global default (300s)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )  # Absolute expiry time
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -107,7 +114,7 @@ class WorkflowInstance(Base):  # type: ignore[valid-type, misc]
         ),
         CheckConstraint(
             "status IN ('running', 'completed', 'failed', 'waiting_for_event', "
-            "'waiting_for_timer', 'compensating', 'cancelled')",
+            "'waiting_for_timer', 'waiting_for_message', 'compensating', 'cancelled', 'recurred')",
             name="valid_status",
         ),
         Index("idx_instances_status", "status"),
@@ -117,25 +124,29 @@ class WorkflowInstance(Base):  # type: ignore[valid-type, misc]
         Index("idx_instances_lock_expires", "lock_expires_at"),
         Index("idx_instances_updated", "updated_at"),
         Index("idx_instances_hash", "source_hash"),
+        Index("idx_instances_continued_from", "continued_from"),
+        # Composite index for find_resumable_workflows(): WHERE status='running' AND locked_by IS NULL
+        Index("idx_instances_resumable", "status", "locked_by"),
     )
 
 
-class WorkflowHistory(Base):  # type: ignore[valid-type, misc]
+class WorkflowHistory(Base):
     """Workflow execution history (for deterministic replay)."""
 
     __tablename__ = "workflow_history"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    instance_id = Column(
-        String(255),
-        nullable=False,
-    )
-    activity_id = Column(String(255), nullable=False)
-    event_type = Column(String(100), nullable=False)
-    data_type = Column(String(10), nullable=False)  # 'json' or 'binary'
-    event_data = Column(Text, nullable=True)  # JSON (when data_type='json')
-    event_data_binary = Column(LargeBinary, nullable=True)  # Binary (when data_type='binary')
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    activity_id: Mapped[str] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(100))
+    data_type: Mapped[str] = mapped_column(String(10))  # 'json' or 'binary'
+    event_data: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # JSON (when data_type='json')
+    event_data_binary: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )  # Binary (when data_type='binary')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -158,20 +169,43 @@ class WorkflowHistory(Base):  # type: ignore[valid-type, misc]
     )
 
 
-class WorkflowCompensation(Base):  # type: ignore[valid-type, misc]
+class WorkflowHistoryArchive(Base):
+    """Archived workflow execution history (for recur pattern)."""
+
+    __tablename__ = "workflow_history_archive"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    activity_id: Mapped[str] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(100))
+    event_data: Mapped[str] = mapped_column(Text)  # JSON (includes both types for archive)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        Index("idx_history_archive_instance", "instance_id"),
+        Index("idx_history_archive_archived", "archived_at"),
+    )
+
+
+class WorkflowCompensation(Base):
     """Compensation transactions (LIFO stack for Saga pattern)."""
 
     __tablename__ = "workflow_compensations"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    instance_id = Column(
-        String(255),
-        nullable=False,
-    )
-    activity_id = Column(String(255), nullable=False)
-    activity_name = Column(String(255), nullable=False)
-    args = Column(Text, nullable=False)  # JSON
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    activity_id: Mapped[str] = mapped_column(String(255))
+    activity_name: Mapped[str] = mapped_column(String(255))
+    args: Mapped[str] = mapped_column(Text)  # JSON
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -183,48 +217,17 @@ class WorkflowCompensation(Base):  # type: ignore[valid-type, misc]
     )
 
 
-class WorkflowEventSubscription(Base):  # type: ignore[valid-type, misc]
-    """Event subscriptions (for wait_event)."""
-
-    __tablename__ = "workflow_event_subscriptions"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    instance_id = Column(
-        String(255),
-        nullable=False,
-    )
-    event_type = Column(String(255), nullable=False)
-    activity_id = Column(String(255), nullable=True)
-    timeout_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["instance_id"],
-            ["workflow_instances.instance_id"],
-            ondelete="CASCADE",
-        ),
-        UniqueConstraint("instance_id", "event_type", name="unique_instance_event"),
-        Index("idx_subscriptions_event", "event_type"),
-        Index("idx_subscriptions_timeout", "timeout_at"),
-        Index("idx_subscriptions_instance", "instance_id"),
-    )
-
-
-class WorkflowTimerSubscription(Base):  # type: ignore[valid-type, misc]
+class WorkflowTimerSubscription(Base):
     """Timer subscriptions (for wait_timer)."""
 
     __tablename__ = "workflow_timer_subscriptions"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    instance_id = Column(
-        String(255),
-        nullable=False,
-    )
-    timer_id = Column(String(255), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    activity_id = Column(String(255), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    timer_id: Mapped[str] = mapped_column(String(255))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    activity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -238,23 +241,29 @@ class WorkflowTimerSubscription(Base):  # type: ignore[valid-type, misc]
     )
 
 
-class OutboxEvent(Base):  # type: ignore[valid-type, misc]
+class OutboxEvent(Base):
     """Transactional outbox pattern events."""
 
     __tablename__ = "outbox_events"
 
-    event_id = Column(String(255), primary_key=True)
-    event_type = Column(String(255), nullable=False)
-    event_source = Column(String(255), nullable=False)
-    data_type = Column(String(10), nullable=False)  # 'json' or 'binary'
-    event_data = Column(Text, nullable=True)  # JSON (when data_type='json')
-    event_data_binary = Column(LargeBinary, nullable=True)  # Binary (when data_type='binary')
-    content_type = Column(String(100), nullable=False, server_default=text("'application/json'"))
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    published_at = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(50), nullable=False, server_default=text("'pending'"))
-    retry_count = Column(Integer, nullable=False, server_default=text("0"))
-    last_error = Column(Text, nullable=True)
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(255))
+    event_source: Mapped[str] = mapped_column(String(255))
+    data_type: Mapped[str] = mapped_column(String(10))  # 'json' or 'binary'
+    event_data: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # JSON (when data_type='json')
+    event_data_binary: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )  # Binary (when data_type='binary')
+    content_type: Mapped[str] = mapped_column(
+        String(100), server_default=text("'application/json'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), server_default=text("'pending'"))
+    retry_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -274,6 +283,203 @@ class OutboxEvent(Base):  # type: ignore[valid-type, misc]
         Index("idx_outbox_retry", "status", "retry_count"),
         Index("idx_outbox_published", "published_at"),
     )
+
+
+class WorkflowMessageSubscription(Base):
+    """Message subscriptions (for wait_message)."""
+
+    __tablename__ = "workflow_message_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    channel: Mapped[str] = mapped_column(String(255))
+    activity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    timeout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("instance_id", "channel", name="unique_instance_channel"),
+        Index("idx_message_subscriptions_channel", "channel"),
+        Index("idx_message_subscriptions_timeout", "timeout_at"),
+        Index("idx_message_subscriptions_instance", "instance_id"),
+    )
+
+
+class WorkflowGroupMembership(Base):
+    """Group memberships (Erlang pg style for broadcast messaging)."""
+
+    __tablename__ = "workflow_group_memberships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    group_name: Mapped[str] = mapped_column(String(255))
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("instance_id", "group_name", name="unique_instance_group"),
+        Index("idx_group_memberships_group", "group_name"),
+        Index("idx_group_memberships_instance", "instance_id"),
+    )
+
+
+# =============================================================================
+# Channel-based Message Queue Models
+# =============================================================================
+
+
+class ChannelMessage(Base):
+    """Channel message queue (persistent message storage)."""
+
+    __tablename__ = "channel_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(255))
+    message_id: Mapped[str] = mapped_column(String(255), unique=True)
+    data_type: Mapped[str] = mapped_column(String(10))  # 'json' or 'binary'
+    data: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON (when data_type='json')
+    data_binary: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )  # Binary (when data_type='binary')
+    message_metadata: Mapped[str | None] = mapped_column(
+        "metadata", Text, nullable=True
+    )  # JSON - renamed to avoid SQLAlchemy reserved name
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "data_type IN ('json', 'binary')",
+            name="channel_valid_data_type",
+        ),
+        CheckConstraint(
+            "(data_type = 'json' AND data IS NOT NULL AND data_binary IS NULL) OR "
+            "(data_type = 'binary' AND data IS NULL AND data_binary IS NOT NULL)",
+            name="channel_data_type_consistency",
+        ),
+        Index("idx_channel_messages_channel", "channel", "published_at"),
+        Index("idx_channel_messages_id", "id"),
+    )
+
+
+class ChannelSubscription(Base):
+    """Channel subscriptions for workflow instances."""
+
+    __tablename__ = "channel_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    channel: Mapped[str] = mapped_column(String(255))
+    mode: Mapped[str] = mapped_column(String(20))  # 'broadcast' or 'competing'
+    activity_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )  # Set when waiting for message
+    cursor_message_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # Last received message id (broadcast)
+    timeout_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )  # Timeout deadline
+    subscribed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "mode IN ('broadcast', 'competing')",
+            name="channel_valid_mode",
+        ),
+        UniqueConstraint("instance_id", "channel", name="unique_channel_instance_channel"),
+        Index("idx_channel_subscriptions_channel", "channel"),
+        Index("idx_channel_subscriptions_instance", "instance_id"),
+        Index("idx_channel_subscriptions_waiting", "channel", "activity_id"),
+        Index("idx_channel_subscriptions_timeout", "timeout_at"),
+    )
+
+
+class ChannelDeliveryCursor(Base):
+    """Channel delivery cursors (broadcast mode: track who read what)."""
+
+    __tablename__ = "channel_delivery_cursors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(255))
+    instance_id: Mapped[str] = mapped_column(String(255))
+    last_delivered_id: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("channel", "instance_id", name="unique_channel_delivery_cursor"),
+        Index("idx_channel_delivery_cursors_channel", "channel"),
+    )
+
+
+class ChannelMessageClaim(Base):
+    """Channel message claims (competing mode: who is processing what)."""
+
+    __tablename__ = "channel_message_claims"
+
+    message_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(255))
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["message_id"],
+            ["channel_messages.message_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["instance_id"],
+            ["workflow_instances.instance_id"],
+            ondelete="CASCADE",
+        ),
+        Index("idx_channel_message_claims_instance", "instance_id"),
+    )
+
+
+# =============================================================================
+# System-level Lock Models (for background task coordination)
+# =============================================================================
+
+
+class SystemLock(Base):
+    """System-level locks for coordinating background tasks across pods.
+
+    Used to prevent duplicate execution of operational tasks like:
+    - cleanup_stale_locks_periodically()
+    - auto_resume_stale_workflows_periodically()
+    - _cleanup_old_messages_periodically()
+    """
+
+    __tablename__ = "system_locks"
+
+    lock_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (Index("idx_system_locks_expires", "lock_expires_at"),)
 
 
 # Current schema version
@@ -337,10 +543,21 @@ class SQLAlchemyStorage:
         self.engine = engine
 
     async def initialize(self) -> None:
-        """Initialize database connection and create tables."""
+        """Initialize database connection and create tables.
+
+        This method creates all tables if they don't exist, and then performs
+        automatic schema migration to add any missing columns and update CHECK
+        constraints. This ensures compatibility when upgrading Edda versions.
+        """
         # Create all tables and indexes
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+        # Auto-migrate schema (add missing columns)
+        await self._auto_migrate_schema()
+
+        # Auto-migrate CHECK constraints
+        await self._auto_migrate_check_constraints()
 
         # Initialize schema version
         await self._initialize_schema_version()
@@ -365,6 +582,198 @@ class SQLAlchemyStorage:
                 session.add(version)
                 await session.commit()
                 logger.info(f"Initialized schema version to {CURRENT_SCHEMA_VERSION}")
+
+    async def _auto_migrate_schema(self) -> None:
+        """
+        Automatically add missing columns to existing tables.
+
+        This method compares the ORM model definitions with the actual database
+        schema and adds any missing columns using ALTER TABLE ADD COLUMN.
+
+        Note: This only handles column additions, not removals or type changes.
+        For complex migrations, use Alembic.
+        """
+
+        def _get_column_type_sql(column: Column, dialect_name: str) -> str:  # type: ignore[type-arg]
+            """Get SQL type string for a column based on dialect."""
+            col_type = column.type
+
+            # Map SQLAlchemy types to SQL types
+            if isinstance(col_type, String):
+                length = col_type.length or 255
+                return f"VARCHAR({length})"
+            elif isinstance(col_type, Text):
+                return "TEXT"
+            elif isinstance(col_type, Integer):
+                return "INTEGER"
+            elif isinstance(col_type, DateTime):
+                if dialect_name == "postgresql":
+                    return "TIMESTAMP WITH TIME ZONE" if col_type.timezone else "TIMESTAMP"
+                elif dialect_name == "mysql":
+                    return "DATETIME" if not col_type.timezone else "DATETIME"
+                else:  # sqlite
+                    return "DATETIME"
+            elif isinstance(col_type, LargeBinary):
+                if dialect_name == "postgresql":
+                    return "BYTEA"
+                elif dialect_name == "mysql":
+                    return "LONGBLOB"
+                else:  # sqlite
+                    return "BLOB"
+            else:
+                # Fallback to compiled type
+                return str(col_type.compile(dialect=self.engine.dialect))
+
+        def _get_default_sql(column: Column, _dialect_name: str) -> str | None:  # type: ignore[type-arg]
+            """Get DEFAULT clause for a column if applicable."""
+            if column.server_default is not None:
+                # Handle text() server defaults - try to get the arg attribute
+                server_default = column.server_default
+                if hasattr(server_default, "arg"):
+                    default_val = server_default.arg
+                    if hasattr(default_val, "text"):
+                        return f"DEFAULT {default_val.text}"
+                    return f"DEFAULT {default_val}"
+            return None
+
+        def _run_migration(conn: Any) -> None:
+            """Run migration in sync context."""
+            dialect_name = self.engine.dialect.name
+            inspector = inspect(conn)
+
+            # Iterate through all ORM tables
+            for table in Base.metadata.tables.values():
+                table_name = table.name
+
+                # Check if table exists
+                if not inspector.has_table(table_name):
+                    logger.debug(f"Table {table_name} does not exist, skipping migration")
+                    continue
+
+                # Get existing columns
+                existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+
+                # Check each column in the ORM model
+                for column in table.columns:
+                    if column.name not in existing_columns:
+                        # Column is missing, generate ALTER TABLE
+                        col_type_sql = _get_column_type_sql(column, dialect_name)
+                        nullable = "NULL" if column.nullable else "NOT NULL"
+
+                        # Build ALTER TABLE statement
+                        alter_sql = (
+                            f'ALTER TABLE "{table_name}" ADD COLUMN "{column.name}" {col_type_sql}'
+                        )
+
+                        # Add nullable constraint (only if NOT NULL and has default)
+                        default_sql = _get_default_sql(column, dialect_name)
+                        if not column.nullable and default_sql:
+                            alter_sql += f" {default_sql} {nullable}"
+                        elif column.nullable:
+                            alter_sql += f" {nullable}"
+                        elif default_sql:
+                            alter_sql += f" {default_sql}"
+                        # For NOT NULL without default, just add the column as nullable
+                        # (PostgreSQL requires default or nullable for existing rows)
+                        else:
+                            alter_sql += " NULL"
+
+                        logger.info(f"Auto-migrating: Adding column {column.name} to {table_name}")
+                        logger.debug(f"Executing: {alter_sql}")
+
+                        try:
+                            conn.execute(text(alter_sql))
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to add column {column.name} to {table_name}: {e}"
+                            )
+
+        async with self.engine.begin() as conn:
+            await conn.run_sync(_run_migration)
+
+    async def _auto_migrate_check_constraints(self) -> None:
+        """
+        Automatically update CHECK constraints for workflow status.
+
+        This method ensures the valid_status CHECK constraint includes all
+        required status values (including 'waiting_for_message').
+        """
+        dialect_name = self.engine.dialect.name
+
+        # SQLite doesn't support ALTER CONSTRAINT easily, and SQLAlchemy create_all
+        # handles it correctly for new databases. For existing SQLite databases,
+        # the constraint is more lenient (CHECK is not enforced in many SQLite versions).
+        if dialect_name == "sqlite":
+            return
+
+        # Expected status values (must match WorkflowInstance model)
+        expected_statuses = (
+            "'running', 'completed', 'failed', 'waiting_for_event', "
+            "'waiting_for_timer', 'waiting_for_message', 'compensating', 'cancelled', 'recurred'"
+        )
+
+        def _run_constraint_migration(conn: Any) -> None:
+            """Run CHECK constraint migration in sync context."""
+            inspector = inspect(conn)
+
+            # Check if workflow_instances table exists
+            if not inspector.has_table("workflow_instances"):
+                return
+
+            # Get existing CHECK constraints
+            try:
+                constraints = inspector.get_check_constraints("workflow_instances")
+            except NotImplementedError:
+                # Some databases don't support get_check_constraints
+                logger.debug("Database doesn't support get_check_constraints inspection")
+                constraints = []
+
+            # Find the valid_status constraint
+            valid_status_constraint = None
+            for constraint in constraints:
+                if constraint.get("name") == "valid_status":
+                    valid_status_constraint = constraint
+                    break
+
+            # Check if constraint exists and needs updating
+            if valid_status_constraint:
+                sqltext = valid_status_constraint.get("sqltext", "")
+                # Check if 'waiting_for_message' is already in the constraint
+                if "waiting_for_message" in sqltext:
+                    logger.debug("valid_status constraint already includes waiting_for_message")
+                    return
+
+                # Need to update the constraint
+                logger.info("Updating valid_status CHECK constraint to include waiting_for_message")
+                try:
+                    if dialect_name == "postgresql":
+                        conn.execute(
+                            text("ALTER TABLE workflow_instances DROP CONSTRAINT valid_status")
+                        )
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE workflow_instances ADD CONSTRAINT valid_status "
+                                f"CHECK (status IN ({expected_statuses}))"
+                            )
+                        )
+                    elif dialect_name == "mysql":
+                        # MySQL uses DROP CHECK and ADD CONSTRAINT CHECK syntax
+                        conn.execute(text("ALTER TABLE workflow_instances DROP CHECK valid_status"))
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE workflow_instances ADD CONSTRAINT valid_status "
+                                f"CHECK (status IN ({expected_statuses}))"
+                            )
+                        )
+                    logger.info("Successfully updated valid_status CHECK constraint")
+                except Exception as e:
+                    logger.warning(f"Failed to update valid_status CHECK constraint: {e}")
+            else:
+                # Constraint doesn't exist (shouldn't happen with create_all, but handle it)
+                logger.debug("valid_status constraint not found, will be created by create_all")
+
+        async with self.engine.begin() as conn:
+            await conn.run_sync(_run_constraint_migration)
 
     def _get_session_for_operation(self, is_lock_operation: bool = False) -> AsyncSession:
         """
@@ -452,7 +861,7 @@ class SQLAlchemyStorage:
         Example:
             >>> # SQLite: datetime(timeout_at) <= datetime('now')
             >>> # PostgreSQL/MySQL: timeout_at <= NOW()
-            >>> self._make_datetime_comparable(WorkflowEventSubscription.timeout_at)
+            >>> self._make_datetime_comparable(WorkflowMessageSubscription.timeout_at)
             >>>     <= self._get_current_time_expr()
         """
         if self.engine.dialect.name == "sqlite":
@@ -605,7 +1014,7 @@ class SQLAlchemyStorage:
 
             if existing:
                 # Update
-                existing.source_code = source_code  # type: ignore[assignment]
+                existing.source_code = source_code
             else:
                 # Insert
                 definition = WorkflowDefinition(
@@ -682,6 +1091,7 @@ class SQLAlchemyStorage:
         owner_service: str,
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
+        continued_from: str | None = None,
     ) -> None:
         """Create a new workflow instance."""
         session = self._get_session_for_operation()
@@ -693,6 +1103,7 @@ class SQLAlchemyStorage:
                 owner_service=owner_service,
                 input_data=json.dumps(input_data),
                 lock_timeout_seconds=lock_timeout_seconds,
+                continued_from=continued_from,
             )
             session.add(instance)
 
@@ -1166,6 +1577,103 @@ class SQLAlchemyStorage:
             return workflows_to_resume
 
     # -------------------------------------------------------------------------
+    # System-level Locking Methods (for background task coordination)
+    # -------------------------------------------------------------------------
+
+    async def try_acquire_system_lock(
+        self,
+        lock_name: str,
+        worker_id: str,
+        timeout_seconds: int = 60,
+    ) -> bool:
+        """
+        Try to acquire a system-level lock for coordinating background tasks.
+
+        Uses INSERT ON CONFLICT pattern to handle race conditions:
+        1. Try to INSERT new lock record
+        2. If exists, check if expired or unlocked
+        3. If available, acquire lock; otherwise return False
+
+        Note: ALWAYS uses separate session (not external session).
+        """
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            current_time = datetime.now(UTC)
+            lock_expires_at = current_time + timedelta(seconds=timeout_seconds)
+
+            # Try to get existing lock
+            result = await session.execute(
+                select(SystemLock).where(SystemLock.lock_name == lock_name)
+            )
+            lock = result.scalar_one_or_none()
+
+            if lock is None:
+                # No lock exists - create new one
+                lock = SystemLock(
+                    lock_name=lock_name,
+                    locked_by=worker_id,
+                    locked_at=current_time,
+                    lock_expires_at=lock_expires_at,
+                )
+                session.add(lock)
+                await session.commit()
+                return True
+
+            # Lock exists - check if available
+            if lock.locked_by is None:
+                # Unlocked - acquire
+                lock.locked_by = worker_id
+                lock.locked_at = current_time
+                lock.lock_expires_at = lock_expires_at
+                await session.commit()
+                return True
+
+            # Check if expired (use SQL-side comparison for cross-DB compatibility)
+            if lock.lock_expires_at is not None:
+                # Handle timezone-naive datetime from SQLite
+                lock_expires = (
+                    lock.lock_expires_at.replace(tzinfo=UTC)
+                    if lock.lock_expires_at.tzinfo is None
+                    else lock.lock_expires_at
+                )
+                if lock_expires <= current_time:
+                    # Expired - acquire
+                    lock.locked_by = worker_id
+                    lock.locked_at = current_time
+                    lock.lock_expires_at = lock_expires_at
+                    await session.commit()
+                    return True
+
+            # Already locked by another worker
+            return False
+
+    async def release_system_lock(self, lock_name: str, worker_id: str) -> None:
+        """
+        Release a system-level lock.
+
+        Only releases the lock if it's held by the specified worker.
+
+        Note: ALWAYS uses separate session (not external session).
+        """
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            await session.execute(
+                update(SystemLock)
+                .where(
+                    and_(
+                        SystemLock.lock_name == lock_name,
+                        SystemLock.locked_by == worker_id,
+                    )
+                )
+                .values(
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                )
+            )
+            await session.commit()
+
+    # -------------------------------------------------------------------------
     # History Methods (prefer external session)
     # -------------------------------------------------------------------------
 
@@ -1231,6 +1739,107 @@ class SQLAlchemyStorage:
                 for row in rows
             ]
 
+    async def archive_history(self, instance_id: str) -> int:
+        """
+        Archive workflow history for the recur pattern.
+
+        Moves all history entries from workflow_history to workflow_history_archive.
+        Binary data is converted to base64 for JSON storage in the archive.
+
+        Returns:
+            Number of history entries archived
+        """
+        import base64
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Get all history entries for this instance
+            result = await session.execute(
+                select(WorkflowHistory)
+                .where(WorkflowHistory.instance_id == instance_id)
+                .order_by(WorkflowHistory.created_at.asc())
+            )
+            history_rows = result.scalars().all()
+
+            if not history_rows:
+                return 0
+
+            # Archive each history entry
+            for row in history_rows:
+                # Convert event_data to JSON string for archive
+                event_data_json: str | None
+                if row.data_type == "binary" and row.event_data_binary is not None:
+                    # Convert binary to base64 for JSON storage
+                    event_data_json = json.dumps(
+                        {
+                            "_binary": True,
+                            "data": base64.b64encode(row.event_data_binary).decode("ascii"),
+                        }
+                    )
+                else:
+                    # Already JSON, use as-is
+                    event_data_json = row.event_data
+
+                archive_entry = WorkflowHistoryArchive(
+                    instance_id=row.instance_id,
+                    activity_id=row.activity_id,
+                    event_type=row.event_type,
+                    event_data=event_data_json,
+                    created_at=row.created_at,
+                )
+                session.add(archive_entry)
+
+            # Delete original history entries
+            await session.execute(
+                delete(WorkflowHistory).where(WorkflowHistory.instance_id == instance_id)
+            )
+
+            await self._commit_if_not_in_transaction(session)
+            return len(history_rows)
+
+    async def find_first_cancellation_event(self, instance_id: str) -> dict[str, Any] | None:
+        """
+        Find the first cancellation event in workflow history.
+
+        Uses LIMIT 1 optimization to avoid loading all history events.
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Query for cancellation events using LIMIT 1
+            result = await session.execute(
+                select(WorkflowHistory)
+                .where(
+                    and_(
+                        WorkflowHistory.instance_id == instance_id,
+                        or_(
+                            WorkflowHistory.event_type == "WorkflowCancelled",
+                            func.lower(WorkflowHistory.event_type).contains("cancel"),
+                        ),
+                    )
+                )
+                .order_by(WorkflowHistory.created_at.asc())
+                .limit(1)
+            )
+            row = result.scalars().first()
+
+            if row is None:
+                return None
+
+            # Parse event_data based on data_type
+            if row.data_type == "binary" and row.event_data_binary is not None:
+                event_data: dict[str, Any] | bytes = row.event_data_binary
+            else:
+                event_data = json.loads(row.event_data) if row.event_data else {}
+
+            return {
+                "id": row.id,
+                "instance_id": row.instance_id,
+                "activity_id": row.activity_id,
+                "event_type": row.event_type,
+                "event_data": event_data,
+                "created_at": row.created_at,
+            }
+
     # -------------------------------------------------------------------------
     # Compensation Methods (prefer external session)
     # -------------------------------------------------------------------------
@@ -1271,7 +1880,7 @@ class SQLAlchemyStorage:
                     "instance_id": row.instance_id,
                     "activity_id": row.activity_id,
                     "activity_name": row.activity_name,
-                    "args": json.loads(row.args),  # type: ignore[arg-type]
+                    "args": json.loads(row.args) if row.args else [],
                     "created_at": row.created_at.isoformat(),
                 }
                 for row in rows
@@ -1287,207 +1896,8 @@ class SQLAlchemyStorage:
             await self._commit_if_not_in_transaction(session)
 
     # -------------------------------------------------------------------------
-    # Event Subscription Methods (prefer external session for registration)
+    # Timer Subscription Methods
     # -------------------------------------------------------------------------
-
-    async def add_event_subscription(
-        self,
-        instance_id: str,
-        event_type: str,
-        timeout_at: datetime | None = None,
-    ) -> None:
-        """Register an event wait subscription."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            subscription = WorkflowEventSubscription(
-                instance_id=instance_id,
-                event_type=event_type,
-                timeout_at=timeout_at,
-            )
-            session.add(subscription)
-            await self._commit_if_not_in_transaction(session)
-
-    async def find_waiting_instances(self, event_type: str) -> list[dict[str, Any]]:
-        """Find workflow instances waiting for a specific event type."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            result = await session.execute(
-                select(WorkflowEventSubscription).where(
-                    and_(
-                        WorkflowEventSubscription.event_type == event_type,
-                        or_(
-                            WorkflowEventSubscription.timeout_at.is_(None),
-                            self._make_datetime_comparable(WorkflowEventSubscription.timeout_at)
-                            > self._get_current_time_expr(),
-                        ),
-                    )
-                )
-            )
-            rows = result.scalars().all()
-
-            return [
-                {
-                    "id": row.id,
-                    "instance_id": row.instance_id,
-                    "event_type": row.event_type,
-                    "activity_id": row.activity_id,
-                    "timeout_at": row.timeout_at.isoformat() if row.timeout_at else None,
-                    "created_at": row.created_at.isoformat(),
-                }
-                for row in rows
-            ]
-
-    async def remove_event_subscription(
-        self,
-        instance_id: str,
-        event_type: str,
-    ) -> None:
-        """Remove event subscription after the event is received."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            await session.execute(
-                delete(WorkflowEventSubscription).where(
-                    and_(
-                        WorkflowEventSubscription.instance_id == instance_id,
-                        WorkflowEventSubscription.event_type == event_type,
-                    )
-                )
-            )
-            await self._commit_if_not_in_transaction(session)
-
-    async def cleanup_expired_subscriptions(self) -> int:
-        """Clean up event subscriptions that have timed out."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            result = await session.execute(
-                delete(WorkflowEventSubscription).where(
-                    and_(
-                        WorkflowEventSubscription.timeout_at.isnot(None),
-                        self._make_datetime_comparable(WorkflowEventSubscription.timeout_at)
-                        <= self._get_current_time_expr(),
-                    )
-                )
-            )
-            await self._commit_if_not_in_transaction(session)
-            return result.rowcount or 0  # type: ignore[attr-defined]
-
-    async def find_expired_event_subscriptions(self) -> list[dict[str, Any]]:
-        """Find event subscriptions that have timed out."""
-        session = self._get_session_for_operation()
-        async with self._session_scope(session) as session:
-            result = await session.execute(
-                select(
-                    WorkflowEventSubscription.instance_id,
-                    WorkflowEventSubscription.event_type,
-                    WorkflowEventSubscription.activity_id,
-                    WorkflowEventSubscription.timeout_at,
-                    WorkflowEventSubscription.created_at,
-                ).where(
-                    and_(
-                        WorkflowEventSubscription.timeout_at.isnot(None),
-                        self._make_datetime_comparable(WorkflowEventSubscription.timeout_at)
-                        <= self._get_current_time_expr(),
-                    )
-                )
-            )
-            rows = result.all()
-
-            return [
-                {
-                    "instance_id": row[0],
-                    "event_type": row[1],
-                    "activity_id": row[2],
-                    "timeout_at": row[3].isoformat() if row[3] else None,
-                    "created_at": row[4].isoformat() if row[4] else None,
-                }
-                for row in rows
-            ]
-
-    async def register_event_subscription_and_release_lock(
-        self,
-        instance_id: str,
-        worker_id: str,
-        event_type: str,
-        timeout_at: datetime | None = None,
-        activity_id: str | None = None,
-    ) -> None:
-        """
-        Atomically register event subscription and release workflow lock.
-
-        This performs THREE operations in a SINGLE transaction:
-        1. Register event subscription
-        2. Update current activity
-        3. Release lock
-
-        This ensures distributed coroutines work correctly - when a workflow
-        calls wait_event(), the subscription is registered and lock is released
-        atomically, so ANY worker can resume the workflow when the event arrives.
-
-        Note: Uses LOCK operation session (separate from external session).
-        """
-        session = self._get_session_for_operation(is_lock_operation=True)
-        async with self._session_scope(session) as session, session.begin():
-            # 1. Verify we hold the lock (sanity check)
-            result = await session.execute(
-                select(WorkflowInstance.locked_by).where(
-                    WorkflowInstance.instance_id == instance_id
-                )
-            )
-            row = result.one_or_none()
-
-            if row is None:
-                raise RuntimeError(f"Workflow instance {instance_id} not found")
-
-            current_lock_holder = row[0]
-            if current_lock_holder != worker_id:
-                raise RuntimeError(
-                    f"Cannot release lock: worker {worker_id} does not hold lock "
-                    f"for {instance_id} (held by: {current_lock_holder})"
-                )
-
-            # 2. Register event subscription (INSERT OR REPLACE equivalent)
-            # First delete existing
-            await session.execute(
-                delete(WorkflowEventSubscription).where(
-                    and_(
-                        WorkflowEventSubscription.instance_id == instance_id,
-                        WorkflowEventSubscription.event_type == event_type,
-                    )
-                )
-            )
-
-            # Then insert new
-            subscription = WorkflowEventSubscription(
-                instance_id=instance_id,
-                event_type=event_type,
-                activity_id=activity_id,
-                timeout_at=timeout_at,
-            )
-            session.add(subscription)
-
-            # 3. Update current activity (if provided)
-            if activity_id is not None:
-                await session.execute(
-                    update(WorkflowInstance)
-                    .where(WorkflowInstance.instance_id == instance_id)
-                    .values(current_activity_id=activity_id, updated_at=func.now())
-                )
-
-            # 4. Release lock
-            await session.execute(
-                update(WorkflowInstance)
-                .where(
-                    and_(
-                        WorkflowInstance.instance_id == instance_id,
-                        WorkflowInstance.locked_by == worker_id,
-                    )
-                )
-                .values(
-                    locked_by=None,
-                    locked_at=None,
-                    updated_at=func.now(),
-                )
-            )
 
     async def register_timer_subscription_and_release_lock(
         self,
@@ -1580,7 +1990,11 @@ class SQLAlchemyStorage:
             )
 
     async def find_expired_timers(self) -> list[dict[str, Any]]:
-        """Find timer subscriptions that have expired."""
+        """Find timer subscriptions that have expired.
+
+        Returns timer info including workflow status to avoid N+1 queries.
+        The SQL query already filters by status='waiting_for_timer'.
+        """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             result = await session.execute(
@@ -1590,6 +2004,7 @@ class SQLAlchemyStorage:
                     WorkflowTimerSubscription.expires_at,
                     WorkflowTimerSubscription.activity_id,
                     WorkflowInstance.workflow_name,
+                    WorkflowInstance.status,  # Include status to avoid N+1 query
                 )
                 .join(
                     WorkflowInstance,
@@ -1612,6 +2027,7 @@ class SQLAlchemyStorage:
                     "expires_at": row[2].isoformat(),
                     "activity_id": row[3],
                     "workflow_name": row[4],
+                    "status": row[5],  # Always 'waiting_for_timer' due to WHERE clause
                 }
                 for row in rows
             ]
@@ -1866,6 +2282,7 @@ class SQLAlchemyStorage:
                 "running",
                 "waiting_for_event",
                 "waiting_for_timer",
+                "waiting_for_message",
                 "compensating",
             ):
                 # Already completed, failed, or cancelled
@@ -1890,14 +2307,6 @@ class SQLAlchemyStorage:
                 )
             )
 
-            # Remove event subscriptions if waiting for event
-            if current_status == "waiting_for_event":
-                await session.execute(
-                    delete(WorkflowEventSubscription).where(
-                        WorkflowEventSubscription.instance_id == instance_id
-                    )
-                )
-
             # Remove timer subscriptions if waiting for timer
             if current_status == "waiting_for_timer":
                 await session.execute(
@@ -1906,4 +2315,1249 @@ class SQLAlchemyStorage:
                     )
                 )
 
+            # Remove message subscriptions if waiting for message
+            await session.execute(
+                delete(WorkflowMessageSubscription).where(
+                    WorkflowMessageSubscription.instance_id == instance_id
+                )
+            )
+
             return True
+
+    # -------------------------------------------------------------------------
+    # Message Subscription Methods
+    # -------------------------------------------------------------------------
+
+    async def register_message_subscription_and_release_lock(
+        self,
+        instance_id: str,
+        worker_id: str,
+        channel: str,
+        timeout_at: datetime | None = None,
+        activity_id: str | None = None,
+    ) -> None:
+        """
+        Atomically register a message subscription and release the workflow lock.
+
+        This is called when a workflow executes wait_message() and needs to:
+        1. Verify lock ownership (RuntimeError if mismatch - full rollback)
+        2. Register a subscription for the channel
+        3. Update the workflow status to waiting_for_message
+        4. Release the lock
+
+        All operations happen in a single transaction for atomicity.
+
+        Args:
+            instance_id: Workflow instance ID
+            worker_id: Worker ID that must hold the current lock (verified before release)
+            channel: Channel name to subscribe to
+            timeout_at: Optional absolute timeout time
+            activity_id: Activity ID for the wait operation
+
+        Raises:
+            RuntimeError: If the worker does not hold the lock (entire operation rolls back)
+        """
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session, session.begin():
+            # 1. Verify we hold the lock (sanity check - fail fast if not)
+            result = await session.execute(
+                select(WorkflowInstance.locked_by).where(
+                    WorkflowInstance.instance_id == instance_id
+                )
+            )
+            row = result.one_or_none()
+
+            if row is None:
+                raise RuntimeError(f"Workflow instance {instance_id} not found")
+
+            current_lock_holder = row[0]
+            if current_lock_holder != worker_id:
+                raise RuntimeError(
+                    f"Cannot release lock: worker {worker_id} does not hold lock "
+                    f"for {instance_id} (held by: {current_lock_holder})"
+                )
+
+            # 2. Register subscription (delete then insert for cross-database compatibility)
+            await session.execute(
+                delete(WorkflowMessageSubscription).where(
+                    and_(
+                        WorkflowMessageSubscription.instance_id == instance_id,
+                        WorkflowMessageSubscription.channel == channel,
+                    )
+                )
+            )
+
+            subscription = WorkflowMessageSubscription(
+                instance_id=instance_id,
+                channel=channel,
+                activity_id=activity_id,
+                timeout_at=timeout_at,
+            )
+            session.add(subscription)
+
+            # 3. Update workflow status and activity
+            await session.execute(
+                update(WorkflowInstance)
+                .where(WorkflowInstance.instance_id == instance_id)
+                .values(
+                    status="waiting_for_message",
+                    current_activity_id=activity_id,
+                    updated_at=func.now(),
+                )
+            )
+
+            # 4. Release the lock (with ownership check for extra safety)
+            await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.locked_by == worker_id,
+                    )
+                )
+                .values(
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                )
+            )
+
+    async def find_waiting_instances_by_channel(self, channel: str) -> list[dict[str, Any]]:
+        """
+        Find all workflow instances waiting on a specific channel.
+
+        Args:
+            channel: Channel name to search for
+
+        Returns:
+            List of subscription info dicts with instance_id, channel, activity_id, timeout_at
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(WorkflowMessageSubscription).where(
+                    WorkflowMessageSubscription.channel == channel
+                )
+            )
+            subscriptions = result.scalars().all()
+            return [
+                {
+                    "instance_id": sub.instance_id,
+                    "channel": sub.channel,
+                    "activity_id": sub.activity_id,
+                    "timeout_at": sub.timeout_at.isoformat() if sub.timeout_at else None,
+                    "created_at": sub.created_at.isoformat() if sub.created_at else None,
+                }
+                for sub in subscriptions
+            ]
+
+    async def remove_message_subscription(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Remove a message subscription.
+
+        This method removes from the legacy WorkflowMessageSubscription table
+        and clears waiting state from the ChannelSubscription table.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Remove from legacy WorkflowMessageSubscription table
+            await session.execute(
+                delete(WorkflowMessageSubscription).where(
+                    and_(
+                        WorkflowMessageSubscription.instance_id == instance_id,
+                        WorkflowMessageSubscription.channel == channel,
+                    )
+                )
+            )
+
+            # Clear waiting state from ChannelSubscription table
+            # Don't delete the subscription - just clear the waiting state
+            await session.execute(
+                update(ChannelSubscription)
+                .where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+                .values(activity_id=None, timeout_at=None)
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def deliver_message(
+        self,
+        instance_id: str,
+        channel: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any],
+        worker_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Deliver a message to a waiting workflow using Lock-First pattern.
+
+        This method:
+        1. Checks if there's a subscription for this instance/channel
+        2. Acquires lock (Lock-First pattern) - if worker_id provided
+        3. Records the message in history
+        4. Removes the subscription
+        5. Updates status to 'running'
+        6. Releases lock
+
+        Args:
+            instance_id: Target workflow instance ID
+            channel: Channel name
+            data: Message payload (dict or bytes)
+            metadata: Message metadata
+            worker_id: Worker ID for locking. If None, skip locking (legacy mode).
+
+        Returns:
+            Dict with delivery info if successful, None otherwise
+        """
+        import uuid
+
+        # Step 1: Check if subscription exists (without lock)
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(WorkflowMessageSubscription).where(
+                    and_(
+                        WorkflowMessageSubscription.instance_id == instance_id,
+                        WorkflowMessageSubscription.channel == channel,
+                    )
+                )
+            )
+            subscription = result.scalar_one_or_none()
+
+            if subscription is None:
+                return None
+
+            activity_id = subscription.activity_id
+
+        # Step 2: Acquire lock (Lock-First pattern) if worker_id provided
+        lock_acquired = False
+        if worker_id is not None:
+            lock_acquired = await self.try_acquire_lock(instance_id, worker_id)
+            if not lock_acquired:
+                # Another worker is processing this workflow
+                return None
+
+        try:
+            # Step 3-5: Deliver message atomically
+            session = self._get_session_for_operation()
+            async with self._session_scope(session) as session:
+                # Re-check subscription (may have been removed by another worker)
+                result = await session.execute(
+                    select(WorkflowMessageSubscription).where(
+                        and_(
+                            WorkflowMessageSubscription.instance_id == instance_id,
+                            WorkflowMessageSubscription.channel == channel,
+                        )
+                    )
+                )
+                subscription = result.scalar_one_or_none()
+
+                if subscription is None:
+                    # Already delivered by another worker
+                    return None
+
+                activity_id = subscription.activity_id
+
+                # Get workflow info for return value
+                instance_result = await session.execute(
+                    select(WorkflowInstance).where(WorkflowInstance.instance_id == instance_id)
+                )
+                instance = instance_result.scalar_one_or_none()
+                workflow_name = instance.workflow_name if instance else "unknown"
+
+                # Build message data for history
+                message_id = str(uuid.uuid4())
+                message_data = {
+                    "id": message_id,
+                    "channel": channel,
+                    "data": data if isinstance(data, dict) else None,
+                    "metadata": metadata,
+                }
+
+                # Handle binary data
+                if isinstance(data, bytes):
+                    data_type = "binary"
+                    event_data_json = None
+                    event_data_binary = data
+                else:
+                    data_type = "json"
+                    event_data_json = json.dumps(message_data)
+                    event_data_binary = None
+
+                # Record in history
+                history_entry = WorkflowHistory(
+                    instance_id=instance_id,
+                    activity_id=activity_id,
+                    event_type="ChannelMessageReceived",
+                    data_type=data_type,
+                    event_data=event_data_json,
+                    event_data_binary=event_data_binary,
+                )
+                session.add(history_entry)
+
+                # Remove subscription
+                await session.execute(
+                    delete(WorkflowMessageSubscription).where(
+                        and_(
+                            WorkflowMessageSubscription.instance_id == instance_id,
+                            WorkflowMessageSubscription.channel == channel,
+                        )
+                    )
+                )
+
+                # Update status to 'running' (ready for resumption)
+                await session.execute(
+                    update(WorkflowInstance)
+                    .where(WorkflowInstance.instance_id == instance_id)
+                    .values(status="running", updated_at=func.now())
+                )
+
+                await self._commit_if_not_in_transaction(session)
+
+                return {
+                    "instance_id": instance_id,
+                    "workflow_name": workflow_name,
+                    "activity_id": activity_id,
+                }
+
+        finally:
+            # Step 6: Release lock if we acquired it
+            if lock_acquired and worker_id is not None:
+                await self.release_lock(instance_id, worker_id)
+
+    async def find_expired_message_subscriptions(self) -> list[dict[str, Any]]:
+        """
+        Find all message subscriptions that have timed out.
+
+        This method queries both the legacy WorkflowMessageSubscription table and
+        the ChannelSubscription table for expired subscriptions.
+        JOINs with WorkflowInstance to ensure instance exists and avoid N+1 queries.
+
+        Returns:
+            List of dicts with instance_id, channel, activity_id, timeout_at, created_at, workflow_name
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            results: list[dict[str, Any]] = []
+
+            # Query legacy WorkflowMessageSubscription table with JOIN to verify instance exists
+            legacy_result = await session.execute(
+                select(
+                    WorkflowMessageSubscription.instance_id,
+                    WorkflowMessageSubscription.channel,
+                    WorkflowMessageSubscription.activity_id,
+                    WorkflowMessageSubscription.timeout_at,
+                    WorkflowMessageSubscription.created_at,
+                    WorkflowInstance.workflow_name,
+                )
+                .join(
+                    WorkflowInstance,
+                    WorkflowMessageSubscription.instance_id == WorkflowInstance.instance_id,
+                )
+                .where(
+                    and_(
+                        WorkflowMessageSubscription.timeout_at.isnot(None),
+                        self._make_datetime_comparable(WorkflowMessageSubscription.timeout_at)
+                        <= self._get_current_time_expr(),
+                    )
+                )
+            )
+            legacy_rows = legacy_result.all()
+            results.extend(
+                [
+                    {
+                        "instance_id": row[0],
+                        "channel": row[1],
+                        "activity_id": row[2],
+                        "timeout_at": row[3],
+                        "created_at": row[4],
+                        "workflow_name": row[5],
+                    }
+                    for row in legacy_rows
+                ]
+            )
+
+            # Query ChannelSubscription table with JOIN
+            channel_result = await session.execute(
+                select(
+                    ChannelSubscription.instance_id,
+                    ChannelSubscription.channel,
+                    ChannelSubscription.activity_id,
+                    ChannelSubscription.timeout_at,
+                    ChannelSubscription.subscribed_at,
+                    WorkflowInstance.workflow_name,
+                )
+                .join(
+                    WorkflowInstance,
+                    ChannelSubscription.instance_id == WorkflowInstance.instance_id,
+                )
+                .where(
+                    and_(
+                        ChannelSubscription.timeout_at.isnot(None),
+                        ChannelSubscription.activity_id.isnot(None),  # Only waiting subscriptions
+                        self._make_datetime_comparable(ChannelSubscription.timeout_at)
+                        <= self._get_current_time_expr(),
+                    )
+                )
+            )
+            channel_rows = channel_result.all()
+            results.extend(
+                [
+                    {
+                        "instance_id": row[0],
+                        "channel": row[1],
+                        "activity_id": row[2],
+                        "timeout_at": row[3],
+                        "created_at": row[4],  # subscribed_at as created_at for compatibility
+                        "workflow_name": row[5],
+                    }
+                    for row in channel_rows
+                ]
+            )
+
+            return results
+
+    # -------------------------------------------------------------------------
+    # Group Membership Methods (Erlang pg style)
+    # -------------------------------------------------------------------------
+
+    async def join_group(self, instance_id: str, group_name: str) -> None:
+        """
+        Add a workflow instance to a group.
+
+        Groups provide loose coupling for broadcast messaging.
+        Idempotent - joining a group the instance is already in is a no-op.
+
+        Args:
+            instance_id: Workflow instance ID
+            group_name: Group to join
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Check if already a member (for idempotency)
+            result = await session.execute(
+                select(WorkflowGroupMembership).where(
+                    and_(
+                        WorkflowGroupMembership.instance_id == instance_id,
+                        WorkflowGroupMembership.group_name == group_name,
+                    )
+                )
+            )
+            if result.scalar_one_or_none() is not None:
+                # Already a member, nothing to do
+                return
+
+            # Add membership
+            membership = WorkflowGroupMembership(
+                instance_id=instance_id,
+                group_name=group_name,
+            )
+            session.add(membership)
+            await self._commit_if_not_in_transaction(session)
+
+    async def leave_group(self, instance_id: str, group_name: str) -> None:
+        """
+        Remove a workflow instance from a group.
+
+        Args:
+            instance_id: Workflow instance ID
+            group_name: Group to leave
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                delete(WorkflowGroupMembership).where(
+                    and_(
+                        WorkflowGroupMembership.instance_id == instance_id,
+                        WorkflowGroupMembership.group_name == group_name,
+                    )
+                )
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def get_group_members(self, group_name: str) -> list[str]:
+        """
+        Get all workflow instances in a group.
+
+        Args:
+            group_name: Group name
+
+        Returns:
+            List of instance IDs in the group
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(WorkflowGroupMembership.instance_id).where(
+                    WorkflowGroupMembership.group_name == group_name
+                )
+            )
+            return [row[0] for row in result.fetchall()]
+
+    async def leave_all_groups(self, instance_id: str) -> None:
+        """
+        Remove a workflow instance from all groups.
+
+        Called automatically when a workflow completes or fails.
+
+        Args:
+            instance_id: Workflow instance ID
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                delete(WorkflowGroupMembership).where(
+                    WorkflowGroupMembership.instance_id == instance_id
+                )
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    # -------------------------------------------------------------------------
+    # Workflow Resumption Methods
+    # -------------------------------------------------------------------------
+
+    async def find_resumable_workflows(self) -> list[dict[str, Any]]:
+        """
+        Find workflows that are ready to be resumed.
+
+        Returns workflows with status='running' that don't have an active lock.
+        Used for immediate resumption after message delivery.
+
+        Returns:
+            List of resumable workflows with instance_id and workflow_name.
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(
+                    WorkflowInstance.instance_id,
+                    WorkflowInstance.workflow_name,
+                ).where(
+                    and_(
+                        WorkflowInstance.status == "running",
+                        WorkflowInstance.locked_by.is_(None),
+                    )
+                )
+            )
+            return [
+                {
+                    "instance_id": row.instance_id,
+                    "workflow_name": row.workflow_name,
+                }
+                for row in result.fetchall()
+            ]
+
+    # -------------------------------------------------------------------------
+    # Subscription Cleanup Methods (for recur())
+    # -------------------------------------------------------------------------
+
+    async def cleanup_instance_subscriptions(self, instance_id: str) -> None:
+        """
+        Remove all subscriptions for a workflow instance.
+
+        Called during recur() to clean up event/timer/message subscriptions
+        before archiving the history.
+
+        Args:
+            instance_id: Workflow instance ID to clean up
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Remove timer subscriptions
+            await session.execute(
+                delete(WorkflowTimerSubscription).where(
+                    WorkflowTimerSubscription.instance_id == instance_id
+                )
+            )
+
+            # Remove message subscriptions (legacy)
+            await session.execute(
+                delete(WorkflowMessageSubscription).where(
+                    WorkflowMessageSubscription.instance_id == instance_id
+                )
+            )
+
+            # Remove channel subscriptions
+            await session.execute(
+                delete(ChannelSubscription).where(ChannelSubscription.instance_id == instance_id)
+            )
+
+            # Remove channel message claims
+            await session.execute(
+                delete(ChannelMessageClaim).where(ChannelMessageClaim.instance_id == instance_id)
+            )
+
+            await self._commit_if_not_in_transaction(session)
+
+    # -------------------------------------------------------------------------
+    # Channel-based Message Queue Methods
+    # -------------------------------------------------------------------------
+
+    async def publish_to_channel(
+        self,
+        channel: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """
+        Publish a message to a channel.
+
+        Messages are persisted to channel_messages and available for subscribers.
+
+        Args:
+            channel: Channel name
+            data: Message payload (dict or bytes)
+            metadata: Optional message metadata
+
+        Returns:
+            Generated message_id (UUID)
+        """
+        import uuid
+
+        message_id = str(uuid.uuid4())
+
+        # Determine data type and serialize
+        if isinstance(data, bytes):
+            data_type = "binary"
+            data_json = None
+            data_binary = data
+        else:
+            data_type = "json"
+            data_json = json.dumps(data)
+            data_binary = None
+
+        metadata_json = json.dumps(metadata) if metadata else None
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            msg = ChannelMessage(
+                channel=channel,
+                message_id=message_id,
+                data_type=data_type,
+                data=data_json,
+                data_binary=data_binary,
+                message_metadata=metadata_json,
+            )
+            session.add(msg)
+            await self._commit_if_not_in_transaction(session)
+
+        return message_id
+
+    async def subscribe_to_channel(
+        self,
+        instance_id: str,
+        channel: str,
+        mode: str,
+    ) -> None:
+        """
+        Subscribe a workflow instance to a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+            mode: 'broadcast' or 'competing'
+
+        Raises:
+            ValueError: If mode is invalid
+        """
+        if mode not in ("broadcast", "competing"):
+            raise ValueError(f"Invalid mode: {mode}. Must be 'broadcast' or 'competing'")
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Check if already subscribed
+            result = await session.execute(
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing is not None:
+                # Already subscribed, update mode if different
+                if existing.mode != mode:
+                    existing.mode = mode
+                    await self._commit_if_not_in_transaction(session)
+                return
+
+            # For broadcast mode, set cursor to current max message id
+            # So subscriber only sees messages published after subscription
+            cursor_message_id = None
+            if mode == "broadcast":
+                result = await session.execute(
+                    select(func.max(ChannelMessage.id)).where(ChannelMessage.channel == channel)
+                )
+                max_id = result.scalar()
+                cursor_message_id = max_id if max_id is not None else 0
+
+            # Create subscription
+            subscription = ChannelSubscription(
+                instance_id=instance_id,
+                channel=channel,
+                mode=mode,
+                cursor_message_id=cursor_message_id,
+            )
+            session.add(subscription)
+            await self._commit_if_not_in_transaction(session)
+
+    async def unsubscribe_from_channel(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Unsubscribe a workflow instance from a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                delete(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def get_channel_subscription(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> dict[str, Any] | None:
+        """
+        Get the subscription info for a workflow instance on a channel.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+
+        Returns:
+            Subscription info dict with: mode, activity_id, cursor_message_id
+            or None if not subscribed
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+            )
+            subscription = result.scalar_one_or_none()
+
+            if subscription is None:
+                return None
+
+            return {
+                "mode": subscription.mode,
+                "activity_id": subscription.activity_id,
+                "cursor_message_id": subscription.cursor_message_id,
+            }
+
+    async def register_channel_receive_and_release_lock(
+        self,
+        instance_id: str,
+        worker_id: str,
+        channel: str,
+        activity_id: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """
+        Atomically register that workflow is waiting for channel message and release lock.
+
+        Args:
+            instance_id: Workflow instance ID
+            worker_id: Worker ID that currently holds the lock
+            channel: Channel name being waited on
+            activity_id: Current activity ID to record
+            timeout_seconds: Optional timeout in seconds for the message wait
+
+        Raises:
+            RuntimeError: If the worker doesn't hold the lock
+            ValueError: If workflow is not subscribed to the channel
+        """
+        async with self.engine.begin() as conn:
+            session = AsyncSession(bind=conn, expire_on_commit=False)
+
+            # Verify lock ownership
+            result = await session.execute(
+                select(WorkflowInstance).where(WorkflowInstance.instance_id == instance_id)
+            )
+            instance = result.scalar_one_or_none()
+
+            if instance is None:
+                raise RuntimeError(f"Instance not found: {instance_id}")
+
+            if instance.locked_by != worker_id:
+                raise RuntimeError(
+                    f"Worker {worker_id} does not hold lock for {instance_id}. "
+                    f"Locked by: {instance.locked_by}"
+                )
+
+            # Verify subscription exists
+            sub_result = await session.execute(
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+            )
+            subscription: ChannelSubscription | None = sub_result.scalar_one_or_none()
+
+            if subscription is None:
+                raise ValueError(f"Instance {instance_id} is not subscribed to channel {channel}")
+
+            # Update subscription to mark as waiting
+            current_time = datetime.now(UTC)
+            subscription.activity_id = activity_id
+            # Calculate timeout_at if timeout_seconds is provided
+            if timeout_seconds is not None:
+                subscription.timeout_at = current_time + timedelta(seconds=timeout_seconds)
+            else:
+                subscription.timeout_at = None
+
+            # Update instance: set activity, status, release lock
+            await session.execute(
+                update(WorkflowInstance)
+                .where(WorkflowInstance.instance_id == instance_id)
+                .values(
+                    current_activity_id=activity_id,
+                    status="waiting_for_message",
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                    updated_at=current_time,
+                )
+            )
+
+            await session.commit()
+
+    async def get_pending_channel_messages(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get pending messages for a subscriber on a channel.
+
+        For broadcast mode: messages with id > cursor_message_id
+        For competing mode: unclaimed messages
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+
+        Returns:
+            List of pending messages
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Get subscription info
+            sub_result = await session.execute(
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+            )
+            subscription = sub_result.scalar_one_or_none()
+
+            if subscription is None:
+                return []
+
+            if subscription.mode == "broadcast":
+                # Get messages after cursor
+                cursor = subscription.cursor_message_id or 0
+                msg_result = await session.execute(
+                    select(ChannelMessage)
+                    .where(
+                        and_(
+                            ChannelMessage.channel == channel,
+                            ChannelMessage.id > cursor,
+                        )
+                    )
+                    .order_by(ChannelMessage.published_at.asc())
+                )
+            else:  # competing
+                # Get unclaimed messages (not in channel_message_claims)
+                subquery = select(ChannelMessageClaim.message_id)
+                msg_result = await session.execute(
+                    select(ChannelMessage)
+                    .where(
+                        and_(
+                            ChannelMessage.channel == channel,
+                            ChannelMessage.message_id.not_in(subquery),
+                        )
+                    )
+                    .order_by(ChannelMessage.published_at.asc())
+                )
+
+            messages = msg_result.scalars().all()
+            return [
+                {
+                    "id": msg.id,
+                    "message_id": msg.message_id,
+                    "channel": msg.channel,
+                    "data": (
+                        msg.data_binary
+                        if msg.data_type == "binary"
+                        else json.loads(msg.data) if msg.data else {}
+                    ),
+                    "metadata": json.loads(msg.message_metadata) if msg.message_metadata else {},
+                    "published_at": msg.published_at.isoformat() if msg.published_at else None,
+                }
+                for msg in messages
+            ]
+
+    async def claim_channel_message(
+        self,
+        message_id: str,
+        instance_id: str,
+    ) -> bool:
+        """
+        Claim a message for competing consumption.
+
+        Uses INSERT with conflict check to ensure only one subscriber claims.
+
+        Args:
+            message_id: Message ID to claim
+            instance_id: Workflow instance claiming the message
+
+        Returns:
+            True if claim succeeded, False if already claimed
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            try:
+                # Check if already claimed
+                result = await session.execute(
+                    select(ChannelMessageClaim).where(ChannelMessageClaim.message_id == message_id)
+                )
+                if result.scalar_one_or_none() is not None:
+                    return False  # Already claimed
+
+                claim = ChannelMessageClaim(
+                    message_id=message_id,
+                    instance_id=instance_id,
+                )
+                session.add(claim)
+                await self._commit_if_not_in_transaction(session)
+                return True
+            except Exception:
+                return False
+
+    async def delete_channel_message(self, message_id: str) -> None:
+        """
+        Delete a message from the channel queue.
+
+        Args:
+            message_id: Message ID to delete
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Delete claim first (foreign key)
+            await session.execute(
+                delete(ChannelMessageClaim).where(ChannelMessageClaim.message_id == message_id)
+            )
+            # Delete message
+            await session.execute(
+                delete(ChannelMessage).where(ChannelMessage.message_id == message_id)
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def update_delivery_cursor(
+        self,
+        channel: str,
+        instance_id: str,
+        message_id: int,
+    ) -> None:
+        """
+        Update the delivery cursor for broadcast mode.
+
+        Args:
+            channel: Channel name
+            instance_id: Subscriber instance ID
+            message_id: Last delivered message's internal ID
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # Update subscription cursor
+            await session.execute(
+                update(ChannelSubscription)
+                .where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+                .values(cursor_message_id=message_id)
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def get_channel_subscribers_waiting(
+        self,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get channel subscribers that are waiting (activity_id is set).
+
+        Args:
+            channel: Channel name
+
+        Returns:
+            List of waiting subscribers
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.channel == channel,
+                        ChannelSubscription.activity_id.isnot(None),
+                    )
+                )
+            )
+            subscriptions = result.scalars().all()
+            return [
+                {
+                    "instance_id": sub.instance_id,
+                    "channel": sub.channel,
+                    "mode": sub.mode,
+                    "activity_id": sub.activity_id,
+                }
+                for sub in subscriptions
+            ]
+
+    async def clear_channel_waiting_state(
+        self,
+        instance_id: str,
+        channel: str,
+    ) -> None:
+        """
+        Clear the waiting state for a channel subscription.
+
+        Args:
+            instance_id: Workflow instance ID
+            channel: Channel name
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                update(ChannelSubscription)
+                .where(
+                    and_(
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                    )
+                )
+                .values(activity_id=None)
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def deliver_channel_message(
+        self,
+        instance_id: str,
+        channel: str,
+        message_id: str,
+        data: dict[str, Any] | bytes,
+        metadata: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        """
+        Deliver a channel message to a waiting workflow.
+
+        Uses Lock-First pattern for distributed safety.
+
+        Args:
+            instance_id: Target workflow instance ID
+            channel: Channel name
+            message_id: Message ID being delivered
+            data: Message payload
+            metadata: Message metadata
+            worker_id: Worker ID for locking
+
+        Returns:
+            Delivery info if successful, None if failed
+        """
+        try:
+            # Try to acquire lock
+            if not await self.try_acquire_lock(instance_id, worker_id):
+                logger.debug(f"Failed to acquire lock for {instance_id}")
+                return None
+
+            try:
+                async with self.engine.begin() as conn:
+                    session = AsyncSession(bind=conn, expire_on_commit=False)
+
+                    # Get subscription info
+                    result = await session.execute(
+                        select(ChannelSubscription).where(
+                            and_(
+                                ChannelSubscription.instance_id == instance_id,
+                                ChannelSubscription.channel == channel,
+                            )
+                        )
+                    )
+                    subscription = result.scalar_one_or_none()
+
+                    if subscription is None or subscription.activity_id is None:
+                        logger.debug(f"No waiting subscription for {instance_id} on {channel}")
+                        return None
+
+                    activity_id = subscription.activity_id
+
+                    # Get instance info for return value
+                    result = await session.execute(
+                        select(WorkflowInstance.workflow_name).where(
+                            WorkflowInstance.instance_id == instance_id
+                        )
+                    )
+                    row = result.one_or_none()
+                    if row is None:
+                        return None
+                    workflow_name = row[0]
+
+                    # Prepare message data for history
+                    # Use "id" key to match what context.py expects when loading history
+                    current_time = datetime.now(UTC)
+                    message_result = {
+                        "id": message_id,
+                        "channel": channel,
+                        "data": data if isinstance(data, dict) else None,
+                        "metadata": metadata,
+                        "published_at": current_time.isoformat(),
+                    }
+
+                    # Record to history
+                    if isinstance(data, bytes):
+                        history = WorkflowHistory(
+                            instance_id=instance_id,
+                            activity_id=activity_id,
+                            event_type="ChannelMessageReceived",
+                            data_type="binary",
+                            event_data=None,
+                            event_data_binary=data,
+                        )
+                    else:
+                        history = WorkflowHistory(
+                            instance_id=instance_id,
+                            activity_id=activity_id,
+                            event_type="ChannelMessageReceived",
+                            data_type="json",
+                            event_data=json.dumps(message_result),
+                            event_data_binary=None,
+                        )
+                    session.add(history)
+
+                    # Handle mode-specific logic
+                    if subscription.mode == "broadcast":
+                        # Get message internal id to update cursor
+                        result = await session.execute(
+                            select(ChannelMessage.id).where(ChannelMessage.message_id == message_id)
+                        )
+                        msg_row = result.one_or_none()
+                        if msg_row:
+                            subscription.cursor_message_id = msg_row[0]
+                    else:  # competing
+                        # Claim and delete the message
+                        claim = ChannelMessageClaim(
+                            message_id=message_id,
+                            instance_id=instance_id,
+                        )
+                        session.add(claim)
+
+                        # Delete the message (competing mode consumes it)
+                        await session.execute(
+                            delete(ChannelMessage).where(ChannelMessage.message_id == message_id)
+                        )
+
+                    # Clear waiting state
+                    subscription.activity_id = None
+
+                    # Update instance status to running
+                    current_time = datetime.now(UTC)
+                    await session.execute(
+                        update(WorkflowInstance)
+                        .where(WorkflowInstance.instance_id == instance_id)
+                        .values(
+                            status="running",
+                            updated_at=current_time,
+                        )
+                    )
+
+                    await session.commit()
+
+                return {
+                    "instance_id": instance_id,
+                    "workflow_name": workflow_name,
+                    "activity_id": activity_id,
+                }
+
+            finally:
+                # Always release lock
+                await self.release_lock(instance_id, worker_id)
+
+        except Exception as e:
+            logger.error(f"Error delivering channel message: {e}")
+            return None
+
+    async def cleanup_old_channel_messages(self, older_than_days: int = 7) -> int:
+        """
+        Clean up old messages from channel queues.
+
+        Args:
+            older_than_days: Message retention period in days
+
+        Returns:
+            Number of messages deleted
+        """
+        cutoff_time = datetime.now(UTC) - timedelta(days=older_than_days)
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            # First delete claims for old messages
+            await session.execute(
+                delete(ChannelMessageClaim).where(
+                    ChannelMessageClaim.message_id.in_(
+                        select(ChannelMessage.message_id).where(
+                            self._make_datetime_comparable(ChannelMessage.published_at)
+                            < self._get_current_time_expr()
+                        )
+                    )
+                )
+            )
+
+            # Delete old messages
+            result = await session.execute(
+                delete(ChannelMessage)
+                .where(ChannelMessage.published_at < cutoff_time)
+                .returning(ChannelMessage.id)
+            )
+            deleted_ids = result.fetchall()
+            await self._commit_if_not_in_transaction(session)
+
+            return len(deleted_ids)

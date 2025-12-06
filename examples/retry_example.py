@@ -13,18 +13,17 @@ Run:
 """
 
 import asyncio
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from edda import (
     EddaApp,
-    workflow,
-    activity,
-    WorkflowContext,
+    RetryExhaustedError,
     RetryPolicy,
     TerminalError,
-    RetryExhaustedError,
+    WorkflowContext,
+    activity,
+    workflow,
 )
-
 
 # ============================================================================
 # Example 1: Default Retry (5 attempts, exponential backoff)
@@ -35,7 +34,7 @@ api_call_count = 0
 
 
 @activity  # Uses default retry policy (5 attempts)
-async def call_flaky_api(ctx: WorkflowContext, url: str) -> dict:
+async def call_flaky_api(_ctx: WorkflowContext, _url: str) -> dict:
     """
     Simulates a flaky API that fails the first 2 times, then succeeds.
 
@@ -88,7 +87,7 @@ payment_attempt_count = 0
         max_duration=60.0,  # Stop after 1 minute total
     )
 )
-async def process_critical_payment(ctx: WorkflowContext, amount: float) -> dict:
+async def process_critical_payment(_ctx: WorkflowContext, amount: float) -> dict:
     """
     Critical payment processing with aggressive retry policy.
 
@@ -107,7 +106,7 @@ async def process_critical_payment(ctx: WorkflowContext, amount: float) -> dict:
     if payment_attempt_count < 4:
         raise ConnectionError(f"Payment gateway timeout (attempt {payment_attempt_count})")
 
-    print(f"✅ Payment processed successfully!")
+    print("✅ Payment processed successfully!")
     return {"transaction_id": f"TXN-{payment_attempt_count}", "amount": amount}
 
 
@@ -129,7 +128,7 @@ async def custom_retry_workflow(ctx: WorkflowContext, amount: float) -> dict:
 
 
 @activity
-async def validate_user(ctx: WorkflowContext, user_id: str) -> dict:
+async def validate_user(_ctx: WorkflowContext, user_id: str) -> dict:
     """
     Validates user existence.
 
@@ -175,7 +174,7 @@ order_attempt_count = 0
 
 
 @activity(retry_policy=RetryPolicy(max_attempts=3, initial_interval=0.1))
-async def place_order(ctx: WorkflowContext, order_id: str) -> dict:
+async def place_order(_ctx: WorkflowContext, order_id: str) -> dict:
     """
     Order placement that always fails (to demonstrate RetryExhaustedError).
     """
@@ -189,7 +188,7 @@ async def place_order(ctx: WorkflowContext, order_id: str) -> dict:
 
 
 @activity
-async def notify_failure(ctx: WorkflowContext, order_id: str, error: str) -> dict:
+async def notify_failure(_ctx: WorkflowContext, order_id: str, error: str) -> dict:
     """Notification sent when order placement fails."""
     print(f"📧 Sending failure notification for order {order_id}")
     print(f"   Error: {error}")
@@ -208,7 +207,7 @@ async def retry_exhausted_workflow(ctx: WorkflowContext, order_id: str) -> dict:
         return {"status": "completed", "result": result}
 
     except RetryExhaustedError as e:
-        print(f"\n⚠️ RetryExhaustedError caught!")
+        print("\n⚠️ RetryExhaustedError caught!")
         print(f"   Message: {e}")
         print(f"   Original error: {e.__cause__}")  # Exception chaining
 
@@ -229,7 +228,7 @@ async def retry_exhausted_workflow(ctx: WorkflowContext, order_id: str) -> dict:
 
 
 @activity
-async def unreliable_service(ctx: WorkflowContext, service_name: str) -> dict:
+async def unreliable_service(_ctx: WorkflowContext, service_name: str) -> dict:
     """Service that fails once before succeeding."""
     # Access current step to check if this is a retry
     print(f"🔧 Calling {service_name} service...")
@@ -237,10 +236,10 @@ async def unreliable_service(ctx: WorkflowContext, service_name: str) -> dict:
     # Simple counter-based failure (fails first time)
     if not hasattr(unreliable_service, "called"):
         unreliable_service.called = True
-        print(f"   First call - simulating failure")
+        print("   First call - simulating failure")
         raise ConnectionError(f"{service_name} service timeout")
 
-    print(f"   Second call - success!")
+    print("   Second call - success!")
     return {"service": service_name, "status": "operational"}
 
 
@@ -324,9 +323,9 @@ async def main():
         print("✅ All examples completed!")
         print("=" * 70)
         print(
-            f"\n💡 View workflow history in Viewer UI:"
-            f"\n   python viewer_app.py"
-            f"\n   http://localhost:8080"
+            "\n💡 View workflow history in Viewer UI:"
+            "\n   python viewer_app.py"
+            "\n   http://localhost:8080"
         )
 
     except Exception as e:

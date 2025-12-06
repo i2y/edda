@@ -1,8 +1,11 @@
 """
 Tests for atomic wait_event transaction.
 
-These tests verify that event subscription registration and lock release
+These tests verify that channel subscription registration and lock release
 happen atomically in a single database transaction.
+
+Note: CloudEvents (wait_event) internally uses Channel-based Message Queue (receive),
+so these tests verify the underlying channel subscription atomic behavior.
 """
 
 import uuid
@@ -10,8 +13,8 @@ import uuid
 import pytest
 
 from edda import workflow
+from edda.channels import wait_event
 from edda.context import WorkflowContext
-from edda.events import wait_event
 from edda.replay import ReplayEngine
 
 # Use sqlite_storage and create_test_instance from conftest.py
@@ -44,17 +47,23 @@ class TestAtomicWaitEvent:
         instance = await sqlite_storage.get_instance(instance_id)
         assert instance["locked_by"] == "worker-1"
 
-        # Call atomic method
-        await sqlite_storage.register_event_subscription_and_release_lock(
+        # First subscribe to channel, then call atomic method
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="test.event",
+            mode="broadcast",
+        )
+
+        # Call atomic method (registers receive and releases lock atomically)
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="worker-1",
-            event_type="test.event",
-            timeout_at=None,
-            activity_id="wait_event_test.event:1",
+            channel="test.event",
+            activity_id="receive_test.event:1",
         )
 
         # Verify subscription was registered
-        subscriptions = await sqlite_storage.find_waiting_instances("test.event")
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("test.event")
         assert len(subscriptions) == 1
         assert subscriptions[0]["instance_id"] == instance_id
 
@@ -64,7 +73,7 @@ class TestAtomicWaitEvent:
         assert instance["locked_at"] is None
 
         # Verify activity_id was updated
-        assert instance["current_activity_id"] == "wait_event_test.event:1"
+        assert instance["current_activity_id"] == "receive_test.event:1"
 
     @pytest.mark.asyncio
     async def test_atomic_method_fails_if_worker_doesnt_hold_lock(
@@ -83,19 +92,26 @@ class TestAtomicWaitEvent:
         # Acquire lock with worker-1
         await sqlite_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
 
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="test.event",
+            mode="broadcast",
+        )
+
         # Try to use atomic method with worker-2 (should fail)
         with pytest.raises(RuntimeError, match="does not hold lock"):
-            await sqlite_storage.register_event_subscription_and_release_lock(
+            await sqlite_storage.register_channel_receive_and_release_lock(
                 instance_id=instance_id,
                 worker_id="worker-2",
-                event_type="test.event",
-                timeout_at=None,
-                activity_id="wait_event_test.event:1",
+                channel="test.event",
+                activity_id="receive_test.event:1",
             )
 
-        # Verify subscription was NOT registered (transaction rolled back)
-        subscriptions = await sqlite_storage.find_waiting_instances("test.event")
-        assert len(subscriptions) == 0
+        # Verify activity_id was NOT updated (transaction rolled back)
+        # The subscription still exists but no activity_id is set
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("test.event")
+        assert len(subscriptions) == 0  # Not waiting (no activity_id set)
 
         # Verify lock is still held by worker-1
         instance = await sqlite_storage.get_instance(instance_id)
@@ -126,25 +142,23 @@ class TestAtomicWaitEvent:
 
         # Verify workflow is waiting
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
 
         # Verify lock was released (atomic operation succeeded)
         assert instance["locked_by"] is None
 
-        # Verify subscription was registered
-        subscriptions = await sqlite_storage.find_waiting_instances("payment.received")
+        # Verify subscription was registered (CloudEvents uses channel subscriptions)
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("payment.received")
         assert len(subscriptions) == 1
         assert subscriptions[0]["instance_id"] == instance_id
 
         # Verify activity_id was updated
-        assert instance["current_activity_id"] == "wait_event_payment.received:1"
+        assert instance["current_activity_id"] == "receive_payment.received:1"
 
     @pytest.mark.asyncio
-    async def test_atomic_method_with_timeout(self, sqlite_storage, create_test_instance):
-        """Test atomic method correctly stores timeout."""
-        from datetime import UTC, datetime, timedelta
-
-        instance_id = f"test-timeout-{uuid.uuid4().hex[:8]}"
+    async def test_atomic_method_sets_activity_id(self, sqlite_storage, create_test_instance):
+        """Test atomic method correctly sets activity_id for waiting state."""
+        instance_id = f"test-activity-id-{uuid.uuid4().hex[:8]}"
         await create_test_instance(
             instance_id=instance_id,
             workflow_name="test_workflow",
@@ -153,22 +167,25 @@ class TestAtomicWaitEvent:
 
         await sqlite_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
 
-        # Calculate timeout
-        timeout_at = datetime.now(UTC) + timedelta(seconds=600)
-
-        # Use atomic method with timeout
-        await sqlite_storage.register_event_subscription_and_release_lock(
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
             instance_id=instance_id,
-            worker_id="worker-1",
-            event_type="test.event",
-            timeout_at=timeout_at,
-            activity_id="wait_event_test.event:1",
+            channel="test.event",
+            mode="broadcast",
         )
 
-        # Verify subscription has timeout
-        subscriptions = await sqlite_storage.find_waiting_instances("test.event")
+        # Use atomic method
+        await sqlite_storage.register_channel_receive_and_release_lock(
+            instance_id=instance_id,
+            worker_id="worker-1",
+            channel="test.event",
+            activity_id="receive_test.event:1",
+        )
+
+        # Verify subscription has activity_id set (waiting state)
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("test.event")
         assert len(subscriptions) == 1
-        assert subscriptions[0]["timeout_at"] is not None
+        assert subscriptions[0]["activity_id"] == "receive_test.event:1"
 
     @pytest.mark.asyncio
     async def test_resume_workflow_uses_atomic_method(self, sqlite_storage, create_test_instance):
@@ -197,30 +214,35 @@ class TestAtomicWaitEvent:
 
         # Verify waiting for first event
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
         assert instance["locked_by"] is None  # Lock released atomically
 
-        subscriptions = await sqlite_storage.find_waiting_instances("event.first")
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("event.first")
         assert len(subscriptions) == 1
 
-        # Manually deliver first event and resume
+        # Manually deliver first event and resume (using channel subscription API)
         await sqlite_storage.append_history(
             instance_id,
-            activity_id="wait_event_event.first:1",
-            event_type="EventReceived",
-            event_data={"data": "test1"},
+            activity_id="receive_event.first:1",
+            event_type="ChannelMessageReceived",
+            event_data={
+                "data": {"data": "test1"},
+                "channel": "event.first",
+                "id": "test-msg-1",
+                "metadata": {},
+            },
         )
-        await sqlite_storage.remove_event_subscription(instance_id, "event.first")
+        await sqlite_storage.unsubscribe_from_channel(instance_id, "event.first")
 
         # Resume workflow (will wait for second event)
         await engine.resume_workflow(instance_id=instance_id, workflow_func=multi_wait_workflow)
 
         # Verify waiting for second event with lock released
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
         assert instance["locked_by"] is None  # Lock released atomically on second wait
 
-        subscriptions = await sqlite_storage.find_waiting_instances("event.second")
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("event.second")
         assert len(subscriptions) == 1
 
     @pytest.mark.asyncio
@@ -236,25 +258,31 @@ class TestAtomicWaitEvent:
 
         await sqlite_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
 
-        # Force an error by using invalid instance_id for subscription
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="test.event",
+            mode="broadcast",
+        )
+
+        # Force an error by using invalid worker_id for atomic operation
         # (This is a bit artificial, but demonstrates rollback behavior)
         try:
             # We can't easily force a partial failure, but we can verify
             # that if the lock check fails, nothing else happens
             with pytest.raises(RuntimeError):
-                await sqlite_storage.register_event_subscription_and_release_lock(
+                await sqlite_storage.register_channel_receive_and_release_lock(
                     instance_id=instance_id,
                     worker_id="wrong-worker",  # This should cause lock check to fail
-                    event_type="test.event",
-                    timeout_at=None,
-                    activity_id="wait_event_test.event:1",
+                    channel="test.event",
+                    activity_id="receive_test.event:1",
                 )
         except Exception:
             pass
 
-        # Verify nothing was committed (lock still held, no subscription)
+        # Verify nothing was committed (lock still held, activity_id not set)
         instance = await sqlite_storage.get_instance(instance_id)
         assert instance["locked_by"] == "worker-1"  # Lock not released
 
-        subscriptions = await sqlite_storage.find_waiting_instances("test.event")
-        assert len(subscriptions) == 0  # Subscription not registered
+        subscriptions = await sqlite_storage.get_channel_subscribers_waiting("test.event")
+        assert len(subscriptions) == 0  # No waiting subscription (activity_id not set)

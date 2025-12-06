@@ -511,6 +511,6 @@ For a full demonstration, you would need:
 
 - **[Saga Pattern](../core-features/saga-compensation.md)**: Deep dive into compensation
 - **[Event Handling](../core-features/events/wait-event.md)**: Wait for external events
-- **[Transactional Outbox](../advanced/transactional-outbox.md)**: Reliable event publishing
+- **[Transactional Outbox](../core-features/transactional-outbox.md)**: Reliable event publishing
 - **[Examples](../examples/ecommerce.md)**: More real-world examples
 - **[Viewer UI](../viewer-ui/setup.md)**: Visualize your workflows

@@ -27,6 +27,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
+- 📬 **Channel-based Messaging**: Actor-model style communication with competing (job queue) and broadcast (fan-out) modes
 - 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
@@ -49,14 +50,14 @@ Edda's waiting functions make it ideal for time-based and event-driven business 
 - **📦 Scheduled Notifications**: Shipping updates, subscription renewals, appointment reminders
 
 **Waiting functions**:
-- `wait_timer(duration_seconds)`: Wait for a relative duration
-- `wait_until(until_time)`: Wait until an absolute datetime (e.g., campaign end date)
+- `sleep(seconds)`: Wait for a relative duration
+- `sleep_until(target_time)`: Wait until an absolute datetime (e.g., campaign end date)
 - `wait_event(event_type)`: Wait for external events (near real-time response)
 
 ```python
 @workflow
 async def onboarding_reminder(ctx: WorkflowContext, user_id: str):
-    await wait_timer(ctx, duration_seconds=3*24*60*60)  # Wait 3 days
+    await sleep(ctx, seconds=3*24*60*60)  # Wait 3 days
     if not await check_completed(ctx, user_id):
         await send_reminder(ctx, user_id)
 ```
@@ -108,7 +109,7 @@ graph TB
 
 - Multiple workers can run simultaneously across different pods/servers
 - Each workflow instance runs on only one worker at a time (automatic coordination)
-- `wait_event()` and `wait_timer()` free up worker resources while waiting, resume on any worker when event arrives or timer expires
+- `wait_event()` and `sleep()` free up worker resources while waiting, resume on any worker when event arrives or timer expires
 - Automatic crash recovery with stale lock cleanup and workflow auto-resume
 
 ## Quick Start
@@ -428,7 +429,10 @@ Multiple workers can safely process workflows using database-based exclusive con
 
 app = EddaApp(
     db_url="postgresql://localhost/workflows",  # Shared database for coordination
-    service_name="order-service"
+    service_name="order-service",
+    # Connection pool settings (optional)
+    pool_size=5,        # Concurrent connections
+    max_overflow=10,    # Additional burst capacity
 )
 ```
 
@@ -556,10 +560,32 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str):
     return payment_event.data
 ```
 
-**wait_timer() for time-based waiting**:
+**ReceivedEvent attributes**: The `wait_event()` function returns a `ReceivedEvent` object:
 
 ```python
-from edda import wait_timer
+event = await wait_event(ctx, "payment.completed")
+amount = event.data["amount"]           # Event payload (dict or bytes)
+source = event.metadata.source          # CloudEvents source
+event_type = event.metadata.type        # CloudEvents type
+extensions = event.extensions           # CloudEvents extensions
+```
+
+**Timeout handling with EventTimeoutError**:
+
+```python
+from edda import wait_event, EventTimeoutError
+
+try:
+    event = await wait_event(ctx, "payment.completed", timeout_seconds=60)
+except EventTimeoutError:
+    # Handle timeout (e.g., cancel order, send reminder)
+    await cancel_order(ctx, order_id)
+```
+
+**sleep() for time-based waiting**:
+
+```python
+from edda import sleep
 
 @workflow
 async def order_with_timeout(ctx: WorkflowContext, order_id: str):
@@ -567,7 +593,7 @@ async def order_with_timeout(ctx: WorkflowContext, order_id: str):
     await create_order(ctx, order_id)
 
     # Wait 60 seconds for payment
-    await wait_timer(ctx, duration_seconds=60)
+    await sleep(ctx, seconds=60)
 
     # Check payment status
     return await check_payment(ctx, order_id)
@@ -580,6 +606,136 @@ async def order_with_timeout(ctx: WorkflowContext, order_id: str):
 - No worker is blocked while waiting for events or timers
 
 **For technical details**, see [Multi-Worker Continuations](local-docs/distributed-coroutines.md).
+
+### Message Passing (Workflow-to-Workflow)
+
+Edda provides actor-model style message passing for direct workflow-to-workflow communication:
+
+```python
+from edda import workflow, wait_message, send_message_to, WorkflowContext
+
+# Receiver workflow - waits for approval message
+@workflow
+async def approval_workflow(ctx: WorkflowContext, request_id: str):
+    # Wait for message on "approval" channel
+    msg = await wait_message(ctx, channel="approval")
+
+    if msg.data["approved"]:
+        return {"status": "approved", "approver": msg.data["approver"]}
+    return {"status": "rejected"}
+
+# Sender workflow - sends approval decision
+@workflow
+async def manager_workflow(ctx: WorkflowContext, request_id: str):
+    # Review and make decision
+    decision = await review_request(ctx, request_id)
+
+    # Send message to waiting workflow
+    await send_message_to(
+        ctx,
+        target_instance_id=request_id,
+        channel="approval",
+        data={"approved": decision, "approver": "manager-123"},
+    )
+```
+
+**Group Communication (Erlang pg style)** - for fan-out messaging without knowing receiver instance IDs:
+
+```python
+from edda import workflow, join_group, wait_message, publish_to_group
+
+# Receiver workflow - joins a group and listens
+@workflow
+async def notification_service(ctx: WorkflowContext, service_id: str):
+    # Join group at startup (loose coupling - sender doesn't need to know us)
+    await join_group(ctx, group="order_watchers")
+
+    while True:
+        msg = await wait_message(ctx, channel="order.created")
+        await send_notification(ctx, msg.data)
+
+# Sender workflow - publishes to all group members
+@workflow
+async def order_processor(ctx: WorkflowContext, order_id: str):
+    result = await process_order(ctx, order_id)
+
+    # Broadcast to all watchers (doesn't need to know instance IDs)
+    count = await publish_to_group(
+        ctx,
+        group="order_watchers",
+        channel="order.created",
+        data={"order_id": order_id, "status": "completed"},
+    )
+    print(f"Notified {count} watchers")
+```
+
+**Channel API with Delivery Modes** - subscribe to channels with explicit delivery semantics:
+
+```python
+from edda import workflow, subscribe, receive, publish, WorkflowContext
+
+# Job Worker - processes jobs exclusively (competing mode)
+@workflow
+async def job_worker(ctx: WorkflowContext, worker_id: str):
+    # Subscribe with competing mode - each job goes to ONE worker only
+    await subscribe(ctx, channel="jobs", mode="competing")
+
+    while True:
+        job = await receive(ctx, channel="jobs")  # Get next job
+        await process_job(ctx, job.data)
+        await ctx.recur(worker_id)  # Continue processing
+
+# Notification Handler - receives ALL messages (broadcast mode)
+@workflow
+async def notification_handler(ctx: WorkflowContext, handler_id: str):
+    # Subscribe with broadcast mode - ALL handlers receive each message
+    await subscribe(ctx, channel="notifications", mode="broadcast")
+
+    while True:
+        msg = await receive(ctx, channel="notifications")
+        await send_notification(ctx, msg.data)
+        await ctx.recur(handler_id)
+
+# Publisher - send messages to channel
+await publish(ctx, channel="jobs", data={"task": "send_report"})
+```
+
+**Delivery modes**:
+- **`competing`**: Each message goes to exactly ONE subscriber (job queue/task distribution)
+- **`broadcast`**: Each message goes to ALL subscribers (notifications/fan-out)
+
+**Key features**:
+- **Channel-based messaging**: Messages are delivered to workflows waiting on specific channels
+- **Competing vs Broadcast**: Choose semantics per subscription
+- **Group communication**: Erlang pg-style groups for loose coupling and fan-out
+- **Database-backed**: All messages are persisted for durability
+- **Lock-first delivery**: Safe for multi-worker environments
+
+### Workflow Recurrence
+
+Long-running workflows can use `ctx.recur()` to restart with fresh history while maintaining the same instance ID. This is essential for workflows that run indefinitely (job workers, notification handlers, etc.):
+
+```python
+from edda import workflow, subscribe, receive, WorkflowContext
+
+@workflow
+async def job_worker(ctx: WorkflowContext, worker_id: str):
+    await subscribe(ctx, channel="jobs", mode="competing")
+
+    # Process one job
+    job = await receive(ctx, channel="jobs")
+    await process_job(ctx, job.data)
+
+    # Archive history and restart with same instance_id
+    # Prevents unbounded history growth
+    await ctx.recur(worker_id)
+```
+
+**Key benefits**:
+- **Prevents history growth**: Archives old history, starts fresh
+- **Maintains instance ID**: Same workflow continues logically
+- **Preserves subscriptions**: Channel subscriptions survive recurrence
+- **Enables infinite loops**: Essential for long-running workers
 
 ### ASGI Integration
 

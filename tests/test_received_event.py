@@ -8,8 +8,8 @@ and accessible through the ReceivedEvent class.
 import pytest
 
 from edda import workflow
+from edda.channels import ReceivedEvent, wait_event
 from edda.context import WorkflowContext
-from edda.events import ReceivedEvent, wait_event
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine
 
@@ -100,24 +100,28 @@ class TestEventMetadataStorage:
 
         # Verify workflow is waiting
         instance = await sqlite_storage.get_instance(instance_id)
-        assert instance["status"] == "waiting_for_event"
+        assert instance["status"] == "waiting_for_message"
 
-        # Simulate event delivery with metadata
+        # Simulate event delivery with metadata (using ChannelMessageReceived format)
+        # Note: CloudEvents internally uses Message Passing,
+        # so metadata uses ce_ prefix for CloudEvents attributes.
         await sqlite_storage.append_history(
             instance_id,
-            activity_id="wait_event_test.event:1",
-            event_type="EventReceived",
+            activity_id="receive_test.event:1",
+            event_type="ChannelMessageReceived",
             event_data={
-                "payload": {"order_id": "ORDER-123", "status": "completed"},
+                "data": {"order_id": "ORDER-123", "status": "completed"},
+                "channel": "test.event",
+                "id": "msg-001",
                 "metadata": {
-                    "type": "test.event",
-                    "source": "test-service",
-                    "id": "event-abc123",
-                    "time": "2025-10-29T12:34:56Z",
-                    "datacontenttype": "application/json",
-                    "subject": "test/subject",
+                    "ce_type": "test.event",
+                    "ce_source": "test-service",
+                    "ce_id": "event-abc123",
+                    "ce_time": "2025-10-29T12:34:56Z",
+                    "ce_datacontenttype": "application/json",
+                    "ce_subject": "test/subject",
+                    "ce_extensions": {"custom": "value"},
                 },
-                "extensions": {"custom": "value"},
             },
         )
 
@@ -153,20 +157,21 @@ class TestEventMetadataStorage:
         # Start workflow
         instance_id = await replay_metadata_workflow.start()
 
-        # Simulate event delivery
+        # Simulate event delivery (using ChannelMessageReceived format with CloudEvents metadata)
         await sqlite_storage.append_history(
             instance_id,
-            activity_id="wait_event_payment.completed:1",
-            event_type="EventReceived",
+            activity_id="receive_payment.completed:1",
+            event_type="ChannelMessageReceived",
             event_data={
-                "payload": {"order_id": "ORDER-456", "amount": 150.00},
+                "data": {"order_id": "ORDER-456", "amount": 150.00},
+                "channel": "payment.completed",
+                "id": "msg-002",
                 "metadata": {
-                    "type": "payment.completed",
-                    "source": "payment-gateway",
-                    "id": "pay-xyz789",
-                    "time": "2025-10-29T15:00:00Z",
+                    "ce_type": "payment.completed",
+                    "ce_source": "payment-gateway",
+                    "ce_id": "pay-xyz789",
+                    "ce_time": "2025-10-29T15:00:00Z",
                 },
-                "extensions": {},
             },
         )
 
@@ -185,37 +190,50 @@ class TestEventMetadataStorage:
         assert result["event_id"] == "pay-xyz789"
         assert result["event_time"] == "2025-10-29T15:00:00Z"
 
-    async def test_backward_compatibility_with_old_format(
+    async def test_minimal_cloudevents_metadata(
         self, replay_engine, sqlite_storage, create_test_instance
     ):
-        """Test backward compatibility with old event_data format."""
+        """Test handling of minimal CloudEvents metadata (only required fields)."""
 
         @workflow
-        async def backward_compat_workflow(ctx: WorkflowContext) -> dict:
-            event = await wait_event(ctx, event_type="legacy.event")
-            return {"payload": event.data}
+        async def minimal_metadata_workflow(ctx: WorkflowContext) -> dict:
+            event = await wait_event(ctx, event_type="minimal.event")
+            return {
+                "payload": event.data,
+                "source": event.source,
+                "event_id": event.id,
+            }
 
         # Start workflow
-        instance_id = await backward_compat_workflow.start()
+        instance_id = await minimal_metadata_workflow.start()
 
-        # Simulate event delivery using OLD format (event_data directly)
+        # Simulate event delivery with minimal CloudEvents metadata
+        # (no time, datacontenttype, subject, or extensions)
         await sqlite_storage.append_history(
             instance_id,
-            activity_id="wait_event_legacy.event:1",
-            event_type="EventReceived",
-            event_data={"event_data": {"order_id": "LEGACY-123", "status": "success"}},
+            activity_id="receive_minimal.event:1",
+            event_type="ChannelMessageReceived",
+            event_data={
+                "data": {"order_id": "MINIMAL-123", "status": "success"},
+                "channel": "minimal.event",
+                "id": "msg-003",
+                "metadata": {
+                    "ce_source": "minimal-service",
+                    "ce_id": "event-minimal-123",
+                },
+            },
         )
 
         # Resume workflow
         await replay_engine.resume_workflow(
             instance_id=instance_id,
-            workflow_func=backward_compat_workflow.func,
+            workflow_func=minimal_metadata_workflow.func,
         )
 
-        # Verify workflow completed and data was accessible
+        # Verify workflow completed and minimal metadata was accessible
         instance = await sqlite_storage.get_instance(instance_id)
         assert instance["status"] == "completed"
-        assert instance["output_data"]["result"]["payload"] == {
-            "order_id": "LEGACY-123",
-            "status": "success",
-        }
+        result = instance["output_data"]["result"]
+        assert result["payload"] == {"order_id": "MINIMAL-123", "status": "success"}
+        assert result["source"] == "minimal-service"
+        assert result["event_id"] == "event-minimal-123"

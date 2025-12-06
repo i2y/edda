@@ -31,18 +31,22 @@ test-file FILE:
 
 # Format code with black
 format:
+    @uv sync --extra dev --quiet
     uv run black edda tests
 
 # Check code formatting
 format-check:
+    @uv sync --extra dev --quiet
     uv run black --check edda tests
 
 # Lint code with ruff
 lint:
+    @uv sync --extra dev --quiet
     uv run ruff check edda tests
 
 # Type check with mypy
 type-check:
+    @uv sync --extra dev --quiet
     uv run mypy edda
 
 # Run all checks (format, lint, type-check, test)
@@ -50,6 +54,7 @@ check: format-check lint type-check test
 
 # Auto-fix issues (format + lint with auto-fix)
 fix:
+    @uv sync --extra dev --quiet
     uv run black edda tests
     uv run ruff check --fix edda tests
 
@@ -129,3 +134,94 @@ clean:
     find . -type d -name __pycache__ -exec rm -rf {} +
     find . -type f -name "*.pyc" -delete
     rm -f demo.db
+
+# Helper recipe for point-to-point test (uses bash for command substitution)
+_test-point-to-point LOG_FILE:
+    #!/usr/bin/env bash
+    set -e
+    echo "=== Test 3: Point-to-Point Mode (Direct Message) ==="
+    echo "Starting receiver..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d '{"specversion":"1.0","type":"direct_message_receiver_workflow","source":"test","id":"receiver-1","data":{"receiver_id":"receiver-1"}}' > /dev/null
+    sleep 2
+    # Parse instance_id from server log (format: [RECEIVER] Instance ID: workflow-uuid)
+    # Strip ANSI color codes before grepping
+    INSTANCE_ID=$(sed 's/\x1b\[[0-9;]*m//g' "{{LOG_FILE}}" | grep -o '\[RECEIVER\] Instance ID: [^ ]*' | tail -1 | cut -d' ' -f4)
+    echo "Receiver instance_id: $INSTANCE_ID"
+    if [ -z "$INSTANCE_ID" ]; then
+        echo "ERROR: Could not extract instance_id from server log"
+        echo "Log content (stripped):"
+        sed 's/\x1b\[[0-9;]*m//g' "{{LOG_FILE}}" | grep -i receiver || echo "(no receiver logs found)"
+        exit 1
+    fi
+    echo "Sending direct message to receiver..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d "{\"specversion\":\"1.0\",\"type\":\"direct_message_sender_workflow\",\"source\":\"test\",\"id\":\"sender-1\",\"data\":{\"target_instance_id\":\"$INSTANCE_ID\",\"message\":\"Hello from sender!\"}}"
+    echo ""
+    sleep 5
+    # Verify receiver got the message (strip ANSI codes)
+    if sed 's/\x1b\[[0-9;]*m//g' "{{LOG_FILE}}" | grep -q "\[RECEIVER\] Received message:"; then
+        echo "✓ Point-to-Point message delivered successfully!"
+    else
+        echo "✗ Point-to-Point message delivery failed"
+    fi
+
+# Test message passing (competing, broadcast, and point-to-point modes)
+test-messages:
+    #!/usr/bin/env bash
+    set -e
+    LOG_FILE=$(mktemp)
+    echo "=== Message Passing Test ==="
+    echo "Server log: $LOG_FILE"
+    echo "Starting demo app in background..."
+    rm -f demo.db
+    uv sync --extra server --quiet
+    PYTHONUNBUFFERED=1 uv run tsuno demo_app:application --bind 127.0.0.1:8001 --workers 1 > "$LOG_FILE" 2>&1 &
+    SERVER_PID=$!
+    sleep 2
+
+    echo ""
+    echo "=== Test 1: Competing Mode (Job Worker) ==="
+    echo "Starting worker..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d '{"specversion":"1.0","type":"job_worker_workflow","source":"test","id":"worker-1","data":{"worker_id":"worker-1"}}'
+    echo ""
+    sleep 1
+    echo "Publishing job..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d '{"specversion":"1.0","type":"job_publisher_workflow","source":"test","id":"job-1","data":{"task":"test-task"}}'
+    echo ""
+    sleep 2
+
+    echo ""
+    echo "=== Test 2: Broadcast Mode (Notification) ==="
+    echo "Starting notification service..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d '{"specversion":"1.0","type":"notification_service_workflow","source":"test","id":"service-1","data":{"service_id":"service-1"}}'
+    echo ""
+    sleep 1
+    echo "Publishing notification..."
+    curl -s -X POST http://localhost:8001/ \
+        -H "Content-Type: application/cloudevents+json" \
+        -d '{"specversion":"1.0","type":"notification_publisher_workflow","source":"test","id":"notification-1","data":{"message":"Test notification"}}'
+    echo ""
+    sleep 2
+
+    just _test-point-to-point "$LOG_FILE"
+
+    echo ""
+    echo "=== Stopping demo app ==="
+    kill -15 $SERVER_PID 2>/dev/null || true
+    sleep 1
+
+    echo ""
+    echo "=== Server Log ==="
+    cat "$LOG_FILE"
+    rm -f "$LOG_FILE"
+    echo ""
+    echo "Done!"
