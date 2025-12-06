@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Documentation](https://img.shields.io/badge/docs-latest-green.svg)](https://i2y.github.io/edda/)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/i2y/edda)
 
 ## Overview
 
