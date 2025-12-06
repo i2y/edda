@@ -121,6 +121,18 @@ viewer-demo DB='demo.db' PORT='8080':
     just viewer {{DB}} {{PORT}} "--import-module demo_app"
 
 
+# Build documentation (clears cache for fresh API reference)
+docs:
+    rm -rf .cache site
+    uv run zensical build
+
+# Serve documentation locally (clears cache for fresh API reference)
+docs-serve:
+    @lsof -ti :8000 | xargs kill -15 2>/dev/null || true
+    @sleep 1
+    rm -rf .cache site
+    uv run zensical serve
+
 # Clean build artifacts and caches
 clean:
     rm -rf .pytest_cache
@@ -128,6 +140,8 @@ clean:
     rm -rf .coverage
     rm -rf .mypy_cache
     rm -rf .ruff_cache
+    rm -rf .cache
+    rm -rf site
     rm -rf dist
     rm -rf build
     rm -rf *.egg-info

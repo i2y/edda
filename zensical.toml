@@ -82,11 +82,13 @@ nav = [
   { "Integrations" = [
     { "MCP Integration" = "integrations/mcp.md" },
     { "OpenTelemetry Integration" = "integrations/opentelemetry.md" },
+    { "pydantic-rpc Integration" = "integrations/pydantic-rpc.md" },
   ]},
   { "Viewer UI" = [
     { "Setup" = "viewer-ui/setup.md" },
     { "Visualization" = "viewer-ui/visualization.md" },
   ]},
+  { "API Reference" = "api/reference.md" },
 ]
 
 # ----------------------------------------------------------------------------
@@ -342,3 +344,14 @@ icon = "fontawesome/brands/github"
 link = "https://github.com/i2y/edda"
 
 
+#-------------------------------------------------------------------------------
+# Section for configuring mkdocstrings plugin
+#-------------------------------------------------------------------------------
+[project.plugins.mkdocstrings.handlers.python]
+inventories = ["https://docs.python.org/3/objects.inv"]
+paths = ["edda"]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"
+inherited_members = true
+show_source = false

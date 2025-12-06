@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from edda.serialization.json import JSONSerializer
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
@@ -40,7 +41,12 @@ async def db_storage(request):
 
     if db_type == "sqlite":
         # SQLite: in-memory database
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        # Use StaticPool to ensure all connections share the same in-memory database
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            echo=False,
+            poolclass=StaticPool,
+        )
         storage = SQLAlchemyStorage(engine)
         await storage.initialize()
 
@@ -154,7 +160,12 @@ async def db_storage(request):
 @pytest_asyncio.fixture
 async def sqlite_storage():
     """Create an in-memory SQLite storage for testing."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    # Use StaticPool to ensure all connections share the same in-memory database
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=False,
+        poolclass=StaticPool,
+    )
     storage = SQLAlchemyStorage(engine)
     await storage.initialize()
 

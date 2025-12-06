@@ -411,12 +411,14 @@ async def event_subscriber(ctx: WorkflowContext, subscriber_id: str):
 ### When to Use Each
 
 **Use Channel-based Messaging when:**
+
 - Communicating between workflow instances
 - Implementing producer-consumer patterns
 - Building internal workflow orchestration
 - Need guaranteed message delivery within workflows
 
 **Use CloudEvents when:**
+
 - Receiving events from external systems
 - Integrating with Knative, Kafka, etc.
 - Need standardized event format

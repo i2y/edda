@@ -114,6 +114,7 @@ delay = min(delay, max_interval)  # Capped
 ```
 
 Example calculation:
+
 - Attempt 2: `1.0 * (2.0 ^ 1) = 2.0s` → 1.0s (wait before attempt 2)
 - Attempt 3: `1.0 * (2.0 ^ 2) = 4.0s` → 2.0s (wait before attempt 3)
 - Attempt 4: `1.0 * (2.0 ^ 3) = 8.0s` → 4.0s (wait before attempt 4)
@@ -139,6 +140,7 @@ async def process_payment(ctx: WorkflowContext, amount: float):
     Critical payment processing with aggressive retry.
 
     Retry schedule:
+
     - Attempt 1: 0s
     - Attempt 2: 0.5s
     - Attempt 3: 0.75s (0.5 * 1.5)

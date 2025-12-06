@@ -45,7 +45,7 @@ class EddaApp:
         service_name: str,
         db_url: str,
         outbox_enabled: bool = False,
-        broker_url: str = "http://broker-ingress.knative-eventing.svc.cluster.local/default/default",
+        broker_url: str | None = None,
         hooks: WorkflowHooks | None = None,
         default_retry_policy: "RetryPolicy | None" = None,
         message_retention_days: int = 7,
@@ -63,7 +63,7 @@ class EddaApp:
             service_name: Service name for distributed execution (e.g., "order-service")
             db_url: Database URL (e.g., "sqlite:///workflow.db")
             outbox_enabled: Enable transactional outbox pattern
-            broker_url: Knative Broker URL for outbox publishing
+            broker_url: Broker URL for outbox publishing. Required if outbox_enabled=True.
             hooks: Optional WorkflowHooks implementation for observability
             default_retry_policy: Default retry policy for all activities.
                                  If None, uses DEFAULT_RETRY_POLICY (5 attempts, exponential backoff).
@@ -86,6 +86,8 @@ class EddaApp:
         self.service_name = service_name
         self.outbox_enabled = outbox_enabled
         self.broker_url = broker_url
+        if self.outbox_enabled and not self.broker_url:
+            raise ValueError("broker_url is required when outbox_enabled=True")
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
         self._message_retention_days = message_retention_days
@@ -197,6 +199,7 @@ class EddaApp:
 
         # Initialize outbox relayer if enabled
         if self.outbox_enabled:
+            assert self.broker_url is not None  # Validated in __init__
             self.outbox_relayer = OutboxRelayer(
                 storage=self.storage,
                 broker_url=self.broker_url,

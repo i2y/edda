@@ -192,6 +192,7 @@ disallow_untyped_defs = false
 
 [dependency-groups]
 dev = [
+    "mkdocstrings-python>=2.0.1",
     "tsuno>=0.1.3",
     "zensical>=0.0.11",
 ]
