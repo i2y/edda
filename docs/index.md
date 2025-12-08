@@ -26,7 +26,7 @@ Edda is a lightweight durable execution framework for Python that runs as a **li
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
-- 📬 **Message Passing**: Actor-model style workflow-to-workflow communication with groups for fan-out (Erlang pg style)
+- 📬 **Message Passing**: Channel-based messaging (broadcast/competing modes) and direct workflow-to-workflow communication
 
 ## Use Cases
 
