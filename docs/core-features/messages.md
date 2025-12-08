@@ -517,6 +517,7 @@ async def process_order(ctx: WorkflowContext, order_id: str):
 ```
 
 **Behavior:**
+
 - If the activity **succeeds**: Message is published after commit
 - If the activity **fails**: Message is **NOT** published (rollback)
 
@@ -538,6 +539,7 @@ async def process_job(ctx: WorkflowContext, channel: str):
 ```
 
 **Behavior:**
+
 - If the activity **succeeds**: Message claim is committed, message is processed
 - If the activity **fails**: Message claim is rolled back, message returns to queue
 
