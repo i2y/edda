@@ -5,7 +5,7 @@ This module provides the WorkflowContext class for workflow execution,
 managing state, history, and replay during workflow execution.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -450,6 +450,33 @@ class WorkflowContext:
                 await send_event_transactional(ctx, "order.created", ...)
         """
         return self.storage.in_transaction()
+
+    def register_post_commit(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """
+        Register a callback to be executed after the current transaction commits.
+
+        The callback will be executed after the top-level transaction commits successfully.
+        If the transaction is rolled back, the callback will NOT be executed.
+        This is useful for deferring side effects (like message delivery) until after
+        the transaction has been committed.
+
+        Args:
+            callback: An async function to call after commit.
+
+        Raises:
+            RuntimeError: If not in a transaction.
+
+        Example:
+            async with ctx.transaction():
+                # Save order to database
+                await ctx.storage.append_history(...)
+
+                # Defer message delivery until after commit
+                async def deliver_notifications():
+                    await notify_subscribers(order_id)
+                ctx.register_post_commit(deliver_notifications)
+        """
+        self.storage.register_post_commit_callback(callback)
 
     async def recur(self, **kwargs: Any) -> None:
         """

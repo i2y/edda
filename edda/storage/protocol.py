@@ -5,6 +5,7 @@ This module defines the StorageProtocol using Python's structural typing (Protoc
 Any storage implementation that conforms to this protocol can be used with Edda.
 """
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -101,6 +102,21 @@ class StorageProtocol(Protocol):
         Note:
             This is a synchronous method because it only checks state,
             it does not perform any I/O operations.
+        """
+        ...
+
+    def register_post_commit_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """
+        Register a callback to be executed after the current transaction commits.
+
+        The callback will be executed after the top-level transaction commits successfully.
+        If the transaction is rolled back, the callback will NOT be executed.
+
+        Args:
+            callback: An async function to call after commit.
+
+        Raises:
+            RuntimeError: If not in a transaction.
         """
         ...
 
@@ -713,39 +729,6 @@ class StorageProtocol(Protocol):
     # Message Subscription Methods (for wait_message)
     # -------------------------------------------------------------------------
 
-    async def register_message_subscription_and_release_lock(
-        self,
-        instance_id: str,
-        worker_id: str,
-        channel: str,
-        timeout_at: datetime | None = None,
-        activity_id: str | None = None,
-    ) -> None:
-        """
-        Atomically register message subscription and release workflow lock.
-
-        This method performs the following operations in a SINGLE database transaction:
-        1. Register message subscription (INSERT into workflow_message_subscriptions)
-        2. Update current activity (UPDATE workflow_instances.current_activity_id)
-        3. Update status to 'waiting_for_event'
-        4. Release lock (UPDATE workflow_instances set locked_by=NULL)
-
-        This ensures that when a workflow calls wait_message(), the subscription is
-        registered and the lock is released atomically, preventing race conditions
-        in distributed environments (distributed coroutines pattern).
-
-        Args:
-            instance_id: Workflow instance ID
-            worker_id: Worker ID that currently holds the lock
-            channel: Channel name to wait on
-            timeout_at: Optional timeout timestamp
-            activity_id: Current activity ID to record
-
-        Raises:
-            RuntimeError: If the worker doesn't hold the lock (sanity check)
-        """
-        ...
-
     async def find_waiting_instances_by_channel(
         self,
         channel: str,
@@ -911,9 +894,8 @@ class StorageProtocol(Protocol):
 
         Removes entries from:
         - workflow_timer_subscriptions
-        - workflow_message_subscriptions
-        - channel_subscriptions (new)
-        - channel_message_claims (new)
+        - channel_subscriptions
+        - channel_message_claims
 
         Args:
             instance_id: Workflow instance ID to clean up

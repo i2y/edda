@@ -192,20 +192,26 @@ class TestWorkflowCancellation:
         # Update status to waiting_for_event
         await storage.update_instance_status(instance_id, "waiting_for_event")
 
-        # Add message subscription (CloudEvents uses Message Passing internally)
-        # Must acquire lock first, then register subscription atomically
-        from datetime import UTC, datetime, timedelta
+        # Add channel subscription (CloudEvents uses Message Passing internally)
+        # Must subscribe to channel first, then register channel receive atomically
 
+        # Subscribe to channel first
+        await storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="test.event",
+            mode="broadcast",
+        )
+
+        # Acquire lock and register channel receive
         acquired = await storage.try_acquire_lock(instance_id, worker_id, timeout_seconds=30)
         assert acquired is True
 
-        timeout_at = datetime.now(UTC) + timedelta(seconds=60)
-        await storage.register_message_subscription_and_release_lock(
+        await storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id=worker_id,
             channel="test.event",
-            timeout_at=timeout_at,
             activity_id="wait_message_test.event:1",
+            timeout_seconds=60,
         )
 
         # Verify subscription exists
@@ -417,20 +423,26 @@ class TestWorkflowCancellation:
         # Update to waiting state
         await storage.update_instance_status(instance_id, "waiting_for_event")
 
-        # Add message subscription (CloudEvents uses Message Passing internally)
-        # Must acquire lock first, then register subscription atomically
-        from datetime import UTC, datetime, timedelta
+        # Add channel subscription (CloudEvents uses Message Passing internally)
+        # Must subscribe to channel first, then register channel receive atomically
 
+        # Subscribe to channel first
+        await storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="payment.completed",
+            mode="broadcast",
+        )
+
+        # Acquire lock and register channel receive
         acquired = await storage.try_acquire_lock(instance_id, worker_id, timeout_seconds=30)
         assert acquired is True
 
-        timeout_at = datetime.now(UTC) + timedelta(seconds=120)
-        await storage.register_message_subscription_and_release_lock(
+        await storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id=worker_id,
             channel="payment.completed",
-            timeout_at=timeout_at,
             activity_id="wait_message_payment.completed:1",
+            timeout_seconds=120,
         )
 
         # Verify subscription exists

@@ -151,16 +151,22 @@ class TestMultiDBMessageSubscriptions:
         await db_storage.create_instance(**sample_workflow_data)
         instance_id = sample_workflow_data["instance_id"]
 
-        # Acquire lock first (required for register_message_subscription_and_release_lock)
+        # Subscribe to channel first (required for register_channel_receive_and_release_lock)
+        await db_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="payment.completed",
+            mode="broadcast",
+        )
+
+        # Acquire lock first (required for register_channel_receive_and_release_lock)
         acquired = await db_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
         assert acquired is True
 
-        # Register message subscription atomically (releases lock)
-        await db_storage.register_message_subscription_and_release_lock(
+        # Register channel receive atomically (releases lock)
+        await db_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="worker-1",
             channel="payment.completed",
-            timeout_at=None,
             activity_id="wait_message_payment.completed:1",
         )
 
@@ -174,13 +180,19 @@ class TestMultiDBMessageSubscriptions:
         await db_storage.create_instance(**sample_workflow_data)
         instance_id = sample_workflow_data["instance_id"]
 
-        # Acquire lock and register subscription
+        # Subscribe to channel first
+        await db_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="payment.completed",
+            mode="broadcast",
+        )
+
+        # Acquire lock and register channel receive
         await db_storage.try_acquire_lock(instance_id, "worker-1", timeout_seconds=30)
-        await db_storage.register_message_subscription_and_release_lock(
+        await db_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="worker-1",
             channel="payment.completed",
-            timeout_at=None,
             activity_id="wait_message_payment.completed:1",
         )
 

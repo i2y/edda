@@ -8,7 +8,7 @@ and transactional outbox pattern.
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -285,31 +285,6 @@ class OutboxEvent(Base):
     )
 
 
-class WorkflowMessageSubscription(Base):
-    """Message subscriptions (for wait_message)."""
-
-    __tablename__ = "workflow_message_subscriptions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    instance_id: Mapped[str] = mapped_column(String(255))
-    channel: Mapped[str] = mapped_column(String(255))
-    activity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    timeout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["instance_id"],
-            ["workflow_instances.instance_id"],
-            ondelete="CASCADE",
-        ),
-        UniqueConstraint("instance_id", "channel", name="unique_instance_channel"),
-        Index("idx_message_subscriptions_channel", "channel"),
-        Index("idx_message_subscriptions_timeout", "timeout_at"),
-        Index("idx_message_subscriptions_instance", "instance_id"),
-    )
-
-
 class WorkflowGroupMembership(Base):
     """Group memberships (Erlang pg style for broadcast messaging)."""
 
@@ -507,6 +482,9 @@ class TransactionContext:
 
     session: "AsyncSession | None" = None
     """The actual session for this transaction"""
+
+    post_commit_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+    """Callbacks to execute after successful top-level commit"""
 
 
 # Context variable for transaction state (asyncio-safe)
@@ -861,7 +839,7 @@ class SQLAlchemyStorage:
         Example:
             >>> # SQLite: datetime(timeout_at) <= datetime('now')
             >>> # PostgreSQL/MySQL: timeout_at <= NOW()
-            >>> self._make_datetime_comparable(WorkflowMessageSubscription.timeout_at)
+            >>> self._make_datetime_comparable(ChannelSubscription.timeout_at)
             >>>     <= self._get_current_time_expr()
         """
         if self.engine.dialect.name == "sqlite":
@@ -913,11 +891,16 @@ class SQLAlchemyStorage:
         if ctx is None or ctx.depth == 0:
             raise RuntimeError("Not in a transaction")
 
+        # Capture callbacks before any state changes
+        callbacks_to_execute: list[Callable[[], Awaitable[None]]] = []
+
         if ctx.depth == 1:
             # Top-level transaction - commit the session
             logger.debug("Committing top-level transaction")
             await ctx.session.commit()  # type: ignore[union-attr]
             await ctx.session.close()  # type: ignore[union-attr]
+            # Capture callbacks to execute after clearing context
+            callbacks_to_execute = ctx.post_commit_callbacks.copy()
         else:
             # Nested transaction - commit the savepoint
             nested_tx = ctx.savepoint_stack.pop()
@@ -929,6 +912,12 @@ class SQLAlchemyStorage:
         if ctx.depth == 0:
             # All transactions completed - clear context
             _transaction_context.set(None)
+            # Execute post-commit callbacks after successful top-level commit
+            for callback in callbacks_to_execute:
+                try:
+                    await callback()
+                except Exception as e:
+                    logger.error(f"Post-commit callback failed: {e}")
 
     async def rollback_transaction(self) -> None:
         """
@@ -967,6 +956,26 @@ class SQLAlchemyStorage:
         """
         ctx = _transaction_context.get()
         return ctx is not None and ctx.depth > 0
+
+    def register_post_commit_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """
+        Register a callback to be executed after the current transaction commits.
+
+        The callback will be executed after the top-level transaction commits successfully.
+        If the transaction is rolled back, the callback will NOT be executed.
+        If not in a transaction, the callback will be executed immediately.
+
+        Args:
+            callback: An async function to call after commit.
+
+        Raises:
+            RuntimeError: If not in a transaction.
+        """
+        ctx = _transaction_context.get()
+        if ctx is None or ctx.depth == 0:
+            raise RuntimeError("Cannot register post-commit callback: not in a transaction")
+        ctx.post_commit_callbacks.append(callback)
+        logger.debug(f"Registered post-commit callback: {callback}")
 
     async def _commit_if_not_in_transaction(self, session: AsyncSession) -> None:
         """
@@ -2247,11 +2256,16 @@ class SQLAlchemyStorage:
         Only running or waiting_for_event workflows can be cancelled.
         This method atomically:
         1. Checks current status
-        2. Updates status to 'cancelled' if allowed
+        2. Updates status to 'cancelled' if allowed (with atomic status check)
         3. Clears locks
         4. Records cancellation metadata
         5. Removes event subscriptions (if waiting for event)
         6. Removes timer subscriptions (if waiting for timer)
+
+        The UPDATE includes a status condition in WHERE clause to prevent
+        TOCTOU (time-of-check to time-of-use) race conditions. If the status
+        changes between SELECT and UPDATE, the UPDATE will affect 0 rows
+        and the cancellation will fail safely.
 
         Args:
             instance_id: Workflow instance to cancel
@@ -2262,6 +2276,14 @@ class SQLAlchemyStorage:
 
         Note: Uses LOCK operation session (separate from external session).
         """
+        cancellable_statuses = (
+            "running",
+            "waiting_for_event",
+            "waiting_for_timer",
+            "waiting_for_message",
+            "compensating",
+        )
+
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session, session.begin():
             # Get current instance status
@@ -2278,34 +2300,42 @@ class SQLAlchemyStorage:
 
             # Only allow cancellation of running, waiting, or compensating workflows
             # compensating workflows can be marked as cancelled after compensation completes
-            if current_status not in (
-                "running",
-                "waiting_for_event",
-                "waiting_for_timer",
-                "waiting_for_message",
-                "compensating",
-            ):
+            if current_status not in cancellable_statuses:
                 # Already completed, failed, or cancelled
                 return False
 
             # Update status to cancelled and record metadata
+            # IMPORTANT: Include status condition in WHERE clause to prevent TOCTOU race
+            # If another worker changed the status between SELECT and UPDATE,
+            # this UPDATE will affect 0 rows and we'll return False
             cancellation_metadata = {
                 "cancelled_by": cancelled_by,
                 "cancelled_at": datetime.now(UTC).isoformat(),
                 "previous_status": current_status,
             }
 
-            await session.execute(
+            update_result = await session.execute(
                 update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.status == current_status,  # Atomic check
+                    )
+                )
                 .values(
                     status="cancelled",
                     output_data=json.dumps(cancellation_metadata),
                     locked_by=None,
                     locked_at=None,
+                    lock_expires_at=None,
                     updated_at=func.now(),
                 )
             )
+
+            if update_result.rowcount == 0:  # type: ignore[attr-defined]
+                # Status changed between SELECT and UPDATE (race condition)
+                # Another worker may have resumed/modified the workflow
+                return False
 
             # Remove timer subscriptions if waiting for timer
             if current_status == "waiting_for_timer":
@@ -2315,112 +2345,19 @@ class SQLAlchemyStorage:
                     )
                 )
 
-            # Remove message subscriptions if waiting for message
-            await session.execute(
-                delete(WorkflowMessageSubscription).where(
-                    WorkflowMessageSubscription.instance_id == instance_id
+            # Clear channel subscriptions if waiting for event/message
+            if current_status in ("waiting_for_event", "waiting_for_message"):
+                await session.execute(
+                    update(ChannelSubscription)
+                    .where(ChannelSubscription.instance_id == instance_id)
+                    .values(activity_id=None, timeout_at=None)
                 )
-            )
 
             return True
 
     # -------------------------------------------------------------------------
     # Message Subscription Methods
     # -------------------------------------------------------------------------
-
-    async def register_message_subscription_and_release_lock(
-        self,
-        instance_id: str,
-        worker_id: str,
-        channel: str,
-        timeout_at: datetime | None = None,
-        activity_id: str | None = None,
-    ) -> None:
-        """
-        Atomically register a message subscription and release the workflow lock.
-
-        This is called when a workflow executes wait_message() and needs to:
-        1. Verify lock ownership (RuntimeError if mismatch - full rollback)
-        2. Register a subscription for the channel
-        3. Update the workflow status to waiting_for_message
-        4. Release the lock
-
-        All operations happen in a single transaction for atomicity.
-
-        Args:
-            instance_id: Workflow instance ID
-            worker_id: Worker ID that must hold the current lock (verified before release)
-            channel: Channel name to subscribe to
-            timeout_at: Optional absolute timeout time
-            activity_id: Activity ID for the wait operation
-
-        Raises:
-            RuntimeError: If the worker does not hold the lock (entire operation rolls back)
-        """
-        session = self._get_session_for_operation(is_lock_operation=True)
-        async with self._session_scope(session) as session, session.begin():
-            # 1. Verify we hold the lock (sanity check - fail fast if not)
-            result = await session.execute(
-                select(WorkflowInstance.locked_by).where(
-                    WorkflowInstance.instance_id == instance_id
-                )
-            )
-            row = result.one_or_none()
-
-            if row is None:
-                raise RuntimeError(f"Workflow instance {instance_id} not found")
-
-            current_lock_holder = row[0]
-            if current_lock_holder != worker_id:
-                raise RuntimeError(
-                    f"Cannot release lock: worker {worker_id} does not hold lock "
-                    f"for {instance_id} (held by: {current_lock_holder})"
-                )
-
-            # 2. Register subscription (delete then insert for cross-database compatibility)
-            await session.execute(
-                delete(WorkflowMessageSubscription).where(
-                    and_(
-                        WorkflowMessageSubscription.instance_id == instance_id,
-                        WorkflowMessageSubscription.channel == channel,
-                    )
-                )
-            )
-
-            subscription = WorkflowMessageSubscription(
-                instance_id=instance_id,
-                channel=channel,
-                activity_id=activity_id,
-                timeout_at=timeout_at,
-            )
-            session.add(subscription)
-
-            # 3. Update workflow status and activity
-            await session.execute(
-                update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
-                .values(
-                    status="waiting_for_message",
-                    current_activity_id=activity_id,
-                    updated_at=func.now(),
-                )
-            )
-
-            # 4. Release the lock (with ownership check for extra safety)
-            await session.execute(
-                update(WorkflowInstance)
-                .where(
-                    and_(
-                        WorkflowInstance.instance_id == instance_id,
-                        WorkflowInstance.locked_by == worker_id,
-                    )
-                )
-                .values(
-                    locked_by=None,
-                    locked_at=None,
-                    lock_expires_at=None,
-                )
-            )
 
     async def find_waiting_instances_by_channel(self, channel: str) -> list[dict[str, Any]]:
         """
@@ -2434,9 +2371,13 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
+            # Query ChannelSubscription table for waiting instances
             result = await session.execute(
-                select(WorkflowMessageSubscription).where(
-                    WorkflowMessageSubscription.channel == channel
+                select(ChannelSubscription).where(
+                    and_(
+                        ChannelSubscription.channel == channel,
+                        ChannelSubscription.activity_id.isnot(None),  # Only waiting subscriptions
+                    )
                 )
             )
             subscriptions = result.scalars().all()
@@ -2446,7 +2387,7 @@ class SQLAlchemyStorage:
                     "channel": sub.channel,
                     "activity_id": sub.activity_id,
                     "timeout_at": sub.timeout_at.isoformat() if sub.timeout_at else None,
-                    "created_at": sub.created_at.isoformat() if sub.created_at else None,
+                    "created_at": sub.subscribed_at.isoformat() if sub.subscribed_at else None,
                 }
                 for sub in subscriptions
             ]
@@ -2459,8 +2400,7 @@ class SQLAlchemyStorage:
         """
         Remove a message subscription.
 
-        This method removes from the legacy WorkflowMessageSubscription table
-        and clears waiting state from the ChannelSubscription table.
+        This method clears waiting state from the ChannelSubscription table.
 
         Args:
             instance_id: Workflow instance ID
@@ -2468,16 +2408,6 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            # Remove from legacy WorkflowMessageSubscription table
-            await session.execute(
-                delete(WorkflowMessageSubscription).where(
-                    and_(
-                        WorkflowMessageSubscription.instance_id == instance_id,
-                        WorkflowMessageSubscription.channel == channel,
-                    )
-                )
-            )
-
             # Clear waiting state from ChannelSubscription table
             # Don't delete the subscription - just clear the waiting state
             await session.execute(
@@ -2527,10 +2457,11 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             result = await session.execute(
-                select(WorkflowMessageSubscription).where(
+                select(ChannelSubscription).where(
                     and_(
-                        WorkflowMessageSubscription.instance_id == instance_id,
-                        WorkflowMessageSubscription.channel == channel,
+                        ChannelSubscription.instance_id == instance_id,
+                        ChannelSubscription.channel == channel,
+                        ChannelSubscription.activity_id.isnot(None),  # Only waiting subscriptions
                     )
                 )
             )
@@ -2555,10 +2486,13 @@ class SQLAlchemyStorage:
             async with self._session_scope(session) as session:
                 # Re-check subscription (may have been removed by another worker)
                 result = await session.execute(
-                    select(WorkflowMessageSubscription).where(
+                    select(ChannelSubscription).where(
                         and_(
-                            WorkflowMessageSubscription.instance_id == instance_id,
-                            WorkflowMessageSubscription.channel == channel,
+                            ChannelSubscription.instance_id == instance_id,
+                            ChannelSubscription.channel == channel,
+                            ChannelSubscription.activity_id.isnot(
+                                None
+                            ),  # Only waiting subscriptions
                         )
                     )
                 )
@@ -2607,14 +2541,16 @@ class SQLAlchemyStorage:
                 )
                 session.add(history_entry)
 
-                # Remove subscription
+                # Clear waiting state from subscription (don't delete)
                 await session.execute(
-                    delete(WorkflowMessageSubscription).where(
+                    update(ChannelSubscription)
+                    .where(
                         and_(
-                            WorkflowMessageSubscription.instance_id == instance_id,
-                            WorkflowMessageSubscription.channel == channel,
+                            ChannelSubscription.instance_id == instance_id,
+                            ChannelSubscription.channel == channel,
                         )
                     )
+                    .values(activity_id=None, timeout_at=None)
                 )
 
                 # Update status to 'running' (ready for resumption)
@@ -2641,8 +2577,6 @@ class SQLAlchemyStorage:
         """
         Find all message subscriptions that have timed out.
 
-        This method queries both the legacy WorkflowMessageSubscription table and
-        the ChannelSubscription table for expired subscriptions.
         JOINs with WorkflowInstance to ensure instance exists and avoid N+1 queries.
 
         Returns:
@@ -2650,47 +2584,8 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            results: list[dict[str, Any]] = []
-
-            # Query legacy WorkflowMessageSubscription table with JOIN to verify instance exists
-            legacy_result = await session.execute(
-                select(
-                    WorkflowMessageSubscription.instance_id,
-                    WorkflowMessageSubscription.channel,
-                    WorkflowMessageSubscription.activity_id,
-                    WorkflowMessageSubscription.timeout_at,
-                    WorkflowMessageSubscription.created_at,
-                    WorkflowInstance.workflow_name,
-                )
-                .join(
-                    WorkflowInstance,
-                    WorkflowMessageSubscription.instance_id == WorkflowInstance.instance_id,
-                )
-                .where(
-                    and_(
-                        WorkflowMessageSubscription.timeout_at.isnot(None),
-                        self._make_datetime_comparable(WorkflowMessageSubscription.timeout_at)
-                        <= self._get_current_time_expr(),
-                    )
-                )
-            )
-            legacy_rows = legacy_result.all()
-            results.extend(
-                [
-                    {
-                        "instance_id": row[0],
-                        "channel": row[1],
-                        "activity_id": row[2],
-                        "timeout_at": row[3],
-                        "created_at": row[4],
-                        "workflow_name": row[5],
-                    }
-                    for row in legacy_rows
-                ]
-            )
-
             # Query ChannelSubscription table with JOIN
-            channel_result = await session.execute(
+            result = await session.execute(
                 select(
                     ChannelSubscription.instance_id,
                     ChannelSubscription.channel,
@@ -2712,22 +2607,18 @@ class SQLAlchemyStorage:
                     )
                 )
             )
-            channel_rows = channel_result.all()
-            results.extend(
-                [
-                    {
-                        "instance_id": row[0],
-                        "channel": row[1],
-                        "activity_id": row[2],
-                        "timeout_at": row[3],
-                        "created_at": row[4],  # subscribed_at as created_at for compatibility
-                        "workflow_name": row[5],
-                    }
-                    for row in channel_rows
-                ]
-            )
-
-            return results
+            rows = result.all()
+            return [
+                {
+                    "instance_id": row[0],
+                    "channel": row[1],
+                    "activity_id": row[2],
+                    "timeout_at": row[3],
+                    "created_at": row[4],  # subscribed_at as created_at for compatibility
+                    "workflow_name": row[5],
+                }
+                for row in rows
+            ]
 
     # -------------------------------------------------------------------------
     # Group Membership Methods (Erlang pg style)
@@ -2879,13 +2770,6 @@ class SQLAlchemyStorage:
             await session.execute(
                 delete(WorkflowTimerSubscription).where(
                     WorkflowTimerSubscription.instance_id == instance_id
-                )
-            )
-
-            # Remove message subscriptions (legacy)
-            await session.execute(
-                delete(WorkflowMessageSubscription).where(
-                    WorkflowMessageSubscription.instance_id == instance_id
                 )
             )
 

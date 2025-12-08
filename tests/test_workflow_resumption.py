@@ -207,14 +207,20 @@ class TestMessageDeliveryTriggeredResumption:
         # Use waiting_for_event status (waiting_for_message is not a valid status)
         await sqlite_storage.update_instance_status(instance_id, "waiting_for_event")
 
-        # Acquire lock and register message subscription (which releases lock)
+        # Subscribe to channel first (required for register_channel_receive_and_release_lock)
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="approval",
+            mode="broadcast",
+        )
+
+        # Acquire lock and register channel receive (which releases lock)
         await sqlite_storage.try_acquire_lock(instance_id, "setup-worker")
-        await sqlite_storage.register_message_subscription_and_release_lock(
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="setup-worker",
             channel="approval",
             activity_id="wait_message_approval:1",
-            timeout_at=None,
         )
         return instance_id
 

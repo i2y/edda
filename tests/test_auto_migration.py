@@ -166,21 +166,6 @@ async def storage_with_old_schema():
         await conn.execute(
             text(
                 """
-            CREATE TABLE workflow_message_subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id VARCHAR(255) NOT NULL,
-                channel VARCHAR(255) NOT NULL,
-                activity_id VARCHAR(255),
-                timeout_at DATETIME,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """
-            )
-        )
-
-        await conn.execute(
-            text(
-                """
             CREATE TABLE workflow_group_memberships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_id VARCHAR(255) NOT NULL,
@@ -348,7 +333,6 @@ class TestFreshDatabaseInitialization:
             "workflow_compensations",
             "workflow_timer_subscriptions",
             "outbox_events",
-            "workflow_message_subscriptions",
             "workflow_group_memberships",
         }
 

@@ -136,27 +136,6 @@ WORKFLOW_TIMER_SUBSCRIPTIONS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_timer_subscriptions_instance ON workflow_timer_subscriptions(instance_id);",
 ]
 
-# SQL schema for message subscriptions (for wait_message)
-WORKFLOW_MESSAGE_SUBSCRIPTIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS workflow_message_subscriptions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    activity_id TEXT,
-    timeout_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (instance_id) REFERENCES workflow_instances(instance_id) ON DELETE CASCADE,
-    CONSTRAINT unique_instance_channel UNIQUE (instance_id, channel)
-);
-"""
-
-# Indexes for message subscriptions
-WORKFLOW_MESSAGE_SUBSCRIPTIONS_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_message_subscriptions_channel ON workflow_message_subscriptions(channel);",
-    "CREATE INDEX IF NOT EXISTS idx_message_subscriptions_timeout ON workflow_message_subscriptions(timeout_at);",
-    "CREATE INDEX IF NOT EXISTS idx_message_subscriptions_instance ON workflow_message_subscriptions(instance_id);",
-]
-
 # SQL schema for group memberships (Erlang pg style)
 WORKFLOW_GROUP_MEMBERSHIPS_TABLE = """
 CREATE TABLE IF NOT EXISTS workflow_group_memberships (
@@ -306,7 +285,6 @@ ALL_TABLES = [
     WORKFLOW_HISTORY_ARCHIVE_TABLE,
     WORKFLOW_COMPENSATIONS_TABLE,
     WORKFLOW_TIMER_SUBSCRIPTIONS_TABLE,
-    WORKFLOW_MESSAGE_SUBSCRIPTIONS_TABLE,
     WORKFLOW_GROUP_MEMBERSHIPS_TABLE,
     OUTBOX_EVENTS_TABLE,
     # Channel-based Message Queue System
@@ -324,7 +302,6 @@ ALL_INDEXES = (
     + WORKFLOW_HISTORY_ARCHIVE_INDEXES
     + WORKFLOW_COMPENSATIONS_INDEXES
     + WORKFLOW_TIMER_SUBSCRIPTIONS_INDEXES
-    + WORKFLOW_MESSAGE_SUBSCRIPTIONS_INDEXES
     + WORKFLOW_GROUP_MEMBERSHIPS_INDEXES
     + OUTBOX_EVENTS_INDEXES
     # Channel-based Message Queue System

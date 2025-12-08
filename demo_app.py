@@ -1953,19 +1953,17 @@ async def job_worker_workflow(
        - Start this workflow multiple times with different worker_id values
        - Each worker will subscribe to the "jobs" channel in competing mode
 
-    2. Publish jobs to the channel:
+    2. Publish jobs using the job_publisher_workflow:
        curl -X POST http://localhost:8001/ \\
          -H "Content-Type: application/cloudevents+json" \\
          -d '{
            "specversion": "1.0",
-           "type": "job_published",
+           "type": "job_publisher_workflow",
            "source": "demo-client",
            "id": "job-1",
            "datacontenttype": "application/json",
            "data": {
-             "channel": "jobs",
-             "task": "send_report",
-             "user_id": 123
+             "task": "send_report"
            }
          }'
 
@@ -2043,19 +2041,17 @@ async def notification_service_workflow(
        - Start this workflow multiple times with different service_id values
        - Each instance will subscribe to the "notifications" channel
 
-    2. Publish a notification:
+    2. Publish a notification using the notification_publisher_workflow:
        curl -X POST http://localhost:8001/ \\
          -H "Content-Type: application/cloudevents+json" \\
          -d '{
            "specversion": "1.0",
-           "type": "notification_published",
+           "type": "notification_publisher_workflow",
            "source": "demo-client",
            "id": "notification-1",
            "datacontenttype": "application/json",
            "data": {
-             "channel": "notifications",
-             "message": "System maintenance scheduled",
-             "priority": "high"
+             "message": "System maintenance scheduled"
            }
          }'
 

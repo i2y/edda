@@ -608,72 +608,12 @@ async def order_with_timeout(ctx: WorkflowContext, order_id: str):
 
 **For technical details**, see [Multi-Worker Continuations](local-docs/distributed-coroutines.md).
 
-### Message Passing (Workflow-to-Workflow)
+### Channel-based Messaging
 
-Edda provides actor-model style message passing for direct workflow-to-workflow communication:
-
-```python
-from edda import workflow, wait_message, send_message_to, WorkflowContext
-
-# Receiver workflow - waits for approval message
-@workflow
-async def approval_workflow(ctx: WorkflowContext, request_id: str):
-    # Wait for message on "approval" channel
-    msg = await wait_message(ctx, channel="approval")
-
-    if msg.data["approved"]:
-        return {"status": "approved", "approver": msg.data["approver"]}
-    return {"status": "rejected"}
-
-# Sender workflow - sends approval decision
-@workflow
-async def manager_workflow(ctx: WorkflowContext, request_id: str):
-    # Review and make decision
-    decision = await review_request(ctx, request_id)
-
-    # Send message to waiting workflow
-    await send_message_to(
-        ctx,
-        target_instance_id=request_id,
-        channel="approval",
-        data={"approved": decision, "approver": "manager-123"},
-    )
-```
-
-**Group Communication (Erlang pg style)** - for fan-out messaging without knowing receiver instance IDs:
+Edda provides channel-based messaging for workflow-to-workflow communication with two delivery modes:
 
 ```python
-from edda import workflow, join_group, wait_message, publish_to_group
-
-# Receiver workflow - joins a group and listens
-@workflow
-async def notification_service(ctx: WorkflowContext, service_id: str):
-    # Join group at startup (loose coupling - sender doesn't need to know us)
-    await join_group(ctx, group="order_watchers")
-
-    while True:
-        msg = await wait_message(ctx, channel="order.created")
-        await send_notification(ctx, msg.data)
-
-# Sender workflow - publishes to all group members
-@workflow
-async def order_processor(ctx: WorkflowContext, order_id: str):
-    result = await process_order(ctx, order_id)
-
-    # Broadcast to all watchers (doesn't need to know instance IDs)
-    count = await publish_to_group(
-        ctx,
-        group="order_watchers",
-        channel="order.created",
-        data={"order_id": order_id, "status": "completed"},
-    )
-    print(f"Notified {count} watchers")
-```
-
-**Channel API with Delivery Modes** - subscribe to channels with explicit delivery semantics:
-
-```python
-from edda import workflow, subscribe, receive, publish, WorkflowContext
+from edda import workflow, subscribe, receive, publish, send_to, WorkflowContext
 
 # Job Worker - processes jobs exclusively (competing mode)
 @workflow
@@ -697,8 +637,11 @@ async def notification_handler(ctx: WorkflowContext, handler_id: str):
         await send_notification(ctx, msg.data)
         await ctx.recur(handler_id)
 
-# Publisher - send messages to channel
+# Publish to channel (all subscribers or one competing subscriber)
 await publish(ctx, channel="jobs", data={"task": "send_report"})
+
+# Direct message to specific workflow instance
+await send_to(ctx, instance_id="workflow-123", channel="approval", data={"approved": True})
 ```
 
 **Delivery modes**:
@@ -708,7 +651,7 @@ await publish(ctx, channel="jobs", data={"task": "send_report"})
 **Key features**:
 - **Channel-based messaging**: Messages are delivered to workflows waiting on specific channels
 - **Competing vs Broadcast**: Choose semantics per subscription
-- **Group communication**: Erlang pg-style groups for loose coupling and fan-out
+- **Direct messaging**: `send_to()` for workflow-to-workflow communication
 - **Database-backed**: All messages are persisted for durability
 - **Lock-first delivery**: Safe for multi-worker environments
 

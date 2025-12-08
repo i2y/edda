@@ -445,15 +445,40 @@ async def publish(
     message_id = await storage.publish_to_channel(channel, data, full_metadata)
 
     # Wake up waiting subscribers
-    await _wake_waiting_subscribers(
-        storage,
-        channel,
-        message_id,
-        data,
-        full_metadata,
-        target_instance_id=target_instance_id,
-        worker_id=effective_worker_id,
-    )
+    # If in a transaction, defer delivery until after commit to ensure atomicity
+    if storage.in_transaction():
+        # Capture current values for the closure
+        _storage = storage
+        _channel = channel
+        _message_id = message_id
+        _data = data
+        _metadata = full_metadata
+        _target_instance_id = target_instance_id
+        _worker_id = effective_worker_id
+
+        async def deferred_wake() -> None:
+            await _wake_waiting_subscribers(
+                _storage,
+                _channel,
+                _message_id,
+                _data,
+                _metadata,
+                target_instance_id=_target_instance_id,
+                worker_id=_worker_id,
+            )
+
+        storage.register_post_commit_callback(deferred_wake)
+    else:
+        # Not in transaction - deliver immediately
+        await _wake_waiting_subscribers(
+            storage,
+            channel,
+            message_id,
+            data,
+            full_metadata,
+            target_instance_id=target_instance_id,
+            worker_id=effective_worker_id,
+        )
 
     return message_id
 

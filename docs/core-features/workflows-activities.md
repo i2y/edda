@@ -764,10 +764,10 @@ In long-running loops, every activity adds an entry to the workflow history. Aft
 # ❌ Problematic: History grows forever
 @workflow
 async def notification_service(ctx: WorkflowContext):
-    await join_group(ctx, group="order_watchers")
+    await subscribe(ctx, "order.completed", mode="broadcast")
 
     while True:
-        msg = await wait_message(ctx, channel="order.completed")
+        msg = await receive(ctx, "order.completed")
         await send_notification(ctx, msg.data)
         # After 10,000 iterations: 10,000+ history entries!
 ```
@@ -780,11 +780,11 @@ Use `ctx.recur()` to restart the workflow with fresh history while preserving st
 # ✅ Good: Reset history periodically
 @workflow
 async def notification_service(ctx: WorkflowContext, processed_count: int = 0):
-    await join_group(ctx, group="order_watchers")
+    await subscribe(ctx, "order.completed", mode="broadcast")
 
     count = 0
     while True:
-        msg = await wait_message(ctx, channel="order.completed")
+        msg = await receive(ctx, "order.completed")
         await send_notification(ctx, msg.data, activity_id=f"notify:{msg.id}")
 
         count += 1

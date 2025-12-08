@@ -28,14 +28,19 @@ class TestDeliverMessageLockFirst:
             owner_service="test-service",
             input_data={"test": "data"},
         )
-        # Acquire lock and register subscription (which releases lock and sets status)
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="test_channel",
+            mode="broadcast",
+        )
+        # Acquire lock and register channel receive (which releases lock and sets status)
         await sqlite_storage.try_acquire_lock(instance_id, "setup-worker")
-        await sqlite_storage.register_message_subscription_and_release_lock(
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="setup-worker",
             channel="test_channel",
             activity_id="wait_message_test_channel:1",
-            timeout_at=None,
         )
         return instance_id
 
@@ -223,14 +228,19 @@ class TestDeliverMessageLockFirst:
             owner_service="test-service",
             input_data={"test": "data"},
         )
-        # Register subscription
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="binary_channel",
+            mode="broadcast",
+        )
+        # Register channel receive
         await sqlite_storage.try_acquire_lock(instance_id, "setup-worker")
-        await sqlite_storage.register_message_subscription_and_release_lock(
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="setup-worker",
             channel="binary_channel",
             activity_id="wait_message_binary_channel:1",
-            timeout_at=None,
         )
 
         # Deliver binary message

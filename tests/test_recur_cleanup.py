@@ -40,19 +40,25 @@ class TestRecurSubscriptionCleanup:
         """Test that cleanup_instance_subscriptions removes event subscriptions.
 
         Note: CloudEvents internally uses Message Passing, so event subscriptions
-        are registered via message subscription API with lock-first pattern.
+        are registered via channel subscription API with lock-first pattern.
         """
         instance_id = workflow_instance
 
-        # Acquire lock first, then register message subscription (which releases lock)
-        # CloudEvents uses Message Passing internally
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="order.created",
+            mode="broadcast",
+        )
+
+        # Acquire lock first, then register channel receive (which releases lock)
         await sqlite_storage.try_acquire_lock(instance_id, "test-worker")
-        await sqlite_storage.register_message_subscription_and_release_lock(
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="test-worker",
             channel="order.created",
             activity_id="wait_message_order.created:1",
-            timeout_at=datetime.now(UTC) + timedelta(hours=1),
+            timeout_seconds=3600,  # 1 hour
         )
 
         # Verify subscription exists
@@ -112,14 +118,20 @@ class TestRecurSubscriptionCleanup:
         """Test that cleanup_instance_subscriptions removes message subscriptions."""
         instance_id = workflow_instance
 
-        # Acquire lock first, then register message subscription (which releases lock)
+        # Subscribe to channel first
+        await sqlite_storage.subscribe_to_channel(
+            instance_id=instance_id,
+            channel="approval",
+            mode="broadcast",
+        )
+
+        # Acquire lock first, then register channel receive (which releases lock)
         await sqlite_storage.try_acquire_lock(instance_id, "test-worker")
-        await sqlite_storage.register_message_subscription_and_release_lock(
+        await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=instance_id,
             worker_id="test-worker",
             channel="approval",
             activity_id="wait_message_approval:1",
-            timeout_at=None,
         )
 
         # Verify subscription exists
@@ -164,20 +176,27 @@ class TestRecurSubscriptionCleanup:
         """Test cleanup with multiple event subscriptions.
 
         Note: CloudEvents internally uses Message Passing, so we register
-        message subscriptions. Each subscription requires lock-first pattern.
+        channel subscriptions. Each subscription requires lock-first pattern.
         """
         instance_id = workflow_instance
         channels = ["order.created", "order.shipped", "order.completed"]
 
-        # Register multiple message subscriptions (lock-first pattern for each)
+        # Register multiple channel subscriptions (lock-first pattern for each)
         for i, channel in enumerate(channels, start=1):
+            # Subscribe to channel first
+            await sqlite_storage.subscribe_to_channel(
+                instance_id=instance_id,
+                channel=channel,
+                mode="broadcast",
+            )
+            # Acquire lock and register channel receive
             await sqlite_storage.try_acquire_lock(instance_id, "test-worker")
-            await sqlite_storage.register_message_subscription_and_release_lock(
+            await sqlite_storage.register_channel_receive_and_release_lock(
                 instance_id=instance_id,
                 worker_id="test-worker",
                 channel=channel,
                 activity_id=f"wait_message_{channel}:{i}",
-                timeout_at=datetime.now(UTC) + timedelta(hours=1),
+                timeout_seconds=3600,  # 1 hour
             )
 
         # Verify subscriptions exist

@@ -190,6 +190,10 @@ strict_equality = true
 module = "tests.*"
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = "opentelemetry.*"
+ignore_missing_imports = true
+
 [dependency-groups]
 dev = [
     "mkdocstrings-python>=2.0.1",
