@@ -496,6 +496,80 @@ async def temporary_subscriber(ctx: WorkflowContext):
     # Continue with other work...
 ```
 
+## Transactional Message Processing
+
+When using channel-based messaging inside activities, both `publish()` and `receive()` participate in the activity's database transaction.
+
+### Transactional Publish
+
+When `publish()` is called inside an activity, the message is only published **after the transaction commits**:
+
+```python
+@activity  # transactional=True by default
+async def process_order(ctx: WorkflowContext, order_id: str):
+    # Do some work...
+    result = await do_processing(order_id)
+
+    # Message is queued for post-commit delivery
+    await publish(ctx, "order.completed", {"order_id": order_id})
+
+    return result  # Commit: message is now published
+```
+
+**Behavior:**
+- If the activity **succeeds**: Message is published after commit
+- If the activity **fails**: Message is **NOT** published (rollback)
+
+This ensures that messages are only sent when the associated business logic succeeds.
+
+### Transactional Receive
+
+When `receive()` is called inside an activity, the message claim is part of the transaction:
+
+```python
+@activity  # transactional=True by default
+async def process_job(ctx: WorkflowContext, channel: str):
+    msg = await receive(ctx, channel)  # Claim is part of transaction
+
+    # Process the message...
+    result = await do_work(msg.data)
+
+    return result  # Commit: claim is finalized
+```
+
+**Behavior:**
+- If the activity **succeeds**: Message claim is committed, message is processed
+- If the activity **fails**: Message claim is rolled back, message returns to queue
+
+This provides **at-least-once delivery** semantics - if processing fails, the message will be redelivered to another subscriber.
+
+### Recommended Pattern
+
+For reliable message processing, wrap `receive()` calls inside activities:
+
+```python
+@workflow
+async def job_worker(ctx: WorkflowContext, worker_id: str):
+    await subscribe(ctx, "jobs", mode="competing")
+
+    while True:
+        # Process job inside activity for transactional guarantees
+        await process_job(ctx, "jobs", activity_id="process:1")
+        await ctx.recur(worker_id)
+
+@activity
+async def process_job(ctx: WorkflowContext, channel: str):
+    msg = await receive(ctx, channel)  # Part of activity transaction
+
+    # Do work...
+    await execute_task(msg.data)
+
+    # Publish completion notification (also transactional)
+    await publish(ctx, "job.completed", {"job_id": msg.id})
+
+    return {"processed": msg.id}
+```
+
 ## Performance Considerations
 
 ### Database-Backed Durability
