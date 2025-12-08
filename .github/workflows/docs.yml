@@ -23,8 +23,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Zensical
-        run: pip install zensical
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install documentation dependencies
+        run: uv pip install zensical mkdocstrings-python
 
       - name: Build documentation
         run: zensical build --clean
