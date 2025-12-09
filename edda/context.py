@@ -217,6 +217,14 @@ class WorkflowContext:
                 # Cache the timer result for wait_timer replay
                 # Timer returns None, so we cache the result field
                 self._history_cache[activity_id] = event_data.get("result")
+            elif event_type == "MessageTimeout":
+                # Cache the timeout error for receive() replay
+                # This allows TimeoutError to be raised and caught in workflow code
+                self._history_cache[activity_id] = {
+                    "_error": True,
+                    "error_type": event_data.get("error_type", "TimeoutError"),
+                    "error_message": event_data.get("error_message", "Message timeout"),
+                }
 
         self._history_loaded = True
 

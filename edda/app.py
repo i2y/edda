@@ -709,7 +709,6 @@ class EddaApp:
             instance_id = subscription["instance_id"]
             channel = subscription["channel"]
             timeout_at = subscription["timeout_at"]
-            created_at = subscription["created_at"]
 
             # Lock-First pattern: Try to acquire the lock before processing
             # If we can't get the lock, another worker is processing this workflow
@@ -777,48 +776,28 @@ class EddaApp:
                 # 2. Remove message subscription
                 await self.storage.remove_message_subscription(instance_id, channel)
 
-                # 3. Fail the workflow with TimeoutError
-                import traceback
-
-                # Get timeout_seconds from timeout_at and created_at
-                # Handle both datetime objects and ISO strings
-                try:
-                    timeout_dt = (
-                        timeout_at
-                        if isinstance(timeout_at, dt_type)
-                        else dt_type.fromisoformat(str(timeout_at))
+                # 3. Resume workflow (lock already held - distributed coroutine pattern)
+                # The workflow will replay and receive() will raise TimeoutError from cached history
+                workflow_name = subscription.get("workflow_name")
+                if not workflow_name:
+                    logger.warning(
+                        "No workflow_name in subscription for %s, skipping",
+                        instance_id,
                     )
-                    created_dt = (
-                        created_at
-                        if isinstance(created_at, dt_type)
-                        else dt_type.fromisoformat(str(created_at))
-                    )
-                    # Calculate the original timeout duration (timeout_at - created_at)
-                    timeout_seconds = int((timeout_dt - created_dt).total_seconds())
-                except Exception:
-                    timeout_seconds = 0  # Fallback
+                    continue
 
-                error = TimeoutError(
-                    f"Message on channel '{channel}' did not arrive within {timeout_seconds} seconds"
-                )
-                stack_trace = "".join(
-                    traceback.format_exception(type(error), error, error.__traceback__)
-                )
+                if self.replay_engine is None:
+                    logger.error("Replay engine not initialized")
+                    continue
 
-                # Update workflow status to failed with error details
-                await self.storage.update_instance_status(
-                    instance_id,
-                    "failed",
-                    {
-                        "error_message": str(error),
-                        "error_type": "TimeoutError",
-                        "stack_trace": stack_trace,
-                    },
+                await self.replay_engine.resume_by_name(
+                    instance_id, workflow_name, already_locked=True
                 )
 
                 logger.debug(
-                    "Marked workflow %s as failed due to message timeout",
+                    "Resumed workflow %s after message timeout on channel '%s'",
                     instance_id,
+                    channel,
                 )
 
             except Exception as e:
