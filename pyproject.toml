@@ -55,6 +55,9 @@ viewer = [
 postgresql = [
     "asyncpg>=0.30.0",
 ]
+postgres-notify = [
+    "asyncpg>=0.30.0",
+]
 mysql = [
     "aiomysql>=0.2.0",
 ]
@@ -65,6 +68,9 @@ opentelemetry = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
+]
+cpu-monitor = [
+    "psutil>=5.9.0",
 ]
 
 [project.scripts]
@@ -192,6 +198,10 @@ disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
 module = "opentelemetry.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
 ignore_missing_imports = true
 
 [dependency-groups]

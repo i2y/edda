@@ -27,6 +27,7 @@ Edda is a lightweight durable execution framework for Python that runs as a **li
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
 - 📬 **Message Passing**: Channel-based messaging (broadcast/competing modes) and direct workflow-to-workflow communication
+- ⚡ **Instant Notifications**: Optional PostgreSQL LISTEN/NOTIFY for near-instant event delivery
 
 ## Use Cases
 

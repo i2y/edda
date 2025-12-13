@@ -48,6 +48,7 @@ class OutboxRelayer:
         max_retries: int = 3,
         batch_size: int = 10,
         max_age_hours: float | None = None,
+        wake_event: asyncio.Event | None = None,
     ):
         """
         Initialize the Outbox Relayer.
@@ -60,6 +61,8 @@ class OutboxRelayer:
             batch_size: Number of events to process per batch (default: 10)
             max_age_hours: Maximum event age in hours before expiration (default: None, disabled)
                           Events older than this are marked as 'expired' and won't be retried.
+            wake_event: Optional asyncio.Event to wake the relayer immediately when new
+                       events are added. Used with PostgreSQL LISTEN/NOTIFY integration.
         """
         self.storage = storage
         self.broker_url = broker_url
@@ -67,6 +70,7 @@ class OutboxRelayer:
         self.max_retries = max_retries
         self.batch_size = batch_size
         self.max_age_hours = max_age_hours
+        self._wake_event = wake_event
 
         self._task: asyncio.Task[Any] | None = None
         self._running = False
@@ -120,6 +124,8 @@ class OutboxRelayer:
         Main polling loop.
 
         Continuously polls the database for pending events and publishes them.
+        When wake_event is provided (PostgreSQL NOTIFY integration), wakes up
+        immediately on notification, otherwise falls back to poll_interval.
         """
         while self._running:
             try:
@@ -127,8 +133,21 @@ class OutboxRelayer:
             except Exception as e:
                 logger.error(f"Error in outbox relayer poll loop: {e}")
 
-            # Wait before next poll
-            await asyncio.sleep(self.poll_interval)
+            # Wait before next poll (with optional NOTIFY wake)
+            if self._wake_event is not None:
+                try:
+                    await asyncio.wait_for(
+                        self._wake_event.wait(),
+                        timeout=self.poll_interval,
+                    )
+                    # Clear the event for next notification
+                    self._wake_event.clear()
+                    logger.debug("Outbox relayer woken by NOTIFY")
+                except TimeoutError:
+                    # Fallback polling timeout reached
+                    pass
+            else:
+                await asyncio.sleep(self.poll_interval)
 
     async def _poll_and_publish(self) -> None:
         """

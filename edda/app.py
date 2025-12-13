@@ -8,10 +8,12 @@ application for handling CloudEvents and executing workflows.
 import asyncio
 import json
 import logging
+import math
 import random
 import sys
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import uvloop
 from cloudevents.exceptions import GenericException as CloudEventsException
@@ -55,6 +57,11 @@ class EddaApp:
         pool_timeout: int = 30,
         pool_recycle: int = 3600,
         pool_pre_ping: bool = True,
+        # PostgreSQL LISTEN/NOTIFY settings
+        use_listen_notify: bool | None = None,
+        notify_fallback_interval: int = 30,
+        # Batch processing settings
+        max_workflows_per_batch: int | Literal["auto", "auto:cpu"] = 10,
     ):
         """
         Initialize Edda application.
@@ -81,6 +88,17 @@ class EddaApp:
                          Helps prevent stale connections. Ignored for SQLite.
             pool_pre_ping: If True, test connections before use (default: True).
                           Helps detect disconnected connections. Ignored for SQLite.
+            use_listen_notify: Enable PostgreSQL LISTEN/NOTIFY for instant notifications.
+                              None (default) = auto-detect (enabled for PostgreSQL, disabled for others).
+                              True = force enable (raises error if not PostgreSQL).
+                              False = force disable (use polling only).
+            notify_fallback_interval: Polling interval in seconds when NOTIFY is enabled.
+                                     Used as backup for missed notifications. Default: 30 seconds.
+                                     SQLite/MySQL always use their default polling intervals.
+            max_workflows_per_batch: Maximum workflows to process per resume cycle.
+                                    - int: Fixed batch size (default: 10)
+                                    - "auto": Scale 10-100 based on queue depth
+                                    - "auto:cpu": Scale 10-100 based on CPU utilization (requires psutil)
         """
         self.db_url = db_url
         self.service_name = service_name
@@ -98,6 +116,12 @@ class EddaApp:
         self._pool_timeout = pool_timeout
         self._pool_recycle = pool_recycle
         self._pool_pre_ping = pool_pre_ping
+
+        # PostgreSQL LISTEN/NOTIFY settings
+        self._use_listen_notify = use_listen_notify
+        self._notify_fallback_interval = notify_fallback_interval
+        self._notify_listener: Any = None
+        self._notify_enabled = False
 
         # Generate unique worker ID for this process
         self.worker_id = generate_worker_id(service_name)
@@ -117,6 +141,31 @@ class EddaApp:
         # Background tasks
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._initialized = False
+
+        # Wake event for notify-triggered background tasks
+        self._resume_wake_event: asyncio.Event | None = None
+        self._outbox_wake_event: asyncio.Event | None = None
+
+        # Rate limiting for NOTIFY handlers (to reduce thundering herd)
+        self._last_resume_notify_time: float = 0.0
+        self._last_outbox_notify_time: float = 0.0
+        self._notify_rate_limit: float = 0.1  # 100ms minimum interval
+
+        # Batch processing settings for load balancing
+        if isinstance(max_workflows_per_batch, int):
+            self._max_workflows_per_batch: int = max_workflows_per_batch
+            self._batch_size_strategy: str | None = None
+        elif max_workflows_per_batch == "auto":
+            self._max_workflows_per_batch = 10  # Initial value
+            self._batch_size_strategy = "queue"  # Scale based on queue depth
+        elif max_workflows_per_batch == "auto:cpu":
+            self._max_workflows_per_batch = 10  # Initial value
+            self._batch_size_strategy = "cpu"  # Scale based on CPU utilization
+        else:
+            raise ValueError(
+                f"Invalid max_workflows_per_batch: {max_workflows_per_batch}. "
+                "Must be int, 'auto', or 'auto:cpu'."
+            )
 
     def _create_storage(self, db_url: str) -> SQLAlchemyStorage:
         """
@@ -166,6 +215,162 @@ class EddaApp:
 
         return SQLAlchemyStorage(engine)
 
+    def _is_postgresql_url(self, db_url: str) -> bool:
+        """Check if the database URL is for PostgreSQL."""
+        return db_url.startswith("postgresql")
+
+    async def _initialize_notify_listener(self) -> None:
+        """Initialize PostgreSQL LISTEN/NOTIFY listener if applicable.
+
+        This sets up the notification system based on configuration:
+        - None (auto): Enable for PostgreSQL, disable for others
+        - True: Force enable (error if not PostgreSQL)
+        - False: Force disable
+        """
+        is_pg = self._is_postgresql_url(self.db_url)
+
+        # Determine if we should use NOTIFY
+        if self._use_listen_notify is None:
+            # Auto-detect: enable for PostgreSQL only
+            should_use_notify = is_pg
+        elif self._use_listen_notify:
+            # Force enable: error if not PostgreSQL
+            if not is_pg:
+                raise ValueError(
+                    "use_listen_notify=True requires PostgreSQL database. "
+                    f"Current database URL starts with: {self.db_url.split(':')[0]}"
+                )
+            should_use_notify = True
+        else:
+            # Force disable
+            should_use_notify = False
+
+        if should_use_notify:
+            try:
+                from edda.storage.pg_notify import PostgresNotifyListener
+
+                # Convert SQLAlchemy URL to asyncpg DSN format
+                asyncpg_dsn = self._get_asyncpg_dsn(self.db_url)
+
+                self._notify_listener = PostgresNotifyListener(dsn=asyncpg_dsn)
+                await self._notify_listener.start()
+
+                # Set listener on storage for NOTIFY calls
+                self.storage.set_notify_listener(self._notify_listener)
+
+                # Initialize wake events for background tasks
+                self._resume_wake_event = asyncio.Event()
+                self._outbox_wake_event = asyncio.Event()
+
+                # Subscribe to notification channels
+                await self._setup_notify_subscriptions()
+
+                self._notify_enabled = True
+                logger.info(
+                    "PostgreSQL LISTEN/NOTIFY enabled "
+                    f"(fallback polling interval: {self._notify_fallback_interval}s)"
+                )
+
+            except ImportError:
+                logger.warning(
+                    "asyncpg not installed, falling back to polling-only mode. "
+                    "Install with: pip install edda[postgres-notify]"
+                )
+                self._notify_enabled = False
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize NOTIFY listener: {e}. "
+                    "Falling back to polling-only mode."
+                )
+                self._notify_enabled = False
+        else:
+            db_type = self.db_url.split(":")[0]
+            logger.info(
+                f"LISTEN/NOTIFY not available for {db_type}, "
+                "using polling-only mode (default intervals)"
+            )
+
+    def _get_asyncpg_dsn(self, db_url: str) -> str:
+        """Convert SQLAlchemy PostgreSQL URL to asyncpg DSN format.
+
+        SQLAlchemy format: postgresql+asyncpg://user:pass@host/db
+        asyncpg format: postgresql://user:pass@host/db
+        """
+        # Remove +asyncpg driver suffix if present
+        if "+asyncpg" in db_url:
+            return db_url.replace("+asyncpg", "")
+        return db_url
+
+    async def _setup_notify_subscriptions(self) -> None:
+        """Set up LISTEN subscriptions for notification channels."""
+        if self._notify_listener is None:
+            return
+
+        # Subscribe to workflow resumable notifications
+        await self._notify_listener.subscribe(
+            "edda_workflow_resumable",
+            self._on_workflow_resumable_notify,
+        )
+
+        # Subscribe to outbox notifications
+        await self._notify_listener.subscribe(
+            "edda_outbox_pending",
+            self._on_outbox_pending_notify,
+        )
+
+        # Subscribe to timer expired notifications
+        await self._notify_listener.subscribe(
+            "edda_timer_expired",
+            self._on_timer_expired_notify,
+        )
+
+        logger.debug("Subscribed to NOTIFY channels")
+
+    async def _on_workflow_resumable_notify(self, _payload: str) -> None:
+        """Handle workflow resumable notification with rate limiting."""
+        try:
+            # Rate limit to reduce thundering herd
+            now = time.monotonic()
+            if now - self._last_resume_notify_time < self._notify_rate_limit:
+                return  # Skip if within rate limit window
+            self._last_resume_notify_time = now
+
+            # Wake up the resume polling loop
+            if self._resume_wake_event is not None:
+                self._resume_wake_event.set()
+        except Exception as e:
+            logger.warning(f"Error handling workflow resumable notify: {e}")
+
+    async def _on_outbox_pending_notify(self, _payload: str) -> None:
+        """Handle outbox pending notification with rate limiting."""
+        try:
+            # Rate limit to reduce thundering herd
+            now = time.monotonic()
+            if now - self._last_outbox_notify_time < self._notify_rate_limit:
+                return  # Skip if within rate limit window
+            self._last_outbox_notify_time = now
+
+            # Wake up the outbox polling loop
+            if self._outbox_wake_event is not None:
+                self._outbox_wake_event.set()
+        except Exception as e:
+            logger.warning(f"Error handling outbox pending notify: {e}")
+
+    async def _on_timer_expired_notify(self, _payload: str) -> None:
+        """Handle timer expired notification with rate limiting."""
+        try:
+            # Rate limit (shares with workflow resumable since they use same event)
+            now = time.monotonic()
+            if now - self._last_resume_notify_time < self._notify_rate_limit:
+                return  # Skip if within rate limit window
+            self._last_resume_notify_time = now
+
+            # Wake up the resume polling loop (timer expiry leads to workflow resume)
+            if self._resume_wake_event is not None:
+                self._resume_wake_event.set()
+        except Exception as e:
+            logger.warning(f"Error handling timer expired notify: {e}")
+
     async def initialize(self) -> None:
         """
         Initialize the application.
@@ -185,6 +390,9 @@ class EddaApp:
         # Initialize storage
         await self.storage.initialize()
 
+        # Initialize LISTEN/NOTIFY if enabled
+        await self._initialize_notify_listener()
+
         # Initialize replay engine
         self.replay_engine = ReplayEngine(
             storage=self.storage,
@@ -200,12 +408,17 @@ class EddaApp:
         # Initialize outbox relayer if enabled
         if self.outbox_enabled:
             assert self.broker_url is not None  # Validated in __init__
+            # Use longer poll interval with NOTIFY fallback
+            outbox_poll_interval = (
+                float(self._notify_fallback_interval) if self._notify_enabled else 1.0
+            )
             self.outbox_relayer = OutboxRelayer(
                 storage=self.storage,
                 broker_url=self.broker_url,
-                poll_interval=1.0,
+                poll_interval=outbox_poll_interval,
                 max_retries=3,
                 batch_size=10,
+                wake_event=self._outbox_wake_event,
             )
             await self.outbox_relayer.start()
 
@@ -226,6 +439,14 @@ class EddaApp:
         # Stop outbox relayer if enabled
         if self.outbox_relayer:
             await self.outbox_relayer.stop()
+
+        # Stop NOTIFY listener if enabled
+        if self._notify_listener is not None:
+            try:
+                await self._notify_listener.stop()
+                logger.info("NOTIFY listener stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping NOTIFY listener: {e}")
 
         # Cancel background tasks
         for task in self._background_tasks:
@@ -830,27 +1051,51 @@ class EddaApp:
 
         This provides fast resumption after message delivery. When deliver_message()
         sets a workflow's status to 'running' and releases the lock, this task
-        will pick it up within 1 second and resume it.
+        will pick it up and resume it.
 
-        Uses adaptive backoff to reduce DB load when no workflows are ready:
-        - When workflows are processed, uses base interval
+        When NOTIFY is enabled:
+        - Wakes up immediately when notified via _resume_wake_event
+        - Falls back to notify_fallback_interval (default 30s) if no notifications
+
+        When NOTIFY is disabled (SQLite/MySQL):
+        - Uses adaptive backoff to reduce DB load when no workflows are ready
+        - When workflows are processed, uses base interval (1s)
         - When no workflows found, exponentially backs off up to 60 seconds
         - Always adds jitter to prevent thundering herd in multi-pod deployments
 
         Args:
-            interval: Check interval in seconds (default: 1)
+            interval: Base check interval in seconds (default: 1)
         """
         consecutive_empty = 0  # Track empty results for adaptive backoff
+
+        # Use longer fallback interval when NOTIFY is enabled
+        effective_interval = self._notify_fallback_interval if self._notify_enabled else interval
+
         while True:
             try:
-                # Adaptive backoff: longer sleep when no work available
-                jitter = random.uniform(0, interval * 0.3)
-                if consecutive_empty > 0:
-                    # Exponential backoff: 2s, 4s, 8s, 16s, 32s, max 60s
-                    backoff = min(interval * (2 ** min(consecutive_empty, 5)), 60)
+                if self._notify_enabled and self._resume_wake_event is not None:
+                    # NOTIFY mode: wait for event or timeout
+                    jitter = random.uniform(0, effective_interval * 0.1)
+                    try:
+                        await asyncio.wait_for(
+                            self._resume_wake_event.wait(),
+                            timeout=effective_interval + jitter,
+                        )
+                        # Clear the event for next notification
+                        self._resume_wake_event.clear()
+                        logger.debug("Resume task woken by NOTIFY")
+                    except TimeoutError:
+                        # Fallback polling timeout reached
+                        pass
                 else:
-                    backoff = interval
-                await asyncio.sleep(backoff + jitter)
+                    # Polling mode: adaptive backoff
+                    jitter = random.uniform(0, interval * 0.3)
+                    if consecutive_empty > 0:
+                        # Exponential backoff: 2s, 4s, 8s, 16s, 32s, max 60s
+                        backoff = min(interval * (2 ** min(consecutive_empty, 5)), 60)
+                    else:
+                        backoff = interval
+                    await asyncio.sleep(backoff + jitter)
 
                 count = await self._resume_running_workflows()
                 if count == 0:
@@ -861,6 +1106,58 @@ class EddaApp:
                 consecutive_empty = 0  # Reset on error
                 logger.error("Error in periodic resume check: %s", e, exc_info=True)
 
+    def _calculate_effective_batch_size(self, pending_count: int) -> int:
+        """
+        Calculate the effective batch size based on the configured strategy.
+
+        Args:
+            pending_count: Number of resumable workflows detected in the previous cycle.
+
+        Returns:
+            Effective batch size to use for the next cycle.
+
+        Strategies:
+            - None (static): Returns the configured _max_workflows_per_batch
+            - "queue": Scales 10-100 based on queue depth
+            - "cpu": Scales 10-100 based on CPU utilization (requires psutil)
+        """
+        if self._batch_size_strategy is None:
+            return self._max_workflows_per_batch
+
+        base_size = 10
+        max_size = 100
+
+        if self._batch_size_strategy == "queue":
+            # Queue-based scaling: scale up when more workflows are waiting
+            if pending_count <= base_size:
+                return base_size
+            scale_factor = min(math.ceil(pending_count / base_size), max_size // base_size)
+            return min(base_size * scale_factor, max_size)
+
+        elif self._batch_size_strategy == "cpu":
+            # CPU-based scaling: scale up when CPU is idle, down when busy
+            try:
+                import psutil  # type: ignore[import-untyped]
+
+                cpu_percent = psutil.cpu_percent(interval=None)  # Non-blocking
+
+                if cpu_percent < 30:
+                    return max_size  # Low load: process aggressively
+                elif cpu_percent < 50:
+                    return 50  # Medium load
+                elif cpu_percent < 70:
+                    return 20  # Higher load
+                else:
+                    return base_size  # High load: process conservatively
+            except ImportError:
+                logger.warning(
+                    "psutil not installed, falling back to default batch size. "
+                    "Install with: pip install edda-framework[cpu-monitor]"
+                )
+                return self._max_workflows_per_batch
+
+        return self._max_workflows_per_batch
+
     async def _resume_running_workflows(self) -> int:
         """
         Find and resume workflows that are ready to run.
@@ -868,13 +1165,21 @@ class EddaApp:
         Finds workflows with status='running' that don't have a lock,
         acquires a lock, and resumes them.
 
+        Uses batch limiting to ensure fair load distribution across workers.
+        Supports static batch size and dynamic auto-scaling strategies.
+
         Returns:
             Number of workflows successfully processed (lock acquired and resumed).
         """
-        resumable = await self.storage.find_resumable_workflows()
+        effective_batch = self._max_workflows_per_batch
+        resumable = await self.storage.find_resumable_workflows(limit=effective_batch)
         processed_count = 0
 
         for workflow_info in resumable:
+            # Batch limit for load balancing across workers
+            if processed_count >= effective_batch:
+                break
+
             instance_id = workflow_info["instance_id"]
             workflow_name = workflow_info["workflow_name"]
 
@@ -882,7 +1187,7 @@ class EddaApp:
                 # Try to acquire lock (Lock-First pattern)
                 lock_acquired = await self.storage.try_acquire_lock(instance_id, self.worker_id)
                 if not lock_acquired:
-                    # Another worker got it first, skip
+                    # Another worker got it first, skip (doesn't count toward limit)
                     continue
 
                 try:
@@ -900,6 +1205,10 @@ class EddaApp:
 
             except Exception as e:
                 logger.error("Error resuming %s: %s", instance_id, e, exc_info=True)
+
+        # Update batch size for next cycle (auto modes only)
+        if self._batch_size_strategy is not None:
+            self._max_workflows_per_batch = self._calculate_effective_batch_size(len(resumable))
 
         return processed_count
 

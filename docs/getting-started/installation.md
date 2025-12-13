@@ -38,6 +38,9 @@ uv add edda-framework --extra mysql
 # With Viewer UI (workflow visualization)
 uv add edda-framework --extra viewer
 
+# With PostgreSQL instant notifications (LISTEN/NOTIFY)
+uv add edda-framework --extra postgres-notify
+
 # All extras (PostgreSQL + MySQL + Viewer UI)
 uv add edda-framework --extra postgresql --extra mysql --extra viewer
 ```
@@ -48,6 +51,7 @@ uv add edda-framework --extra postgresql --extra mysql --extra viewer
 - **postgresql**: `asyncpg` driver for PostgreSQL
 - **mysql**: `aiomysql` driver for MySQL
 - **viewer**: `nicegui` and `httpx` for workflow visualization UI
+- **postgres-notify**: `asyncpg` driver for PostgreSQL LISTEN/NOTIFY instant notifications
 
 ### Using pip
 
@@ -65,6 +69,9 @@ pip install "edda-framework[mysql]"
 
 # With Viewer UI
 pip install "edda-framework[viewer]"
+
+# With PostgreSQL instant notifications
+pip install "edda-framework[postgres-notify]"
 
 # All extras
 pip install "edda-framework[postgresql,mysql,viewer]"
@@ -243,6 +250,44 @@ app = EddaApp(
     db_url="postgresql://user:password@localhost/edda_workflows"
 )
 ```
+
+#### Enabling Instant Notifications (LISTEN/NOTIFY)
+
+For near-instant event and message delivery, enable PostgreSQL LISTEN/NOTIFY:
+
+```bash
+# Install the postgres-notify extra
+uv add edda-framework --extra postgres-notify
+# or
+pip install "edda-framework[postgres-notify]"
+```
+
+```python
+from edda import EddaApp
+
+app = EddaApp(
+    service_name="demo-service",
+    db_url="postgresql://user:password@localhost/edda_workflows",
+    use_listen_notify=True,  # Enable LISTEN/NOTIFY (auto-detected by default)
+    notify_fallback_interval=30,  # Fallback polling interval in seconds
+)
+```
+
+**Configuration options:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_listen_notify` | `bool \| None` | `None` | `None` = auto-detect (enabled for PostgreSQL), `True` = force enable, `False` = force disable |
+| `notify_fallback_interval` | `int` | `30` | Fallback polling interval in seconds when NOTIFY is enabled |
+
+**Benefits:**
+
+- Near-instant event delivery (milliseconds vs. seconds with polling)
+- Reduced database load (fewer polling queries)
+- Automatic fallback to polling if NOTIFY fails
+- Automatic reconnection on connection loss
+
+See [PostgreSQL LISTEN/NOTIFY](../core-features/events/postgres-notify.md) for detailed documentation.
 
 ### MySQL
 

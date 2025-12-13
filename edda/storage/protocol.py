@@ -860,7 +860,7 @@ class StorageProtocol(Protocol):
     # Workflow Resumption Methods
     # -------------------------------------------------------------------------
 
-    async def find_resumable_workflows(self) -> list[dict[str, Any]]:
+    async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.
 
@@ -872,6 +872,10 @@ class StorageProtocol(Protocol):
 
         This allows immediate resumption after message delivery rather than
         waiting for the stale lock cleanup cycle (60+ seconds).
+
+        Args:
+            limit: Optional maximum number of workflows to return.
+                   If None, returns all resumable workflows.
 
         Returns:
             List of resumable workflows.

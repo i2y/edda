@@ -511,14 +511,43 @@ class SQLAlchemyStorage:
     - Automatic transaction management via @activity decorator
     """
 
-    def __init__(self, engine: AsyncEngine):
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        notify_listener: Any | None = None,
+    ):
         """
         Initialize SQLAlchemy storage.
 
         Args:
             engine: SQLAlchemy AsyncEngine instance
+            notify_listener: Optional notify listener for PostgreSQL LISTEN/NOTIFY.
+                            If provided and PostgreSQL is used, NOTIFY messages
+                            will be sent after key operations.
         """
         self.engine = engine
+        self._notify_listener = notify_listener
+
+    @property
+    def _is_postgresql(self) -> bool:
+        """Check if the database is PostgreSQL."""
+        return self.engine.dialect.name == "postgresql"
+
+    @property
+    def _notify_enabled(self) -> bool:
+        """Check if NOTIFY is enabled (PostgreSQL with listener)."""
+        return self._is_postgresql and self._notify_listener is not None
+
+    def set_notify_listener(self, listener: Any) -> None:
+        """Set the notify listener after initialization.
+
+        This allows setting the listener after EddaApp creates the storage,
+        useful for dependency injection patterns.
+
+        Args:
+            listener: NotifyProtocol implementation (PostgresNotifyListener or NoopNotifyListener)
+        """
+        self._notify_listener = listener
 
     async def initialize(self) -> None:
         """Initialize database connection and create tables.
@@ -543,6 +572,39 @@ class SQLAlchemyStorage:
     async def close(self) -> None:
         """Close database connection."""
         await self.engine.dispose()
+
+    async def _send_notify(
+        self,
+        channel: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Send PostgreSQL NOTIFY message.
+
+        This method sends a notification on the specified channel with the given
+        payload. It's a no-op if NOTIFY is not enabled (non-PostgreSQL or no listener).
+
+        Args:
+            channel: PostgreSQL NOTIFY channel name (max 63 chars).
+            payload: Dictionary to serialize as JSON payload (max ~7500 bytes).
+        """
+        if not self._notify_enabled:
+            return
+
+        try:
+            import json as json_module
+
+            payload_str = json_module.dumps(payload, separators=(",", ":"))
+
+            # Use a separate connection for NOTIFY to avoid transaction issues
+            async with self.engine.connect() as conn:
+                await conn.execute(
+                    text("SELECT pg_notify(:channel, :payload)"),
+                    {"channel": channel, "payload": payload_str},
+                )
+                await conn.commit()
+        except Exception as e:
+            # Log but don't fail - polling will catch it as backup
+            logger.warning(f"Failed to send NOTIFY on channel {channel}: {e}")
 
     async def _initialize_schema_version(self) -> None:
         """Initialize schema version for a fresh database."""
@@ -2096,6 +2158,12 @@ class SQLAlchemyStorage:
             session.add(event)
             await self._commit_if_not_in_transaction(session)
 
+        # Send NOTIFY for new outbox event
+        await self._send_notify(
+            "edda_outbox_pending",
+            {"evt_id": event_id, "evt_type": event_type},
+        )
+
     async def get_pending_outbox_events(self, limit: int = 10) -> list[dict[str, Any]]:
         """
         Get pending/failed outbox events for publishing (with row-level locking).
@@ -2719,29 +2787,34 @@ class SQLAlchemyStorage:
     # Workflow Resumption Methods
     # -------------------------------------------------------------------------
 
-    async def find_resumable_workflows(self) -> list[dict[str, Any]]:
+    async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.
 
         Returns workflows with status='running' that don't have an active lock.
         Used for immediate resumption after message delivery.
 
+        Args:
+            limit: Optional maximum number of workflows to return.
+                   If None, returns all resumable workflows.
+
         Returns:
             List of resumable workflows with instance_id and workflow_name.
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            result = await session.execute(
-                select(
-                    WorkflowInstance.instance_id,
-                    WorkflowInstance.workflow_name,
-                ).where(
-                    and_(
-                        WorkflowInstance.status == "running",
-                        WorkflowInstance.locked_by.is_(None),
-                    )
+            query = select(
+                WorkflowInstance.instance_id,
+                WorkflowInstance.workflow_name,
+            ).where(
+                and_(
+                    WorkflowInstance.status == "running",
+                    WorkflowInstance.locked_by.is_(None),
                 )
             )
+            if limit is not None:
+                query = query.limit(limit)
+            result = await session.execute(query)
             return [
                 {
                     "instance_id": row.instance_id,
@@ -2836,6 +2909,15 @@ class SQLAlchemyStorage:
             )
             session.add(msg)
             await self._commit_if_not_in_transaction(session)
+
+        # Send NOTIFY for message published (channel-specific)
+        import hashlib
+
+        channel_hash = hashlib.sha256(channel.encode()).hexdigest()[:16]
+        await self._send_notify(
+            f"edda_msg_{channel_hash}",
+            {"ch": channel, "msg_id": message_id},
+        )
 
         return message_id
 
@@ -3394,6 +3476,12 @@ class SQLAlchemyStorage:
                     )
 
                     await session.commit()
+
+                # Send NOTIFY for workflow resumable
+                await self._send_notify(
+                    "edda_workflow_resumable",
+                    {"wf_id": instance_id, "wf_name": workflow_name},
+                )
 
                 return {
                     "instance_id": instance_id,

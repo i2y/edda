@@ -29,6 +29,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
 - 📬 **Channel-based Messaging**: Actor-model style communication with competing (job queue) and broadcast (fan-out) modes
+- ⚡ **Instant Notifications**: PostgreSQL LISTEN/NOTIFY for near-instant event delivery (optional)
 - 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
@@ -163,6 +164,9 @@ uv add edda-framework --extra mysql
 # With Viewer UI
 uv add edda-framework --extra viewer
 
+# With PostgreSQL instant notifications (LISTEN/NOTIFY)
+uv add edda-framework --extra postgres-notify
+
 # All extras (PostgreSQL, MySQL, Viewer UI)
 uv add edda-framework --extra postgresql --extra mysql --extra viewer
 ```
@@ -213,6 +217,8 @@ pip install "git+https://github.com/i2y/edda.git[postgresql,viewer]"
 | **MySQL** | Production with existing MySQL infrastructure | ✅ Yes | ✅ Yes | Suitable for production - Good choice if you already use MySQL |
 
 **Important**: For multi-process or multi-pod deployments (K8s, Docker Compose with multiple replicas, etc.), you **must** use PostgreSQL or MySQL. SQLite supports multiple async workers within a single process, but its table-level locking makes it unsuitable for multi-process/multi-pod scenarios.
+
+> **Tip**: For PostgreSQL, install the `postgres-notify` extra for near-instant event delivery using LISTEN/NOTIFY instead of polling.
 
 ### Development Installation
 
@@ -434,6 +440,8 @@ app = EddaApp(
     # Connection pool settings (optional)
     pool_size=5,        # Concurrent connections
     max_overflow=10,    # Additional burst capacity
+    # Batch processing (optional)
+    max_workflows_per_batch=10,  # Or "auto" / "auto:cpu" for dynamic scaling
 )
 ```
 

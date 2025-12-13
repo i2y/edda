@@ -1,6 +1,7 @@
 """Demo Edda ASGI application for tsuno."""
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import datetime
@@ -8,9 +9,17 @@ from enum import Enum
 from typing import Any, cast
 
 import uvloop
-from pydantic import BaseModel, Field, field_validator
 
-from edda import (
+# Configure logging to see Edda startup messages (must be before edda import)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+from pydantic import BaseModel, Field, field_validator  # noqa: E402
+
+from edda import (  # noqa: E402
     EddaApp,
     RetryPolicy,
     WorkflowContext,
@@ -24,7 +33,7 @@ from edda import (
     wait_until,
     workflow,
 )
-from edda.wsgi import create_wsgi_app
+from edda.wsgi import create_wsgi_app  # noqa: E402
 
 # Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
 if sys.version_info >= (3, 12):
@@ -408,9 +417,18 @@ class ScheduledShipmentResult(BaseModel):
 
 # Create Edda application
 # Use environment variable EDDA_DB_URL if available, otherwise default to sqlite:///demo.db
+# Use EDDA_USE_NOTIFY to control LISTEN/NOTIFY (true/false/auto, default: auto)
+_use_notify_env = os.getenv("EDDA_USE_NOTIFY", "auto").lower()
+_use_listen_notify: bool | None = None  # Auto-detect
+if _use_notify_env == "true":
+    _use_listen_notify = True
+elif _use_notify_env == "false":
+    _use_listen_notify = False
+
 app = EddaApp(
     service_name="demo-service",
     db_url=os.getenv("EDDA_DB_URL", "sqlite:///demo.db"),
+    use_listen_notify=_use_listen_notify,
 )
 
 
@@ -2115,7 +2133,7 @@ async def job_publisher_workflow(
     """
     print(f"\n[PUBLISHER] Publishing job: {input.task}")
     await publish(ctx, "jobs", {"task": input.task})
-    print(f"[PUBLISHER] Job published to 'jobs' channel")
+    print("[PUBLISHER] Job published to 'jobs' channel")
     return {"published": True, "channel": "jobs", "task": input.task}
 
 
@@ -2135,7 +2153,7 @@ async def notification_publisher_workflow(
     """
     print(f"\n[PUBLISHER] Publishing notification: {input.message}")
     await publish(ctx, "notifications", {"message": input.message})
-    print(f"[PUBLISHER] Notification published to 'notifications' channel")
+    print("[PUBLISHER] Notification published to 'notifications' channel")
     return {"published": True, "channel": "notifications", "message": input.message}
 
 
@@ -2194,7 +2212,7 @@ async def direct_message_sender_workflow(
 
     await send_to(ctx, input.target_instance_id, {"message": input.message})
 
-    print(f"[SENDER] Message sent!")
+    print("[SENDER] Message sent!")
     return DirectMessageSenderResult(
         sent=True,
         target_instance_id=input.target_instance_id,

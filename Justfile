@@ -11,7 +11,7 @@ install:
 
 # Install all dependencies including database drivers
 install-all:
-    uv sync --extra dev --extra postgresql --extra mysql
+    uv sync --extra dev --extra postgresql --extra mysql --extra postgres-notify
 
 # Install viewer dependencies
 install-viewer:
@@ -71,15 +71,32 @@ demo:
 # Run demo application with PostgreSQL (requires local PostgreSQL)
 # Usage: just demo-postgresql
 # Requires: EDDA_POSTGRES_PASSWORD environment variable
+# Uses LISTEN/NOTIFY for instant notifications (auto-detected)
 demo-postgresql:
     @echo "Stopping existing demo app on port 8001..."
     @lsof -ti :8001 | xargs kill -15 2>/dev/null || true
     @sleep 1
     @lsof -ti :8001 | xargs kill -9 2>/dev/null || true
     @echo "Ensuring server and PostgreSQL dependencies are installed..."
-    @uv sync --extra server --extra postgresql --quiet
-    @echo "Starting demo app with PostgreSQL..."
+    @uv sync --extra server --extra postgresql --extra postgres-notify --quiet
+    @echo "Starting demo app with PostgreSQL (NOTIFY enabled)..."
     EDDA_DB_URL="postgresql+asyncpg://postgres:{{env_var('EDDA_POSTGRES_PASSWORD')}}@localhost:5432/edda" \
+    uv run tsuno demo_app:application --bind 127.0.0.1:8001
+
+# Run demo application with PostgreSQL but WITHOUT NOTIFY (polling only)
+# Usage: just demo-postgresql-polling
+# Requires: EDDA_POSTGRES_PASSWORD environment variable
+# Uses polling-only mode (no LISTEN/NOTIFY) for comparison testing
+demo-postgresql-polling:
+    @echo "Stopping existing demo app on port 8001..."
+    @lsof -ti :8001 | xargs kill -15 2>/dev/null || true
+    @sleep 1
+    @lsof -ti :8001 | xargs kill -9 2>/dev/null || true
+    @echo "Ensuring server and PostgreSQL dependencies are installed..."
+    @uv sync --extra server --extra postgresql --quiet
+    @echo "Starting demo app with PostgreSQL (polling only, NOTIFY disabled)..."
+    EDDA_DB_URL="postgresql+asyncpg://postgres:{{env_var('EDDA_POSTGRES_PASSWORD')}}@localhost:5432/edda" \
+    EDDA_USE_NOTIFY=false \
     uv run tsuno demo_app:application --bind 127.0.0.1:8001
 
 # Run viewer with demo_app using PostgreSQL (requires local PostgreSQL)
