@@ -1,6 +1,6 @@
 [project]
 name = "edda-framework"
-version = "0.9.1"
+version = "0.10.0"
 description = "Lightweight Durable Execution Framework"
 authors = [
     { name = "Yasushi Itoh", email = "6240399+i2y@users.noreply.github.com" }
