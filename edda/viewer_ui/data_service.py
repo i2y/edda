@@ -48,6 +48,7 @@ class WorkflowDataService:
         search_query: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        input_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Get workflow instances with cursor-based pagination and filtering.
@@ -59,6 +60,8 @@ class WorkflowDataService:
             search_query: Search by workflow name or instance ID (partial match)
             started_after: Filter instances started after this datetime
             started_before: Filter instances started before this datetime
+            input_filters: Filter by input data values. Keys are JSON paths
+                (e.g., "order_id"), values are expected values (exact match).
 
         Returns:
             Dictionary containing:
@@ -75,6 +78,7 @@ class WorkflowDataService:
             instance_id_filter=search_query,
             started_after=started_after,
             started_before=started_before,
+            input_filters=input_filters,
         )
         return result
 

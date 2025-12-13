@@ -8,6 +8,7 @@ and transactional outbox pattern.
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -911,6 +912,60 @@ class SQLAlchemyStorage:
             # PostgreSQL/MySQL: column is already timezone-aware
             return column
 
+    def _validate_json_path(self, json_path: str) -> bool:
+        """
+        Validate JSON path to prevent SQL injection.
+
+        Args:
+            json_path: JSON path string (e.g., "order_id" or "customer.email")
+
+        Returns:
+            True if valid, False otherwise
+        """
+        # Only allow alphanumeric characters, dots, and underscores
+        # Must start with letter or underscore
+        return bool(re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", json_path))
+
+    def _build_json_extract_expr(self, column: Any, json_path: str) -> Any:
+        """
+        Build a database-agnostic JSON extraction expression.
+
+        Args:
+            column: SQLAlchemy column containing JSON text
+            json_path: Dot-notation path (e.g., "order_id" or "customer.email")
+
+        Returns:
+            SQLAlchemy expression that extracts the value at json_path
+
+        Raises:
+            ValueError: If json_path is invalid or dialect is unsupported
+        """
+        if not self._validate_json_path(json_path):
+            raise ValueError(f"Invalid JSON path: {json_path}")
+
+        full_path = f"$.{json_path}"
+        dialect = self.engine.dialect.name
+
+        if dialect == "sqlite":
+            # SQLite: json_extract(column, '$.key')
+            return func.json_extract(column, full_path)
+        elif dialect == "postgresql":
+            # PostgreSQL: For nested paths, use #>> operator with array path
+            # For simple paths, use ->> operator
+            # Since we're dealing with Text column, we need to cast first
+            if "." in json_path:
+                # Nested: (column)::json #>> '{customer,email}'
+                path_array = "{" + json_path.replace(".", ",") + "}"
+                return text(f"(input_data)::json #>> '{path_array}'")
+            else:
+                # Simple: (column)::json->>'key'
+                return text(f"(input_data)::json->>'{json_path}'")
+        elif dialect == "mysql":
+            # MySQL: JSON_UNQUOTE(JSON_EXTRACT(column, '$.key'))
+            return func.JSON_UNQUOTE(func.JSON_EXTRACT(column, full_path))
+        else:
+            raise ValueError(f"Unsupported database dialect: {dialect}")
+
     # -------------------------------------------------------------------------
     # Transaction Management Methods
     # -------------------------------------------------------------------------
@@ -1262,6 +1317,7 @@ class SQLAlchemyStorage:
         instance_id_filter: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        input_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """List workflow instances with cursor-based pagination and filtering."""
         session = self._get_session_for_operation()
@@ -1353,6 +1409,42 @@ class SQLAlchemyStorage:
                     else:
                         started_before_comparable = started_before
                     stmt = stmt.where(started_at_comparable <= started_before_comparable)
+
+            # Apply input data filters (JSON field matching)
+            if input_filters:
+                for json_path, expected_value in input_filters.items():
+                    dialect = self.engine.dialect.name
+                    if dialect == "postgresql":
+                        # PostgreSQL: use text() for the entire condition
+                        if not self._validate_json_path(json_path):
+                            raise ValueError(f"Invalid JSON path: {json_path}")
+                        if "." in json_path:
+                            path_array = "{" + json_path.replace(".", ",") + "}"
+                            json_sql = f"(input_data)::json #>> '{path_array}'"
+                        else:
+                            json_sql = f"(input_data)::json->>'{json_path}'"
+                        if expected_value is None:
+                            stmt = stmt.where(text(f"({json_sql} IS NULL OR {json_sql} = 'null')"))
+                        else:
+                            # Escape single quotes in value
+                            safe_value = str(expected_value).replace("'", "''")
+                            stmt = stmt.where(text(f"{json_sql} = '{safe_value}'"))
+                    else:
+                        # SQLite and MySQL: use func-based approach
+                        json_expr = self._build_json_extract_expr(
+                            WorkflowInstance.input_data, json_path
+                        )
+                        if expected_value is None:
+                            stmt = stmt.where(or_(json_expr.is_(None), json_expr == "null"))
+                        elif isinstance(expected_value, bool):
+                            stmt = stmt.where(json_expr == str(expected_value).lower())
+                        elif isinstance(expected_value, (int, float)):
+                            if dialect == "sqlite":
+                                stmt = stmt.where(json_expr == expected_value)
+                            else:
+                                stmt = stmt.where(json_expr == str(expected_value))
+                        else:
+                            stmt = stmt.where(json_expr == str(expected_value))
 
             # Fetch limit+1 to determine if there are more pages
             stmt = stmt.limit(limit + 1)

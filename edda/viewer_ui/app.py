@@ -1296,6 +1296,8 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
             "search_query": "",
             "started_after": None,
             "started_before": None,
+            "input_filter_key": "",
+            "input_filter_value": "",
             "instances": [],
             "next_page_token": None,
             "has_more": False,
@@ -1352,6 +1354,17 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                         "click", lambda m=date_to_menu: m.open()
                     )
 
+            # Input data filter fields
+            input_key = ui.input(
+                label="Input Key",
+                placeholder="e.g., input.order_id",
+            ).classes("w-40")
+
+            input_value = ui.input(
+                label="Input Value",
+                placeholder="e.g., ORD-123",
+            ).classes("w-36")
+
             # Refresh button
             async def handle_refresh() -> None:
                 """Handle refresh button click."""
@@ -1360,6 +1373,11 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                 pagination_state["page_size"] = page_size_select.value
                 pagination_state["started_after"] = date_from.value
                 pagination_state["started_before"] = date_to.value
+                pagination_state["input_filter_key"] = input_key.value
+                pagination_state["input_filter_value"] = input_value.value
+                # Debug output
+                print(f"DEBUG: input_key.value = '{input_key.value}'")
+                print(f"DEBUG: input_value.value = '{input_value.value}'")
                 # Reset to first page
                 pagination_state["current_token"] = None
                 pagination_state["token_stack"] = []
@@ -1389,6 +1407,13 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                         pagination_state["started_before"] + "T23:59:59"
                     )
 
+            # Build input_filters if key is provided
+            input_filters = None
+            if pagination_state["input_filter_key"]:
+                input_filters = {
+                    pagination_state["input_filter_key"]: pagination_state["input_filter_value"]
+                }
+
             result = await service.get_instances_paginated(
                 page_size=pagination_state["page_size"],
                 page_token=pagination_state["current_token"],
@@ -1396,6 +1421,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                 search_query=pagination_state["search_query"] or None,
                 started_after=started_after,
                 started_before=started_before,
+                input_filters=input_filters,
             )
             pagination_state["instances"] = result["instances"]
             pagination_state["next_page_token"] = result["next_page_token"]

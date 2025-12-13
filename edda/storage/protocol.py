@@ -262,6 +262,7 @@ class StorageProtocol(Protocol):
         instance_id_filter: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        input_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         List workflow instances with cursor-based pagination and filtering.
@@ -277,6 +278,9 @@ class StorageProtocol(Protocol):
             instance_id_filter: Optional instance ID filter (partial match, case-insensitive)
             started_after: Filter instances started after this datetime (inclusive)
             started_before: Filter instances started before this datetime (inclusive)
+            input_filters: Filter by input data values. Keys are JSON paths
+                (e.g., "order_id" or "customer.email"), values are expected
+                values (exact match). All filters are AND-combined.
 
         Returns:
             Dictionary containing:

@@ -373,3 +373,159 @@ class TestOutboxEvents:
         assert len(pending) == 1
         assert pending[0]["retry_count"] == 1
         assert "Connection error" in pending[0]["last_error"]
+
+
+class TestInputParameterSearch:
+    """Tests for input parameter search functionality."""
+
+    async def test_search_by_simple_input_filter(self, sqlite_storage):
+        """Test searching by a simple input parameter."""
+        # Create workflow definition
+        await sqlite_storage.upsert_workflow_definition(
+            workflow_name="order_workflow",
+            source_hash="hash123",
+            source_code="async def order_workflow(ctx): pass",
+        )
+
+        # Create instances with different input data
+        await sqlite_storage.create_instance(
+            instance_id="inst-1",
+            workflow_name="order_workflow",
+            source_hash="hash123",
+            owner_service="test",
+            input_data={"order_id": "ORD-001", "amount": 100},
+        )
+        await sqlite_storage.create_instance(
+            instance_id="inst-2",
+            workflow_name="order_workflow",
+            source_hash="hash123",
+            owner_service="test",
+            input_data={"order_id": "ORD-002", "amount": 200},
+        )
+
+        # Search by order_id
+        result = await sqlite_storage.list_instances(input_filters={"order_id": "ORD-001"})
+
+        assert len(result["instances"]) == 1
+        assert result["instances"][0]["instance_id"] == "inst-1"
+
+    async def test_search_by_nested_input_filter(self, sqlite_storage):
+        """Test searching by nested input parameter."""
+        # Create workflow definition
+        await sqlite_storage.upsert_workflow_definition(
+            workflow_name="customer_workflow",
+            source_hash="hash456",
+            source_code="async def customer_workflow(ctx): pass",
+        )
+
+        # Create instance with nested data
+        await sqlite_storage.create_instance(
+            instance_id="inst-nested",
+            workflow_name="customer_workflow",
+            source_hash="hash456",
+            owner_service="test",
+            input_data={"customer": {"email": "user@example.com", "name": "John"}},
+        )
+        await sqlite_storage.create_instance(
+            instance_id="inst-nested-2",
+            workflow_name="customer_workflow",
+            source_hash="hash456",
+            owner_service="test",
+            input_data={"customer": {"email": "other@example.com", "name": "Jane"}},
+        )
+
+        # Search by nested path
+        result = await sqlite_storage.list_instances(
+            input_filters={"customer.email": "user@example.com"}
+        )
+
+        assert len(result["instances"]) == 1
+        assert result["instances"][0]["instance_id"] == "inst-nested"
+
+    async def test_search_with_multiple_filters(self, sqlite_storage):
+        """Test searching with multiple input filters (AND logic)."""
+        # Create workflow definition
+        await sqlite_storage.upsert_workflow_definition(
+            workflow_name="multi_workflow",
+            source_hash="hash789",
+            source_code="async def multi_workflow(ctx): pass",
+        )
+
+        # Create instances
+        await sqlite_storage.create_instance(
+            instance_id="inst-multi-1",
+            workflow_name="multi_workflow",
+            source_hash="hash789",
+            owner_service="test",
+            input_data={"customer_id": "CUST-001", "status": "pending"},
+        )
+        await sqlite_storage.create_instance(
+            instance_id="inst-multi-2",
+            workflow_name="multi_workflow",
+            source_hash="hash789",
+            owner_service="test",
+            input_data={"customer_id": "CUST-001", "status": "approved"},
+        )
+
+        # Search with multiple filters (AND logic)
+        result = await sqlite_storage.list_instances(
+            input_filters={"customer_id": "CUST-001", "status": "pending"}
+        )
+
+        assert len(result["instances"]) == 1
+        assert result["instances"][0]["instance_id"] == "inst-multi-1"
+
+    async def test_search_combined_with_status_filter(self, sqlite_storage, sample_workflow_data):
+        """Test combining input filter with status filter."""
+        # Create instance with sample data
+        await sqlite_storage.create_instance(**sample_workflow_data)
+
+        # Update status
+        await sqlite_storage.update_instance_status(
+            sample_workflow_data["instance_id"], "completed"
+        )
+
+        # Create another instance with same input but different status
+        await sqlite_storage.create_instance(
+            instance_id="running-instance",
+            workflow_name=sample_workflow_data["workflow_name"],
+            source_hash=sample_workflow_data["source_hash"],
+            owner_service="test",
+            input_data={"order_id": "order-123", "amount": 100},
+        )
+
+        # Search with input filter + status filter
+        result = await sqlite_storage.list_instances(
+            input_filters={"order_id": "order-123"},
+            status_filter="running",
+        )
+
+        assert len(result["instances"]) == 1
+        assert result["instances"][0]["instance_id"] == "running-instance"
+
+    async def test_search_numeric_value(self, sqlite_storage, sample_workflow_data):
+        """Test searching by numeric input value."""
+        # Create instance with sample data (amount=100)
+        await sqlite_storage.create_instance(**sample_workflow_data)
+
+        # Search by numeric value
+        result = await sqlite_storage.list_instances(input_filters={"amount": 100})
+
+        assert len(result["instances"]) == 1
+        assert result["instances"][0]["instance_id"] == sample_workflow_data["instance_id"]
+
+    async def test_invalid_json_path_rejected(self, sqlite_storage):
+        """Test that invalid JSON paths are rejected to prevent SQL injection."""
+        import pytest
+
+        with pytest.raises(ValueError, match="Invalid JSON path"):
+            await sqlite_storage.list_instances(input_filters={"'; DROP TABLE--": "value"})
+
+    async def test_empty_input_filters(self, sqlite_storage, sample_workflow_data):
+        """Test that empty input_filters behaves like None."""
+        await sqlite_storage.create_instance(**sample_workflow_data)
+
+        # Empty dict should return all instances
+        result = await sqlite_storage.list_instances(input_filters={})
+
+        assert len(result["instances"]) >= 1

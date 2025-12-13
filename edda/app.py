@@ -13,6 +13,7 @@ import random
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, Literal
 
 import uvloop
@@ -1256,6 +1257,69 @@ class EddaApp:
                     await self.storage.release_system_lock("cleanup_old_messages", self.worker_id)
             except Exception as e:
                 logger.error("Error cleaning up old messages: %s", e, exc_info=True)
+
+    # -------------------------------------------------------------------------
+    # Query API Methods
+    # -------------------------------------------------------------------------
+
+    async def find_instances(
+        self,
+        *,
+        input_filters: dict[str, Any] | None = None,
+        status: str | None = None,
+        workflow_name: str | None = None,
+        instance_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+        limit: int = 50,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Find workflow instances with filtering support.
+
+        This is a high-level API for querying workflow instances by various
+        criteria, including input parameter values.
+
+        Args:
+            input_filters: Filter by input data values. Keys are JSON paths,
+                values are expected values (exact match).
+                Example: {"order_id": "ORD-123"}
+            status: Filter by workflow status (e.g., "running", "completed")
+            workflow_name: Filter by workflow name (partial match, case-insensitive)
+            instance_id: Filter by instance ID (partial match, case-insensitive)
+            started_after: Filter instances started after this datetime (inclusive)
+            started_before: Filter instances started before this datetime (inclusive)
+            limit: Maximum number of instances to return per page (default: 50)
+            page_token: Cursor for pagination (from previous response)
+
+        Returns:
+            Dictionary containing:
+            - instances: List of matching workflow instances
+            - next_page_token: Cursor for the next page, or None if no more pages
+            - has_more: Boolean indicating if there are more pages
+
+        Example:
+            >>> # Find all instances with order_id = "ORD-123"
+            >>> result = await app.find_instances(input_filters={"order_id": "ORD-123"})
+            >>> for instance in result["instances"]:
+            ...     print(f"{instance['instance_id']}: {instance['status']}")
+
+            >>> # Find running instances with specific customer
+            >>> result = await app.find_instances(
+            ...     input_filters={"customer_id": "CUST-456"},
+            ...     status="running"
+            ... )
+        """
+        return await self.storage.list_instances(
+            limit=limit,
+            page_token=page_token,
+            status_filter=status,
+            workflow_name_filter=workflow_name,
+            instance_id_filter=instance_id,
+            started_after=started_after,
+            started_before=started_before,
+            input_filters=input_filters,
+        )
 
     # -------------------------------------------------------------------------
     # ASGI Interface
