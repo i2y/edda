@@ -810,9 +810,18 @@ class EddaApp:
                 logger.warning("No activity_id in timer for %s, skipping", instance_id)
                 continue
 
-            # Note: find_expired_timers() already filters by status='waiting_for_timer'
-            # and JOINs with workflow_instances, so no need for additional get_instance() call.
-            # The lock mechanism below handles race conditions.
+            # Check if workflow is registered in this worker BEFORE acquiring lock
+            # In multi-app environments, another worker may own this workflow
+            from edda.workflow import get_all_workflows
+
+            workflows = get_all_workflows()
+            if workflow_name not in workflows:
+                logger.debug(
+                    "Skipping timer for unregistered workflow: " "instance_id=%s, workflow_name=%s",
+                    instance_id,
+                    workflow_name,
+                )
+                continue  # Let another worker handle it
 
             # Distributed Coroutines: Acquire lock FIRST to prevent race conditions
             # This ensures only ONE pod processes this timer, even if multiple pods
@@ -931,6 +940,25 @@ class EddaApp:
             instance_id = subscription["instance_id"]
             channel = subscription["channel"]
             timeout_at = subscription["timeout_at"]
+            workflow_name = subscription.get("workflow_name")
+
+            if not workflow_name:
+                logger.warning("No workflow_name in subscription for %s, skipping", instance_id)
+                continue
+
+            # Check if workflow is registered in this worker BEFORE acquiring lock
+            # In multi-app environments, another worker may own this workflow
+            from edda.workflow import get_all_workflows
+
+            workflows = get_all_workflows()
+            if workflow_name not in workflows:
+                logger.debug(
+                    "Skipping message subscription for unregistered workflow: "
+                    "instance_id=%s, workflow_name=%s",
+                    instance_id,
+                    workflow_name,
+                )
+                continue  # Let another worker handle it
 
             # Lock-First pattern: Try to acquire the lock before processing
             # If we can't get the lock, another worker is processing this workflow
@@ -1000,14 +1028,6 @@ class EddaApp:
 
                 # 3. Resume workflow (lock already held - distributed coroutine pattern)
                 # The workflow will replay and receive() will raise TimeoutError from cached history
-                workflow_name = subscription.get("workflow_name")
-                if not workflow_name:
-                    logger.warning(
-                        "No workflow_name in subscription for %s, skipping",
-                        instance_id,
-                    )
-                    continue
-
                 if self.replay_engine is None:
                     logger.error("Replay engine not initialized")
                     continue
