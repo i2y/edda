@@ -220,8 +220,20 @@ The Viewer UI provides:
 - ✅ **Hybrid Diagram**: Visual workflow graph (AST + execution history)
 - ✅ **Start Workflows**: Launch workflows from the UI with auto-generated forms
 - ✅ **Cancel Workflows**: Cancel running or waiting workflows
-- ✅ **Filter & Search**: Find specific workflows by status, name, or ID
+- ✅ **Filter & Search**: Find specific workflows by status, name, ID, or input parameters
 - ✅ **Real-time Updates**: Auto-refresh workflow status
+
+### Input Parameter Search
+
+Filter workflow instances by their input data values using the Input Key and Input Value fields:
+
+1. **Input Key**: JSON path to the field (e.g., `order_id` or `input.order_id` for nested data)
+2. **Input Value**: Expected value to match (exact match)
+
+**Example:** To find workflows with input `{"input": {"order_id": "ORD-123"}}`:
+
+- Input Key: `input.order_id`
+- Input Value: `ORD-123`
 
 ## Troubleshooting
 

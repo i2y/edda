@@ -20,6 +20,14 @@
 
 ---
 
+## Instance Search
+
+### find_instances
+
+::: edda.EddaApp.find_instances
+
+---
+
 ## Timer Functions
 
 ### sleep
