@@ -31,6 +31,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - 📬 **Channel-based Messaging**: Actor-model style communication with competing (job queue) and broadcast (fan-out) modes
 - ⚡ **Instant Notifications**: PostgreSQL LISTEN/NOTIFY for near-instant event delivery (optional)
 - 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
+- 🧠 **Mirascope Integration**: Durable LLM calls
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
 ## Use Cases
