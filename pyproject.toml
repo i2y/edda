@@ -72,6 +72,10 @@ opentelemetry = [
 cpu-monitor = [
     "psutil>=5.9.0",
 ]
+mirascope = [
+    "mirascope[anthropic,openai,google]>=2.0.0a0",
+    "pydantic-settings>=2.0.0",
+]
 
 [project.scripts]
 edda-viewer = "viewer_app:main"
@@ -202,6 +206,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "mirascope.*"
 ignore_missing_imports = true
 
 [dependency-groups]

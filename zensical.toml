@@ -81,6 +81,7 @@ nav = [
   ]},
   { "Integrations" = [
     { "MCP Integration" = "integrations/mcp.md" },
+    { "Mirascope Integration" = "integrations/mirascope.md" },
     { "OpenTelemetry Integration" = "integrations/opentelemetry.md" },
     { "pydantic-rpc Integration" = "integrations/pydantic-rpc.md" },
   ]},
