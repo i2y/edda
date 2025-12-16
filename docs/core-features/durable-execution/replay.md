@@ -349,7 +349,7 @@ async def resume_workflow_endpoint(instance_id: str):
 
 Edda automatically recovers from crashes in two stages:
 
-#### 3-1. Stale Lock Cleanup (Implemented)
+#### 3-1. Stale Lock Cleanup
 
 When a worker process crashes, its locks become "stale." Edda automatically cleans these up:
 
@@ -394,7 +394,7 @@ This background task starts automatically when `EddaApp` launches.
 
 The `status` field indicates whether the workflow was running normally (`"running"`) or executing compensations (`"compensating"`) when it crashed.
 
-#### 3-2. Automatic Workflow Resume (Implemented)
+#### 3-2. Automatic Workflow Resume
 
 After cleaning stale locks, Edda automatically resumes workflows with `status="running"` or `status="compensating"`:
 
@@ -586,6 +586,7 @@ async with workflow_lock(storage, instance_id, worker_id, timeout_seconds=300):
 ```
 
 Features:
+
 - **5-minute timeout** by default (prevents indefinite locks)
 - **Worker ID tracking** (know which worker holds the lock)
 - **Stale lock cleanup** (automatic recovery after crashes)

@@ -189,5 +189,5 @@ These models work seamlessly with Edda's Pydantic integration for:
 - [Workflows and Activities](../core-features/workflows-activities.md)
 - [Pydantic Integration](../core-features/workflows-activities.md#pydantic-integration)
 - [Example Code](https://github.com/i2y/edda/blob/main/examples/pydantic_rpc_integration.py)
-- [pydantic-rpc](https://github.com/pydantic/pydantic-rpc)
+- [pydantic-rpc](https://github.com/i2y/pydantic-rpc)
 - [connect-python](https://github.com/connectrpc/connect-python)

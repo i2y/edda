@@ -228,7 +228,7 @@ If you want to contribute to Edda or modify the framework itself:
 ```bash
 # Clone repository
 git clone https://github.com/i2y/edda.git
-cd kairo
+cd edda
 uv sync --all-extras
 ```
 
@@ -268,7 +268,7 @@ async def user_signup(ctx: WorkflowContext, email: str):
     return {"status": "completed"}
 ```
 
-**Activity IDs**: Activities are automatically identified with IDs like `"send_email:1"` for deterministic replay. Manual IDs are only needed for concurrent execution (e.g., `asyncio.gather`). See [MIGRATION_GUIDE_ACTIVITY_ID.md](MIGRATION_GUIDE_ACTIVITY_ID.md) for details.
+**Activity IDs**: Activities are automatically identified with IDs like `"send_email:1"` for deterministic replay. Manual IDs are only needed for concurrent execution (e.g., `asyncio.gather`).
 
 ### Durable Execution
 
