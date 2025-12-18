@@ -363,6 +363,35 @@ dbmate -d ./schema/db/migrations/postgresql status
 
 > **Note**: Edda's auto-migration uses the same SQL files as dbmate, so you can switch between modes freely.
 
+### Multi-Worker Configuration
+
+When running multiple Edda workers (e.g., in Kubernetes or with multiple processes), Edda automatically coordinates background tasks using **leader election**. Only one worker runs maintenance tasks (timers, message cleanup, etc.) while others focus on workflow execution.
+
+```python
+from edda import EddaApp
+
+app = EddaApp(
+    service_name="demo-service",
+    db_url="postgresql://...",
+    # Leader election settings (optional - defaults work well for most cases)
+    leader_heartbeat_interval=15,  # How often workers check/renew leadership
+    leader_lease_duration=45,      # How long before a failed leader is replaced
+)
+```
+
+**Configuration options:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `leader_heartbeat_interval` | `int` | `15` | Interval in seconds for leader heartbeat |
+| `leader_lease_duration` | `int` | `45` | Duration in seconds before leadership expires |
+
+**Notes:**
+
+- Default values work well for most deployments
+- Reduce `leader_lease_duration` for faster failover (minimum: 3x heartbeat interval)
+- Leader election uses the database for coordination (no external dependencies)
+
 ## Next Steps
 
 - **[Quick Start](quick-start.md)**: Build your first workflow in 5 minutes
