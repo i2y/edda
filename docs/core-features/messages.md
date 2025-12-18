@@ -47,6 +47,40 @@ async def notification_service(ctx: WorkflowContext, service_id: str):
 
 - `"broadcast"` (default): All subscribers receive all messages. Use for fan-out patterns like notifications.
 - `"competing"`: Each message is processed by only one subscriber. Use for job queues and task distribution.
+- `"direct"`: Receive messages sent via `send_to()` to this specific instance. Syntactic sugar for point-to-point messaging.
+
+**Using `mode="direct"`**:
+
+The `"direct"` mode simplifies receiving messages sent via `send_to()`:
+
+```python
+@workflow
+async def direct_receiver(ctx: WorkflowContext, id: str):
+    # Subscribe to receive direct messages
+    await subscribe(ctx, "notifications", mode="direct")
+
+    # Wait for a message sent via send_to()
+    msg = await receive(ctx, "notifications")
+    return msg.data
+
+@workflow
+async def sender(ctx: WorkflowContext, receiver_id: str):
+    # Send directly to the receiver instance
+    await send_to(ctx, instance_id=receiver_id, data={"hello": "world"}, channel="notifications")
+```
+
+This is equivalent to manually constructing the channel name:
+
+```python
+# Without mode="direct" (manual approach)
+direct_channel = f"notifications:{ctx.instance_id}"
+await subscribe(ctx, direct_channel, mode="broadcast")
+msg = await receive(ctx, direct_channel)
+
+# With mode="direct" (simplified)
+await subscribe(ctx, "notifications", mode="direct")
+msg = await receive(ctx, "notifications")
+```
 
 #### `unsubscribe()`
 
@@ -202,7 +236,7 @@ async def subscribe(
 
 - `ctx`: Workflow context
 - `channel`: Channel name to subscribe to
-- `mode`: `"broadcast"` (all subscribers receive) or `"competing"` (one subscriber per message)
+- `mode`: `"broadcast"` (all subscribers receive), `"competing"` (one subscriber per message), or `"direct"` (receive messages from `send_to()`)
 
 ### receive()
 
