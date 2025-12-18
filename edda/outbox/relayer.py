@@ -149,9 +149,7 @@ class OutboxRelayer:
             # Adaptive backoff calculation
             if consecutive_empty > 0:
                 # Exponential backoff: 2s, 4s, 8s, 16s, max 30s (with poll_interval=1)
-                backoff = min(
-                    self.poll_interval * (2 ** min(consecutive_empty, 4)), 30.0
-                )
+                backoff = min(self.poll_interval * (2 ** min(consecutive_empty, 4)), 30.0)
             else:
                 backoff = self.poll_interval
             jitter = random.uniform(0, backoff * 0.3)

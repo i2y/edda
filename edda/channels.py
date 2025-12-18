@@ -200,7 +200,9 @@ async def subscribe(
         actual_mode = "broadcast"
         ctx._record_direct_subscription(channel)
     elif mode not in ("broadcast", "competing"):
-        raise ValueError(f"Invalid subscription mode: {mode}. Must be 'broadcast', 'competing', or 'direct'")
+        raise ValueError(
+            f"Invalid subscription mode: {mode}. Must be 'broadcast', 'competing', or 'direct'"
+        )
 
     await ctx.storage.subscribe_to_channel(ctx.instance_id, actual_channel, actual_mode)
 
@@ -340,7 +342,9 @@ async def receive(
             await ctx.storage.delete_channel_message(msg_id)
         else:
             # Broadcast mode - update cursor
-            await ctx.storage.update_delivery_cursor(actual_channel, ctx.instance_id, msg_dict["id"])
+            await ctx.storage.update_delivery_cursor(
+                actual_channel, ctx.instance_id, msg_dict["id"]
+            )
 
         # Build the message
         raw_data = msg_dict.get("data")

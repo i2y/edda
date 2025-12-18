@@ -65,9 +65,7 @@ class TestDirectMode:
         )
         assert original_subscription is None
 
-    async def test_subscribe_direct_records_in_context(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_subscribe_direct_records_in_context(self, sqlite_storage, workflow_instance):
         """Test that subscribe with mode='direct' records the subscription in context."""
         ctx = WorkflowContext(
             instance_id=workflow_instance,
@@ -197,9 +195,7 @@ class TestDirectMode:
         assert msg.data == {"payload": "Hello from sender!"}
         assert msg.channel == "messages"
 
-    async def test_unsubscribe_with_direct_mode(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_unsubscribe_with_direct_mode(self, sqlite_storage, workflow_instance):
         """Test that unsubscribe works correctly with direct mode subscriptions."""
         ctx = WorkflowContext(
             instance_id=workflow_instance,
@@ -228,9 +224,7 @@ class TestDirectMode:
         )
         assert subscription is None
 
-    async def test_replay_with_direct_mode(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_replay_with_direct_mode(self, sqlite_storage, workflow_instance):
         """Test that direct mode works correctly during replay."""
         # First execution: subscribe and receive
         ctx1 = WorkflowContext(
@@ -276,9 +270,7 @@ class TestDirectMode:
         assert replayed_msg.data == {"message": "Test replay"}
         assert replayed_msg.channel == "notifications"
 
-    async def test_broadcast_mode_unchanged(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_broadcast_mode_unchanged(self, sqlite_storage, workflow_instance):
         """Test that broadcast mode still works correctly."""
         ctx = WorkflowContext(
             instance_id=workflow_instance,
@@ -292,18 +284,14 @@ class TestDirectMode:
         await subscribe(ctx, "events", mode="broadcast")
 
         # Verify subscription uses original channel name
-        subscription = await sqlite_storage.get_channel_subscription(
-            workflow_instance, "events"
-        )
+        subscription = await sqlite_storage.get_channel_subscription(workflow_instance, "events")
         assert subscription is not None
         assert subscription["mode"] == "broadcast"
 
         # Verify it's not recorded as direct
         assert not ctx._is_direct_subscription("events")
 
-    async def test_competing_mode_unchanged(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_competing_mode_unchanged(self, sqlite_storage, workflow_instance):
         """Test that competing mode still works correctly."""
         ctx = WorkflowContext(
             instance_id=workflow_instance,
@@ -317,18 +305,14 @@ class TestDirectMode:
         await subscribe(ctx, "jobs", mode="competing")
 
         # Verify subscription uses original channel name
-        subscription = await sqlite_storage.get_channel_subscription(
-            workflow_instance, "jobs"
-        )
+        subscription = await sqlite_storage.get_channel_subscription(workflow_instance, "jobs")
         assert subscription is not None
         assert subscription["mode"] == "competing"
 
         # Verify it's not recorded as direct
         assert not ctx._is_direct_subscription("jobs")
 
-    async def test_invalid_mode_raises_error(
-        self, sqlite_storage, workflow_instance
-    ):
+    async def test_invalid_mode_raises_error(self, sqlite_storage, workflow_instance):
         """Test that invalid mode raises ValueError."""
         ctx = WorkflowContext(
             instance_id=workflow_instance,
