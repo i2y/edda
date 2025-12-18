@@ -265,23 +265,23 @@ class TestHelperFunctions:
     """Tests for helper functions in pg_notify module."""
 
     def test_get_notify_channel_for_message(self):
-        """Test channel name hashing."""
+        """Test unified channel name for message notifications."""
         try:
             from edda.storage.pg_notify import get_notify_channel_for_message
         except ImportError:
             pytest.skip("asyncpg not installed")
 
+        # All channels map to unified name for cross-framework compatibility
         channel = get_notify_channel_for_message("order.created")
-        assert channel.startswith("edda_msg_")
+        assert channel == "workflow_channel_message"
         assert len(channel) <= 63  # PostgreSQL identifier limit
 
-        # Same input should produce same output
+        # Same output for any input (unified channel)
         channel2 = get_notify_channel_for_message("order.created")
         assert channel == channel2
 
-        # Different input should produce different output
         channel3 = get_notify_channel_for_message("order.updated")
-        assert channel != channel3
+        assert channel == channel3  # Same unified channel
 
     def test_make_notify_payload(self):
         """Test payload JSON serialization."""

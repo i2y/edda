@@ -63,6 +63,9 @@ class EddaApp:
         notify_fallback_interval: int = 30,
         # Batch processing settings
         max_workflows_per_batch: int | Literal["auto", "auto:cpu"] = 10,
+        # Leader election settings (for coordinating background tasks across workers)
+        leader_heartbeat_interval: int = 15,
+        leader_lease_duration: int = 45,
     ):
         """
         Initialize Edda application.
@@ -100,6 +103,10 @@ class EddaApp:
                                     - int: Fixed batch size (default: 10)
                                     - "auto": Scale 10-100 based on queue depth
                                     - "auto:cpu": Scale 10-100 based on CPU utilization (requires psutil)
+            leader_heartbeat_interval: Interval in seconds for leader heartbeat (default: 15).
+                                      Controls how often workers attempt to become/maintain leadership.
+            leader_lease_duration: Duration in seconds for leader lease (default: 45).
+                                  If leader fails to heartbeat within this time, another worker takes over.
         """
         self.db_url = db_url
         self.service_name = service_name
@@ -167,6 +174,12 @@ class EddaApp:
                 f"Invalid max_workflows_per_batch: {max_workflows_per_batch}. "
                 "Must be int, 'auto', or 'auto:cpu'."
             )
+
+        # Leader election settings (for coordinating background tasks)
+        self._leader_heartbeat_interval = leader_heartbeat_interval
+        self._leader_lease_duration = leader_lease_duration
+        self._is_leader = False
+        self._leader_tasks: list[asyncio.Task[Any]] = []
 
     def _create_storage(self, db_url: str) -> SQLAlchemyStorage:
         """
@@ -309,19 +322,19 @@ class EddaApp:
 
         # Subscribe to workflow resumable notifications
         await self._notify_listener.subscribe(
-            "edda_workflow_resumable",
+            "workflow_resumable",
             self._on_workflow_resumable_notify,
         )
 
         # Subscribe to outbox notifications
         await self._notify_listener.subscribe(
-            "edda_outbox_pending",
+            "workflow_outbox_pending",
             self._on_outbox_pending_notify,
         )
 
         # Subscribe to timer expired notifications
         await self._notify_listener.subscribe(
-            "edda_timer_expired",
+            "workflow_timer_expired",
             self._on_timer_expired_notify,
         )
 
@@ -462,47 +475,202 @@ class EddaApp:
         self._initialized = False
 
     def _start_background_tasks(self) -> None:
-        """Start background maintenance tasks."""
-        # Task to cleanup stale locks and auto-resume workflows
-        auto_resume_task = asyncio.create_task(
-            auto_resume_stale_workflows_periodically(
-                self.storage,
-                self.replay_engine,
-                self.worker_id,
-                interval=60,  # Check every 60 seconds
-            )
-        )
-        self._background_tasks.append(auto_resume_task)
+        """Start background maintenance tasks.
 
-        # Task to check expired timers and resume workflows
-        timer_check_task = asyncio.create_task(
-            self._check_expired_timers_periodically(interval=10)  # Check every 10 seconds
-        )
-        self._background_tasks.append(timer_check_task)
+        Background tasks are divided into two categories:
+        1. All-worker tasks: Run on every worker (leader election, workflow resumption)
+        2. Leader-only tasks: Run only on the elected leader (timers, timeouts, cleanup)
 
-        # Task to check expired message subscriptions and fail workflows
-        # Note: CloudEvents timeouts are also handled here since wait_event() uses wait_message()
-        message_timeout_task = asyncio.create_task(
-            self._check_expired_message_subscriptions_periodically(
-                interval=10
-            )  # Check every 10 seconds
-        )
-        self._background_tasks.append(message_timeout_task)
+        This design reduces database polling load significantly in multi-worker deployments.
+        """
+        # Leader election loop (all workers participate)
+        leader_election_task = asyncio.create_task(self._leader_election_loop())
+        self._background_tasks.append(leader_election_task)
 
-        # Task to resume workflows after message delivery (fast resumption)
+        # Task to resume workflows after message delivery (all workers - competitive lock)
         message_resume_task = asyncio.create_task(
             self._resume_running_workflows_periodically(interval=1)  # Check every 1 second
         )
         self._background_tasks.append(message_resume_task)
 
-        # Task to cleanup old channel messages (orphaned messages)
-        message_cleanup_task = asyncio.create_task(
-            self._cleanup_old_messages_periodically(
-                interval=3600,  # Check every 1 hour
-                retention_days=self._message_retention_days,
+        # Note: Leader-only tasks (timer checks, message timeouts, stale workflow cleanup,
+        # old message cleanup) are started dynamically in _leader_election_loop() when
+        # this worker becomes the leader.
+
+    async def _leader_election_loop(self) -> None:
+        """
+        Leader election loop that runs on all workers.
+
+        Uses system lock to elect a single leader among all workers.
+        The leader runs maintenance tasks (timer checks, message timeouts, etc.).
+        Non-leaders only participate in workflow resumption.
+
+        If a leader task crashes, it will be automatically restarted.
+        """
+        while True:
+            try:
+                was_leader = self._is_leader
+
+                # Try to acquire/renew leadership
+                self._is_leader = await self.storage.try_acquire_system_lock(
+                    lock_name="edda_leader",
+                    worker_id=self.worker_id,
+                    timeout_seconds=self._leader_lease_duration,
+                )
+
+                if self._is_leader and not was_leader:
+                    # Became leader - start leader-only tasks
+                    logger.info(f"Worker {self.worker_id} became leader")
+                    self._leader_tasks = self._create_leader_only_tasks()
+
+                elif not self._is_leader and was_leader:
+                    # Lost leadership - cancel leader-only tasks
+                    logger.info(f"Worker {self.worker_id} lost leadership")
+                    await self._cancel_tasks(self._leader_tasks)
+                    self._leader_tasks = []
+
+                elif self._is_leader:
+                    # Still leader - check if any leader tasks have crashed and restart
+                    await self._monitor_and_restart_leader_tasks()
+
+                # Wait before next heartbeat
+                await asyncio.sleep(self._leader_heartbeat_interval)
+
+            except asyncio.CancelledError:
+                # Shutdown - cancel leader tasks and exit
+                await self._cancel_tasks(self._leader_tasks)
+                self._leader_tasks = []
+                raise
+            except Exception as e:
+                logger.error(f"Leader election error: {e}", exc_info=True)
+                self._is_leader = False
+                await self._cancel_tasks(self._leader_tasks)
+                self._leader_tasks = []
+                # Wait before retry
+                await asyncio.sleep(self._leader_heartbeat_interval)
+
+    def _create_leader_only_tasks(self) -> list[asyncio.Task[Any]]:
+        """
+        Create tasks that should only run on the leader worker.
+
+        These tasks are responsible for:
+        - Timer expiration checks
+        - Message subscription timeout checks
+        - Stale workflow auto-resume
+        - Old message cleanup
+        """
+        tasks = []
+
+        # Timer expiration check
+        tasks.append(
+            asyncio.create_task(
+                self._check_expired_timers_periodically(interval=10),
+                name="leader_timer_check",
             )
         )
-        self._background_tasks.append(message_cleanup_task)
+
+        # Message subscription timeout check
+        tasks.append(
+            asyncio.create_task(
+                self._check_expired_message_subscriptions_periodically(interval=10),
+                name="leader_message_timeout_check",
+            )
+        )
+
+        # Stale workflow auto-resume
+        tasks.append(
+            asyncio.create_task(
+                auto_resume_stale_workflows_periodically(
+                    self.storage,
+                    self.replay_engine,
+                    self.worker_id,
+                    interval=60,
+                ),
+                name="leader_stale_workflow_resume",
+            )
+        )
+
+        # Old message cleanup
+        tasks.append(
+            asyncio.create_task(
+                self._cleanup_old_messages_periodically(
+                    interval=3600,
+                    retention_days=self._message_retention_days,
+                ),
+                name="leader_message_cleanup",
+            )
+        )
+
+        return tasks
+
+    async def _cancel_tasks(self, tasks: list[asyncio.Task[Any]]) -> None:
+        """Cancel a list of tasks and wait for them to finish."""
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _monitor_and_restart_leader_tasks(self) -> None:
+        """
+        Monitor leader tasks and restart any that have crashed.
+
+        This ensures leader-only tasks keep running even if they encounter errors.
+        """
+        task_creators = {
+            "leader_timer_check": lambda: asyncio.create_task(
+                self._check_expired_timers_periodically(interval=10),
+                name="leader_timer_check",
+            ),
+            "leader_message_timeout_check": lambda: asyncio.create_task(
+                self._check_expired_message_subscriptions_periodically(interval=10),
+                name="leader_message_timeout_check",
+            ),
+            "leader_stale_workflow_resume": lambda: asyncio.create_task(
+                auto_resume_stale_workflows_periodically(
+                    self.storage,
+                    self.replay_engine,
+                    self.worker_id,
+                    interval=60,
+                ),
+                name="leader_stale_workflow_resume",
+            ),
+            "leader_message_cleanup": lambda: asyncio.create_task(
+                self._cleanup_old_messages_periodically(
+                    interval=3600,
+                    retention_days=self._message_retention_days,
+                ),
+                name="leader_message_cleanup",
+            ),
+        }
+
+        # Check each task and restart if done (crashed)
+        new_tasks = []
+        for task in self._leader_tasks:
+            if task.done():
+                # Task has finished (possibly due to error)
+                task_name = task.get_name()
+                try:
+                    # Check if it raised an exception
+                    exc = task.exception()
+                    if exc is not None:
+                        logger.warning(
+                            f"Leader task {task_name} crashed with {type(exc).__name__}: {exc}, "
+                            "restarting..."
+                        )
+                except asyncio.CancelledError:
+                    # Task was cancelled, don't restart
+                    logger.debug(f"Leader task {task_name} was cancelled")
+                    continue
+
+                # Restart the task
+                if task_name in task_creators:
+                    new_task = task_creators[task_name]()
+                    new_tasks.append(new_task)
+                    logger.info(f"Restarted leader task: {task_name}")
+            else:
+                # Task is still running
+                new_tasks.append(task)
+
+        self._leader_tasks = new_tasks
 
     def _auto_register_workflows(self) -> None:
         """

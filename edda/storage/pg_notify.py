@@ -291,18 +291,15 @@ class PostgresNotifyListener:
 def get_notify_channel_for_message(channel: str) -> str:
     """Convert Edda channel name to PostgreSQL NOTIFY channel.
 
-    Uses a hash to ensure valid PostgreSQL identifier (max 63 chars).
+    Returns a unified channel name that both Python and Go frameworks use.
 
     Args:
-        channel: The Edda channel name.
+        channel: The Edda channel name (unused, kept for API compatibility).
 
     Returns:
-        PostgreSQL-safe channel name.
+        Unified PostgreSQL channel name.
     """
-    import hashlib
-
-    h = hashlib.sha256(channel.encode()).hexdigest()[:16]
-    return f"edda_msg_{h}"
+    return "workflow_channel_message"
 
 
 def make_notify_payload(data: dict[str, Any]) -> str:

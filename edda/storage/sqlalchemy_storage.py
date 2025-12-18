@@ -88,6 +88,7 @@ class WorkflowInstance(Base):
     workflow_name: Mapped[str] = mapped_column(String(255))
     source_hash: Mapped[str] = mapped_column(String(64))
     owner_service: Mapped[str] = mapped_column(String(255))
+    framework: Mapped[str] = mapped_column(String(50), server_default=text("'python'"))
     status: Mapped[str] = mapped_column(String(50), server_default=text("'running'"))
     current_activity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     continued_from: Mapped[str | None] = mapped_column(
@@ -121,6 +122,7 @@ class WorkflowInstance(Base):
         Index("idx_instances_status", "status"),
         Index("idx_instances_workflow", "workflow_name"),
         Index("idx_instances_owner", "owner_service"),
+        Index("idx_instances_framework", "framework"),
         Index("idx_instances_locked", "locked_by", "locked_at"),
         Index("idx_instances_lock_expires", "lock_expires_at"),
         Index("idx_instances_updated", "updated_at"),
@@ -561,8 +563,10 @@ class SQLAlchemyStorage:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        # Auto-migrate schema (add missing columns)
-        await self._auto_migrate_schema()
+        # NOTE: Schema migrations are now handled by dbmate.
+        # See schema/db/migrations/ for migration files.
+        # Run `cd schema && dbmate up` to apply migrations.
+        # await self._auto_migrate_schema()
 
         # Auto-migrate CHECK constraints
         await self._auto_migrate_check_constraints()
@@ -1227,6 +1231,7 @@ class SQLAlchemyStorage:
                 workflow_name=workflow_name,
                 source_hash=source_hash,
                 owner_service=owner_service,
+                framework="python",
                 input_data=json.dumps(input_data),
                 lock_timeout_seconds=lock_timeout_seconds,
                 continued_from=continued_from,
@@ -1332,6 +1337,7 @@ class SQLAlchemyStorage:
                         WorkflowInstance.source_hash == WorkflowDefinition.source_hash,
                     ),
                 )
+                .where(WorkflowInstance.framework == "python")
                 .order_by(
                     WorkflowInstance.started_at.desc(),
                     WorkflowInstance.instance_id.desc(),
@@ -1700,6 +1706,7 @@ class SQLAlchemyStorage:
                         WorkflowInstance.lock_expires_at.isnot(None),
                         self._make_datetime_comparable(WorkflowInstance.lock_expires_at)
                         < self._get_current_time_expr(),
+                        WorkflowInstance.framework == "python",
                     )
                 )
             )
@@ -1752,10 +1759,9 @@ class SQLAlchemyStorage:
         """
         Try to acquire a system-level lock for coordinating background tasks.
 
-        Uses INSERT ON CONFLICT pattern to handle race conditions:
-        1. Try to INSERT new lock record
-        2. If exists, check if expired or unlocked
-        3. If available, acquire lock; otherwise return False
+        Uses atomic UPDATE pattern to avoid race conditions:
+        1. Ensure row exists (INSERT OR IGNORE / ON CONFLICT DO NOTHING)
+        2. Atomic UPDATE with WHERE condition (rowcount determines success)
 
         Note: ALWAYS uses separate session (not external session).
         """
@@ -1764,51 +1770,66 @@ class SQLAlchemyStorage:
             current_time = datetime.now(UTC)
             lock_expires_at = current_time + timedelta(seconds=timeout_seconds)
 
-            # Try to get existing lock
-            result = await session.execute(
-                select(SystemLock).where(SystemLock.lock_name == lock_name)
-            )
-            lock = result.scalar_one_or_none()
+            # Get dialect name
+            dialect_name = self.engine.dialect.name
 
-            if lock is None:
-                # No lock exists - create new one
-                lock = SystemLock(
+            # 1. Ensure row exists (idempotent INSERT)
+            if dialect_name == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                stmt: Any = sqlite_insert(SystemLock).values(
                     lock_name=lock_name,
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                ).on_conflict_do_nothing(index_elements=["lock_name"])
+            elif dialect_name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                stmt = pg_insert(SystemLock).values(
+                    lock_name=lock_name,
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                ).on_conflict_do_nothing(index_elements=["lock_name"])
+            else:  # mysql
+                from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+                stmt = mysql_insert(SystemLock).values(
+                    lock_name=lock_name,
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                ).on_duplicate_key_update(lock_name=lock_name)  # No-op update
+
+            await session.execute(stmt)
+            await session.commit()
+
+            # 2. Atomic UPDATE to acquire lock (rowcount == 1 means success)
+            # Use SQL-side datetime comparison for cross-DB compatibility
+            current_time_expr = self._get_current_time_expr()
+            result = await session.execute(
+                update(SystemLock)
+                .where(
+                    and_(
+                        SystemLock.lock_name == lock_name,
+                        or_(
+                            SystemLock.locked_by == None,  # noqa: E711
+                            SystemLock.locked_by == worker_id,  # Allow renewal by same worker
+                            self._make_datetime_comparable(SystemLock.lock_expires_at)
+                            <= current_time_expr,
+                        ),
+                    )
+                )
+                .values(
                     locked_by=worker_id,
                     locked_at=current_time,
                     lock_expires_at=lock_expires_at,
                 )
-                session.add(lock)
-                await session.commit()
-                return True
+            )
+            await session.commit()
 
-            # Lock exists - check if available
-            if lock.locked_by is None:
-                # Unlocked - acquire
-                lock.locked_by = worker_id
-                lock.locked_at = current_time
-                lock.lock_expires_at = lock_expires_at
-                await session.commit()
-                return True
-
-            # Check if expired (use SQL-side comparison for cross-DB compatibility)
-            if lock.lock_expires_at is not None:
-                # Handle timezone-naive datetime from SQLite
-                lock_expires = (
-                    lock.lock_expires_at.replace(tzinfo=UTC)
-                    if lock.lock_expires_at.tzinfo is None
-                    else lock.lock_expires_at
-                )
-                if lock_expires <= current_time:
-                    # Expired - acquire
-                    lock.locked_by = worker_id
-                    lock.locked_at = current_time
-                    lock.lock_expires_at = lock_expires_at
-                    await session.commit()
-                    return True
-
-            # Already locked by another worker
-            return False
+            return bool(result.rowcount == 1)  # type: ignore[attr-defined]
 
     async def release_system_lock(self, lock_name: str, worker_id: str) -> None:
         """
@@ -2033,7 +2054,7 @@ class SQLAlchemyStorage:
             result = await session.execute(
                 select(WorkflowCompensation)
                 .where(WorkflowCompensation.instance_id == instance_id)
-                .order_by(WorkflowCompensation.created_at.desc())
+                .order_by(WorkflowCompensation.created_at.desc(), WorkflowCompensation.id.desc())
             )
             rows = result.scalars().all()
 
@@ -2178,6 +2199,7 @@ class SQLAlchemyStorage:
                         self._make_datetime_comparable(WorkflowTimerSubscription.expires_at)
                         <= self._get_current_time_expr(),
                         WorkflowInstance.status == "waiting_for_timer",
+                        WorkflowInstance.framework == "python",
                     )
                 )
             )
@@ -2252,7 +2274,7 @@ class SQLAlchemyStorage:
 
         # Send NOTIFY for new outbox event
         await self._send_notify(
-            "edda_outbox_pending",
+            "workflow_outbox_pending",
             {"evt_id": event_id, "evt_type": event_type},
         )
 
@@ -2764,6 +2786,7 @@ class SQLAlchemyStorage:
                         ChannelSubscription.activity_id.isnot(None),  # Only waiting subscriptions
                         self._make_datetime_comparable(ChannelSubscription.timeout_at)
                         <= self._get_current_time_expr(),
+                        WorkflowInstance.framework == "python",
                     )
                 )
             )
@@ -2902,6 +2925,7 @@ class SQLAlchemyStorage:
                 and_(
                     WorkflowInstance.status == "running",
                     WorkflowInstance.locked_by.is_(None),
+                    WorkflowInstance.framework == "python",
                 )
             )
             if limit is not None:
@@ -3002,12 +3026,9 @@ class SQLAlchemyStorage:
             session.add(msg)
             await self._commit_if_not_in_transaction(session)
 
-        # Send NOTIFY for message published (channel-specific)
-        import hashlib
-
-        channel_hash = hashlib.sha256(channel.encode()).hexdigest()[:16]
+        # Send NOTIFY for message published (unified channel name)
         await self._send_notify(
-            f"edda_msg_{channel_hash}",
+            "workflow_channel_message",
             {"ch": channel, "msg_id": message_id},
         )
 
@@ -3571,7 +3592,7 @@ class SQLAlchemyStorage:
 
                 # Send NOTIFY for workflow resumable
                 await self._send_notify(
-                    "edda_workflow_resumable",
+                    "workflow_resumable",
                     {"wf_id": instance_id, "wf_name": workflow_name},
                 )
 

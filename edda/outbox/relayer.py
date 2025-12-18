@@ -8,6 +8,7 @@ outbox events and publishes them to a Message Broker as CloudEvents.
 import asyncio
 import contextlib
 import logging
+import random
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -121,46 +122,72 @@ class OutboxRelayer:
 
     async def _poll_loop(self) -> None:
         """
-        Main polling loop.
+        Main polling loop with adaptive backoff.
 
         Continuously polls the database for pending events and publishes them.
         When wake_event is provided (PostgreSQL NOTIFY integration), wakes up
-        immediately on notification, otherwise falls back to poll_interval.
+        immediately on notification, otherwise uses poll_interval as fallback.
+
+        Adaptive backoff behavior:
+        - When no events are found, exponentially backs off up to 30 seconds
+        - When events are processed, resets to base poll_interval
+        - When woken by NOTIFY, resets backoff
         """
+        consecutive_empty = 0
+
         while self._running:
             try:
-                await self._poll_and_publish()
+                count = await self._poll_and_publish()
+                if count == 0:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
             except Exception as e:
                 logger.error(f"Error in outbox relayer poll loop: {e}")
+                consecutive_empty = 0  # Reset on error
+
+            # Adaptive backoff calculation
+            if consecutive_empty > 0:
+                # Exponential backoff: 2s, 4s, 8s, 16s, max 30s (with poll_interval=1)
+                backoff = min(
+                    self.poll_interval * (2 ** min(consecutive_empty, 4)), 30.0
+                )
+            else:
+                backoff = self.poll_interval
+            jitter = random.uniform(0, backoff * 0.3)
 
             # Wait before next poll (with optional NOTIFY wake)
             if self._wake_event is not None:
                 try:
                     await asyncio.wait_for(
                         self._wake_event.wait(),
-                        timeout=self.poll_interval,
+                        timeout=backoff + jitter,
                     )
                     # Clear the event for next notification
                     self._wake_event.clear()
+                    consecutive_empty = 0  # Reset on NOTIFY wake
                     logger.debug("Outbox relayer woken by NOTIFY")
                 except TimeoutError:
                     # Fallback polling timeout reached
                     pass
             else:
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(backoff + jitter)
 
-    async def _poll_and_publish(self) -> None:
+    async def _poll_and_publish(self) -> int:
         """
         Poll for pending events and publish them.
 
         Fetches a batch of pending events from the database and attempts
         to publish each one to the Message Broker.
+
+        Returns:
+            Number of events processed
         """
         # Get pending events
         events = await self.storage.get_pending_outbox_events(limit=self.batch_size)
 
         if not events:
-            return
+            return 0
 
         logger.debug(f"Processing {len(events)} pending outbox events")
 
@@ -173,6 +200,8 @@ class OutboxRelayer:
                     f"Failed to publish event {event['event_id']}: {e}",
                     exc_info=True,
                 )
+
+        return len(events)
 
     async def _publish_event(self, event: dict[str, Any]) -> None:
         """
