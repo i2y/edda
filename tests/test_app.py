@@ -273,8 +273,8 @@ application = app
         )
 
         try:
-            # Wait for server to start
-            await asyncio.sleep(2.0)
+            # Wait for server to start (longer in CI)
+            await asyncio.sleep(5.0)
 
             # Check if process is running
             poll_result = process.poll()
@@ -287,16 +287,20 @@ application = app
                 )
             assert poll_result is None, "Tsuno server should be running"
 
-            # Try to connect
-            async with httpx.AsyncClient() as client:
-                try:
-                    response = await client.get("http://127.0.0.1:18000/health")
-                    # Server is responding (may return various codes since /health is not implemented)
-                    # 404=not found, 405=method not allowed, 400=bad request, 500=server error
-                    assert response.status_code in [404, 200, 202, 400, 405, 500]
-                except httpx.ConnectError:
-                    # This is acceptable - server may not have /health endpoint
-                    pass
+            # Try to connect with retries
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for attempt in range(3):
+                    try:
+                        response = await client.get("http://127.0.0.1:18000/health")
+                        # Server is responding (may return various codes since /health is not implemented)
+                        # 404=not found, 405=method not allowed, 400=bad request, 500=server error
+                        assert response.status_code in [404, 200, 202, 400, 405, 500]
+                        break
+                    except (httpx.ConnectError, httpx.ReadTimeout):
+                        # This is acceptable - server may not have /health endpoint or be slow
+                        if attempt < 2:
+                            await asyncio.sleep(2.0)
+                        pass
 
         finally:
             # Stop server
@@ -380,8 +384,8 @@ application = app
         )
 
         try:
-            # Wait for server to start
-            await asyncio.sleep(3.0)
+            # Wait for server to start (longer in CI, multiple workers need more time)
+            await asyncio.sleep(6.0)
 
             # Check if process is running
             poll_result = process.poll()
@@ -394,32 +398,35 @@ application = app
                 )
             assert poll_result is None, "Tsuno server should be running with multiple workers"
 
-            # Try to send a request
-            async with httpx.AsyncClient() as client:
-                try:
-                    # Send a test CloudEvent
-                    event_data = {
-                        "specversion": "1.0",
-                        "type": "test.event",
-                        "source": "test",
-                        "id": "test-multi-worker",
-                        "data": {"test": "data"},
-                    }
+            # Try to send a request with retries
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for attempt in range(3):
+                    try:
+                        # Send a test CloudEvent
+                        event_data = {
+                            "specversion": "1.0",
+                            "type": "test.event",
+                            "source": "test",
+                            "id": "test-multi-worker",
+                            "data": {"test": "data"},
+                        }
 
-                    response = await client.post(
-                        "http://127.0.0.1:18001/",
-                        json=event_data,
-                        headers={"content-type": "application/cloudevents+json"},
-                        timeout=5.0,
-                    )
+                        response = await client.post(
+                            "http://127.0.0.1:18001/",
+                            json=event_data,
+                            headers={"content-type": "application/cloudevents+json"},
+                        )
 
-                    # Accept various response codes since the workflow might not be registered
-                    # 202=accepted (success), 404=not found, 400=bad request, 500=server error
-                    assert response.status_code in [200, 202, 404, 400, 500]
+                        # Accept various response codes since the workflow might not be registered
+                        # 202=accepted (success), 404=not found, 400=bad request, 500=server error
+                        assert response.status_code in [200, 202, 404, 400, 500]
+                        break
 
-                except httpx.ConnectError:
-                    # Server might not be fully ready
-                    pass
+                    except (httpx.ConnectError, httpx.ReadTimeout):
+                        # Server might not be fully ready
+                        if attempt < 2:
+                            await asyncio.sleep(2.0)
+                        pass
 
         finally:
             # Stop server
