@@ -12,8 +12,11 @@ The migration system is compatible with dbmate:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +26,9 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 logger = logging.getLogger(__name__)
+
+# Advisory lock key for migration (consistent across workers)
+MIGRATION_LOCK_KEY = 20251217000000  # Using migration timestamp as lock key
 
 
 def detect_db_type(engine: AsyncEngine) -> str:
@@ -100,8 +106,15 @@ async def ensure_schema_migrations_table(engine: AsyncEngine) -> None:
             )
         """
 
-    async with engine.begin() as conn:
-        await conn.execute(text(create_sql))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(create_sql))
+    except Exception as e:
+        err_msg = str(e).lower()
+        # Handle concurrent table creation - another worker might have created it
+        if "already exists" in err_msg or "duplicate" in err_msg or "42p07" in err_msg:
+            return
+        raise
 
 
 async def get_applied_migrations(engine: AsyncEngine) -> set[str]:
@@ -147,6 +160,60 @@ async def record_migration(engine: AsyncEngine, version: str) -> bool:
         if "unique constraint" in err_msg or "duplicate" in err_msg:
             return False
         raise
+
+
+@asynccontextmanager
+async def migration_lock(engine: AsyncEngine, db_type: str) -> AsyncIterator[bool]:
+    """
+    Acquire an advisory lock for migrations.
+
+    Uses database-specific advisory locks to ensure only one worker
+    applies migrations at a time.
+
+    Args:
+        engine: SQLAlchemy async engine
+        db_type: Database type ('sqlite', 'postgresql', 'mysql')
+
+    Yields:
+        True if lock was acquired, False otherwise
+    """
+    if db_type == "sqlite":
+        # SQLite doesn't support advisory locks, but it's single-writer anyway
+        yield True
+        return
+
+    acquired = False
+    try:
+        async with engine.connect() as conn:
+            if db_type == "postgresql":
+                # Try to acquire advisory lock (non-blocking)
+                result = await conn.execute(
+                    text(f"SELECT pg_try_advisory_lock({MIGRATION_LOCK_KEY})")
+                )
+                acquired = result.scalar() is True
+            elif db_type == "mysql":
+                # Try to acquire named lock (0 = no wait)
+                result = await conn.execute(text("SELECT GET_LOCK('edda_migration', 0)"))
+                acquired = result.scalar() == 1
+
+            if acquired:
+                yield True
+            else:
+                logger.debug("Could not acquire migration lock, another worker is migrating")
+                yield False
+
+    finally:
+        if acquired:
+            try:
+                async with engine.connect() as conn:
+                    if db_type == "postgresql":
+                        await conn.execute(text(f"SELECT pg_advisory_unlock({MIGRATION_LOCK_KEY})"))
+                        await conn.commit()
+                    elif db_type == "mysql":
+                        await conn.execute(text("SELECT RELEASE_LOCK('edda_migration')"))
+                        await conn.commit()
+            except Exception as e:
+                logger.warning(f"Failed to release migration lock: {e}")
 
 
 def extract_version_from_filename(filename: str) -> str:
@@ -309,51 +376,60 @@ async def apply_dbmate_migrations(
     # Ensure schema_migrations table exists
     await ensure_schema_migrations_table(engine)
 
-    # Get already applied migrations
-    applied = await get_applied_migrations(engine)
+    # Use advisory lock to ensure only one worker applies migrations
+    async with migration_lock(engine, db_type) as acquired:
+        if not acquired:
+            # Another worker is applying migrations, wait and check applied
+            logger.info("Another worker is applying migrations, waiting...")
+            # Wait a bit and return - migrations will be applied by the other worker
+            await asyncio.sleep(1)
+            return []
 
-    # Get all migration files sorted by name (timestamp order)
-    migration_files = sorted(db_migrations_dir.glob("*.sql"))
+        # Get already applied migrations (inside lock to avoid race)
+        applied = await get_applied_migrations(engine)
 
-    applied_versions: list[str] = []
+        # Get all migration files sorted by name (timestamp order)
+        migration_files = sorted(db_migrations_dir.glob("*.sql"))
 
-    for migration_file in migration_files:
-        version = extract_version_from_filename(migration_file.name)
+        applied_versions: list[str] = []
 
-        # Skip if already applied
-        if version in applied:
-            logger.debug(f"Migration {version} already applied, skipping")
-            continue
+        for migration_file in migration_files:
+            version = extract_version_from_filename(migration_file.name)
 
-        logger.info(f"Applying migration: {migration_file.name}")
+            # Skip if already applied
+            if version in applied:
+                logger.debug(f"Migration {version} already applied, skipping")
+                continue
 
-        # Read and parse migration file
-        content = migration_file.read_text()
-        up_sql, _ = parse_migration_file(content)
+            logger.info(f"Applying migration: {migration_file.name}")
 
-        if not up_sql:
-            logger.warning(f"No '-- migrate:up' section found in {migration_file.name}")
-            continue
+            # Read and parse migration file
+            content = migration_file.read_text()
+            up_sql, _ = parse_migration_file(content)
 
-        # Execute migration
-        try:
-            await execute_sql_statements(engine, up_sql, db_type)
+            if not up_sql:
+                logger.warning(f"No '-- migrate:up' section found in {migration_file.name}")
+                continue
 
-            # Record as applied (handles race condition with other workers)
-            recorded = await record_migration(engine, version)
-            if recorded:
-                applied_versions.append(version)
-                logger.info(f"Successfully applied migration: {version}")
-            else:
-                # Another worker already applied this migration
-                logger.debug(f"Migration {version} was applied by another worker")
-        except Exception as e:
-            logger.error(f"Failed to apply migration {version}: {e}")
-            raise
+            # Execute migration
+            try:
+                await execute_sql_statements(engine, up_sql, db_type)
 
-    if applied_versions:
-        logger.info(f"Applied {len(applied_versions)} migration(s)")
-    else:
-        logger.debug("No pending migrations to apply")
+                # Record as applied (handles race condition with other workers)
+                recorded = await record_migration(engine, version)
+                if recorded:
+                    applied_versions.append(version)
+                    logger.info(f"Successfully applied migration: {version}")
+                else:
+                    # Another worker already applied this migration
+                    logger.debug(f"Migration {version} was applied by another worker")
+            except Exception as e:
+                logger.error(f"Failed to apply migration {version}: {e}")
+                raise
 
-    return applied_versions
+        if applied_versions:
+            logger.info(f"Applied {len(applied_versions)} migration(s)")
+        else:
+            logger.debug("No pending migrations to apply")
+
+        return applied_versions
