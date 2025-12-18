@@ -222,5 +222,5 @@ ignore_missing_imports = true
 dev = [
     "mkdocstrings-python>=2.0.1",
     "tsuno>=0.1.3",
-    "zensical>=0.0.11",
+    "zensical>=0.0.13",
 ]
