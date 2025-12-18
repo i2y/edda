@@ -8,6 +8,7 @@ This module tests:
 """
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,7 +16,6 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
-
 
 # =============================================================================
 # System Lock Tests
@@ -115,10 +115,7 @@ class TestSystemLockAtomicUpdate:
             results.append((worker_id, result))
 
         # Start multiple workers trying to acquire the same lock
-        tasks = [
-            asyncio.create_task(try_acquire(f"worker_{i}"))
-            for i in range(5)
-        ]
+        tasks = [asyncio.create_task(try_acquire(f"worker_{i}")) for i in range(5)]
         await asyncio.gather(*tasks)
 
         # Exactly one worker should succeed
@@ -208,10 +205,19 @@ class TestOutboxRelayerAdaptiveBackoff:
             side_effect=[
                 [],  # Empty - backoff should increase
                 [],  # Empty - backoff should increase more
-                [{"event_id": "1", "event_type": "test", "event_source": "test",
-                  "event_data": {}, "content_type": "application/json",
-                  "created_at": "2024-01-01T00:00:00", "status": "processing",
-                  "retry_count": 0, "last_error": None}],  # Event - reset backoff
+                [
+                    {
+                        "event_id": "1",
+                        "event_type": "test",
+                        "event_source": "test",
+                        "event_data": {},
+                        "content_type": "application/json",
+                        "created_at": "2024-01-01T00:00:00",
+                        "status": "processing",
+                        "retry_count": 0,
+                        "last_error": None,
+                    }
+                ],  # Event - reset backoff
                 [],  # Empty - should start from base again
             ]
         )
@@ -256,16 +262,32 @@ class TestOutboxRelayerAdaptiveBackoff:
         from edda.outbox.relayer import OutboxRelayer
 
         storage = AsyncMock()
-        storage.get_pending_outbox_events = AsyncMock(return_value=[
-            {"event_id": "1", "event_type": "test", "event_source": "test",
-             "event_data": {}, "content_type": "application/json",
-             "created_at": "2024-01-01T00:00:00", "status": "processing",
-             "retry_count": 0, "last_error": None},
-            {"event_id": "2", "event_type": "test", "event_source": "test",
-             "event_data": {}, "content_type": "application/json",
-             "created_at": "2024-01-01T00:00:00", "status": "processing",
-             "retry_count": 0, "last_error": None},
-        ])
+        storage.get_pending_outbox_events = AsyncMock(
+            return_value=[
+                {
+                    "event_id": "1",
+                    "event_type": "test",
+                    "event_source": "test",
+                    "event_data": {},
+                    "content_type": "application/json",
+                    "created_at": "2024-01-01T00:00:00",
+                    "status": "processing",
+                    "retry_count": 0,
+                    "last_error": None,
+                },
+                {
+                    "event_id": "2",
+                    "event_type": "test",
+                    "event_source": "test",
+                    "event_data": {},
+                    "content_type": "application/json",
+                    "created_at": "2024-01-01T00:00:00",
+                    "status": "processing",
+                    "retry_count": 0,
+                    "last_error": None,
+                },
+            ]
+        )
         storage.mark_outbox_published = AsyncMock()
 
         relayer = OutboxRelayer(
@@ -581,10 +603,8 @@ class TestLeaderElectionEdgeCases:
                 task = asyncio.create_task(app._leader_election_loop())
                 await asyncio.sleep(0.1)  # Let it run a bit
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
 
             await run_leader_loop()
 
@@ -652,8 +672,6 @@ class TestOutboxBackoffEdgeCases:
 
         wait_timeouts = []
         iteration = [0]
-
-        original_wait_for = asyncio.wait_for
 
         async def mock_wait_for(coro, timeout):
             wait_timeouts.append(timeout)
@@ -728,6 +746,7 @@ class TestLeaderElectionIntegration:
     async def pg_storage(self):
         """Create a PostgreSQL storage instance for testing."""
         import os
+
         pg_url = os.environ.get("TEST_DATABASE_URL")
         if not pg_url or "postgresql" not in pg_url:
             pytest.skip("PostgreSQL not available for testing")
@@ -834,6 +853,7 @@ class TestSystemLockPostgreSQL:
     async def pg_storage(self):
         """Create a PostgreSQL storage instance for testing."""
         import os
+
         pg_url = os.environ.get("TEST_DATABASE_URL")
         if not pg_url or "postgresql" not in pg_url:
             pytest.skip("PostgreSQL not available for testing")
@@ -844,13 +864,11 @@ class TestSystemLockPostgreSQL:
         yield storage
         # Clean up test locks
         async with storage._async_session_factory() as session:
-            from edda.storage.models import SystemLock
             from sqlalchemy import delete
-            await session.execute(
-                delete(SystemLock).where(
-                    SystemLock.lock_name.like("test_%")
-                )
-            )
+
+            from edda.storage.models import SystemLock
+
+            await session.execute(delete(SystemLock).where(SystemLock.lock_name.like("test_%")))
             await session.commit()
         await storage.close()
 
@@ -858,6 +876,7 @@ class TestSystemLockPostgreSQL:
     async def test_postgres_atomic_lock_acquisition(self, pg_storage):
         """Test atomic lock acquisition on PostgreSQL."""
         import uuid
+
         lock_name = f"test_{uuid.uuid4().hex[:8]}"
 
         result = await pg_storage.try_acquire_system_lock(
@@ -879,6 +898,7 @@ class TestSystemLockPostgreSQL:
     async def test_postgres_concurrent_lock_race(self, pg_storage):
         """Test concurrent lock acquisition on PostgreSQL."""
         import uuid
+
         lock_name = f"test_{uuid.uuid4().hex[:8]}"
 
         results = []
@@ -892,10 +912,7 @@ class TestSystemLockPostgreSQL:
             results.append((worker_id, result))
 
         # Launch multiple concurrent acquisitions
-        tasks = [
-            asyncio.create_task(try_acquire(f"worker_{i}"))
-            for i in range(10)
-        ]
+        tasks = [asyncio.create_task(try_acquire(f"worker_{i}")) for i in range(10)]
         await asyncio.gather(*tasks)
 
         # Exactly one should succeed
@@ -924,6 +941,7 @@ class TestConcurrencyStress:
     async def test_high_concurrency_lock_acquisition(self, storage):
         """Test lock acquisition under high concurrency."""
         import uuid
+
         lock_name = f"test_{uuid.uuid4().hex[:8]}"
         num_workers = 50
 
@@ -938,10 +956,7 @@ class TestConcurrencyStress:
             results.append((worker_id, result))
 
         # Launch many concurrent acquisitions
-        tasks = [
-            asyncio.create_task(try_acquire(f"worker_{i}"))
-            for i in range(num_workers)
-        ]
+        tasks = [asyncio.create_task(try_acquire(f"worker_{i}")) for i in range(num_workers)]
         await asyncio.gather(*tasks)
 
         # Exactly one should succeed
@@ -956,6 +971,7 @@ class TestConcurrencyStress:
     async def test_repeated_lock_release_acquire_cycles(self, storage):
         """Test repeated lock release and acquire cycles."""
         import uuid
+
         lock_name = f"test_{uuid.uuid4().hex[:8]}"
 
         for i in range(20):
@@ -1002,10 +1018,7 @@ class TestConcurrencyStress:
             results.append((lock_num, worker_id, result))
 
         # Each worker acquires a different lock
-        tasks = [
-            asyncio.create_task(acquire_lock(i, f"worker_{i}"))
-            for i in range(num_locks)
-        ]
+        tasks = [asyncio.create_task(acquire_lock(i, f"worker_{i}")) for i in range(num_locks)]
         await asyncio.gather(*tasks)
 
         # All should succeed (different locks)

@@ -288,13 +288,13 @@ class PostgresNotifyListener:
                         await asyncio.sleep(self._reconnect_interval)
 
 
-def get_notify_channel_for_message(channel: str) -> str:
+def get_notify_channel_for_message(_channel: str) -> str:
     """Convert Edda channel name to PostgreSQL NOTIFY channel.
 
     Returns a unified channel name that both Python and Go frameworks use.
 
     Args:
-        channel: The Edda channel name (unused, kept for API compatibility).
+        _channel: The Edda channel name (unused, kept for API compatibility).
 
     Returns:
         Unified PostgreSQL channel name.
