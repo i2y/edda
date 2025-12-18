@@ -69,6 +69,9 @@ class WorkflowContext:
         # Default retry policy from EddaApp (set by ReplayEngine)
         self._app_retry_policy: Any = None
 
+        # Direct subscriptions: channel names subscribed with mode="direct"
+        self._direct_subscriptions: set[str] = set()
+
     @property
     def storage(self) -> StorageProtocol:
         """
@@ -270,6 +273,27 @@ class WorkflowContext:
             activity_id: The activity ID to record
         """
         self.executed_activity_ids.add(activity_id)
+
+    def _record_direct_subscription(self, channel: str) -> None:
+        """
+        Record that a channel was subscribed in direct mode (internal use only).
+
+        Args:
+            channel: The original channel name (before transformation)
+        """
+        self._direct_subscriptions.add(channel)
+
+    def _is_direct_subscription(self, channel: str) -> bool:
+        """
+        Check if a channel was subscribed in direct mode (internal use only).
+
+        Args:
+            channel: The channel name to check
+
+        Returns:
+            True if the channel was subscribed with mode="direct"
+        """
+        return channel in self._direct_subscriptions
 
     async def _record_activity_completed(
         self,

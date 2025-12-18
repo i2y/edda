@@ -145,8 +145,22 @@ async def subscribe(
     Args:
         ctx: Workflow context
         channel: Channel name to subscribe to
-        mode: Subscription mode - "broadcast" (all subscribers receive all messages)
-              or "competing" (each message goes to only one subscriber)
+        mode: Subscription mode:
+              - "broadcast": All subscribers receive all messages (fan-out pattern)
+              - "competing": Each message goes to only one subscriber (work queue pattern)
+              - "direct": Receive messages sent via send_to() to this instance
+
+    The "direct" mode is syntactic sugar that subscribes to "channel:instance_id" internally,
+    allowing simpler code when receiving direct messages:
+
+        # Instead of this:
+        direct_channel = f"notifications:{ctx.instance_id}"
+        await subscribe(ctx, direct_channel, mode="broadcast")
+        msg = await receive(ctx, direct_channel)
+
+        # You can write:
+        await subscribe(ctx, "notifications", mode="direct")
+        msg = await receive(ctx, "notifications")
 
     Example:
         >>> @workflow
@@ -168,11 +182,27 @@ async def subscribe(
         ...         job = await receive(ctx, "jobs")
         ...         await execute_job(ctx, job.data, activity_id=f"job:{job.id}")
         ...         await ctx.recur()
-    """
-    if mode not in ("broadcast", "competing"):
-        raise ValueError(f"Invalid subscription mode: {mode}. Must be 'broadcast' or 'competing'")
 
-    await ctx.storage.subscribe_to_channel(ctx.instance_id, channel, mode)
+        >>> @workflow
+        ... async def direct_receiver(ctx: WorkflowContext, id: str):
+        ...     # Subscribe to receive direct messages via send_to()
+        ...     await subscribe(ctx, "notifications", mode="direct")
+        ...
+        ...     msg = await receive(ctx, "notifications")
+        ...     print(f"Received: {msg.data}")
+    """
+    actual_channel = channel
+    actual_mode = mode
+
+    if mode == "direct":
+        # Transform to instance-specific channel
+        actual_channel = f"{channel}:{ctx.instance_id}"
+        actual_mode = "broadcast"
+        ctx._record_direct_subscription(channel)
+    elif mode not in ("broadcast", "competing"):
+        raise ValueError(f"Invalid subscription mode: {mode}. Must be 'broadcast', 'competing', or 'direct'")
+
+    await ctx.storage.subscribe_to_channel(ctx.instance_id, actual_channel, actual_mode)
 
 
 async def unsubscribe(
@@ -185,11 +215,17 @@ async def unsubscribe(
     Note: Workflows are automatically unsubscribed from all channels when they
     complete, fail, or are cancelled. Explicit unsubscribe is usually not necessary.
 
+    For channels subscribed with mode="direct", use the original channel name
+    (not the transformed "channel:instance_id" form).
+
     Args:
         ctx: Workflow context
         channel: Channel name to unsubscribe from
     """
-    await ctx.storage.unsubscribe_from_channel(ctx.instance_id, channel)
+    actual_channel = channel
+    if ctx._is_direct_subscription(channel):
+        actual_channel = f"{channel}:{ctx.instance_id}"
+    await ctx.storage.unsubscribe_from_channel(ctx.instance_id, actual_channel)
 
 
 # =============================================================================
@@ -233,7 +269,12 @@ async def receive(
         ...         await process(ctx, msg.data, activity_id=f"process:{msg.id}")
         ...         await ctx.recur()
     """
-    # Generate activity ID
+    # Transform channel for direct subscriptions
+    actual_channel = channel
+    if ctx._is_direct_subscription(channel):
+        actual_channel = f"{channel}:{ctx.instance_id}"
+
+    # Generate activity ID (use original channel name for deterministic replay)
     if message_id is None:
         activity_id = ctx._generate_activity_id(f"receive_{channel}")
     else:
@@ -277,21 +318,21 @@ async def receive(
             raise RuntimeError(f"Unexpected cached result type: {type(cached_result)}")
 
     # Check for pending messages in the queue
-    pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, channel)
+    pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, actual_channel)
     if pending:
         # Get the first pending message
         msg_dict = pending[0]
         msg_id = msg_dict["message_id"]
 
         # For competing mode, try to claim the message
-        subscription = await _get_subscription(ctx, channel)
+        subscription = await _get_subscription(ctx, actual_channel)
         if subscription and subscription.get("mode") == "competing":
             claimed = await ctx.storage.claim_channel_message(msg_id, ctx.instance_id)
             if not claimed:
                 # Another worker claimed it, check next message
                 # For simplicity, raise exception to retry
                 raise WaitForChannelMessageException(
-                    channel=channel,
+                    channel=actual_channel,
                     timeout_seconds=timeout_seconds,
                     activity_id=activity_id,
                 )
@@ -299,7 +340,7 @@ async def receive(
             await ctx.storage.delete_channel_message(msg_id)
         else:
             # Broadcast mode - update cursor
-            await ctx.storage.update_delivery_cursor(channel, ctx.instance_id, msg_dict["id"])
+            await ctx.storage.update_delivery_cursor(actual_channel, ctx.instance_id, msg_dict["id"])
 
         # Build the message
         raw_data = msg_dict.get("data")
@@ -337,7 +378,7 @@ async def receive(
 
     # No pending messages, raise exception to pause workflow
     raise WaitForChannelMessageException(
-        channel=channel,
+        channel=actual_channel,
         timeout_seconds=timeout_seconds,
         activity_id=activity_id,
     )
