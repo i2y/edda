@@ -310,9 +310,41 @@ app = EddaApp(
 )
 ```
 
-### Manual Schema Migration (dbmate)
+### Schema Migration
 
-Edda auto-creates tables by default (`auto_migrate=True`). For explicit schema control, use [dbmate](https://github.com/amacneil/dbmate):
+#### Automatic Migration (Default)
+
+Edda automatically applies database migrations at startup. No manual commands needed:
+
+```python
+from edda import EddaApp
+
+# Migrations are applied automatically at startup
+app = EddaApp(
+    service_name="demo-service",
+    db_url="postgresql://user:pass@localhost/dbname"
+)
+```
+
+**Key features:**
+
+- **Zero configuration**: Works out of the box
+- **Multi-worker safe**: Handles concurrent startup gracefully (race condition protected)
+- **dbmate compatible**: Uses the same SQL files and `schema_migrations` table
+- **Incremental**: Only applies pending migrations
+
+#### Manual Migration with dbmate (Optional)
+
+For explicit schema control, you can disable auto-migration and use [dbmate](https://github.com/amacneil/dbmate):
+
+```python
+# Disable auto-migration
+app = EddaApp(
+    service_name="demo-service",
+    db_url="postgresql://...",
+    auto_migrate=False  # Use dbmate-managed schema
+)
+```
 
 ```bash
 # Install dbmate
@@ -322,23 +354,14 @@ brew install dbmate  # macOS
 # Add schema submodule to your project
 git submodule add https://github.com/durax-io/schema.git schema
 
-# Run migration
+# Run migration manually
 DATABASE_URL="postgresql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/postgresql up
-DATABASE_URL="mysql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/mysql up
-DATABASE_URL="sqlite:./workflow.db" dbmate -d ./schema/db/migrations/sqlite up
 
 # Check status
 dbmate -d ./schema/db/migrations/postgresql status
 ```
 
-Disable auto-migration in EddaApp:
-
-```python
-app = EddaApp(
-    db_url="postgresql://...",
-    auto_migrate=False  # Use dbmate-managed schema
-)
-```
+> **Note**: Edda's auto-migration uses the same SQL files as dbmate, so you can switch between modes freely.
 
 ## Next Steps
 

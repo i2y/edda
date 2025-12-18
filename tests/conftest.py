@@ -3,7 +3,6 @@ Pytest configuration and fixtures for Edda tests.
 """
 
 import os
-import re
 from pathlib import Path
 
 import pytest
@@ -13,85 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from edda.serialization.json import JSONSerializer
+from edda.storage.migrations import apply_dbmate_migrations
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
-
 
 # Path to schema migrations (relative to project root)
 SCHEMA_DIR = Path(__file__).parent.parent / "schema" / "db" / "migrations"
-
-
-async def apply_migrations(engine, db_type: str) -> None:
-    """
-    Apply database migrations from SQL files.
-
-    Args:
-        engine: SQLAlchemy async engine
-        db_type: One of 'sqlite', 'postgresql', 'mysql'
-    """
-    migrations_dir = SCHEMA_DIR / db_type
-    if not migrations_dir.exists():
-        raise FileNotFoundError(f"Migration directory not found: {migrations_dir}")
-
-    # Get all migration files sorted by name (timestamp order)
-    migration_files = sorted(migrations_dir.glob("*.sql"))
-
-    async with engine.begin() as conn:
-        for migration_file in migration_files:
-            content = migration_file.read_text()
-
-            # Extract the "-- migrate:up" section
-            up_match = re.search(r"-- migrate:up\s*(.*?)(?:-- migrate:down|$)", content, re.DOTALL)
-            if not up_match:
-                continue
-
-            up_sql = up_match.group(1).strip()
-            if not up_sql:
-                continue
-
-            # For MySQL, handle DELIMITER and stored procedures specially
-            if db_type == "mysql" and "DELIMITER" in up_sql:
-                # Skip procedure-based migrations for now, execute simpler parts
-                # Remove DELIMITER blocks and procedures
-                simple_sql = re.sub(
-                    r"DROP PROCEDURE.*?;|DELIMITER.*?DELIMITER ;",
-                    "",
-                    up_sql,
-                    flags=re.DOTALL
-                )
-                up_sql = simple_sql
-
-            # Split by semicolons and execute each statement
-            # Be careful with statements that might contain semicolons in strings
-            statements = [s.strip() for s in up_sql.split(";") if s.strip()]
-
-            for stmt in statements:
-                # Skip empty statements
-                if not stmt:
-                    continue
-
-                # Strip leading comment lines to get actual SQL
-                lines = stmt.split("\n")
-                sql_lines = []
-                for line in lines:
-                    stripped = line.strip()
-                    # Skip empty lines and comment-only lines
-                    if not stripped or stripped.startswith("--"):
-                        continue
-                    sql_lines.append(line)
-
-                actual_sql = "\n".join(sql_lines).strip()
-                if not actual_sql:
-                    continue
-
-                stmt = actual_sql
-                try:
-                    await conn.execute(text(stmt))
-                except Exception as e:
-                    # Log but continue - some statements might fail if objects exist
-                    # (e.g., CREATE INDEX IF NOT EXISTS not supported in all DBs)
-                    err_msg = str(e).lower()
-                    if "already exists" not in err_msg and "duplicate column" not in err_msg:
-                        raise
 
 
 def get_database_urls() -> dict[str, str]:
@@ -130,7 +55,7 @@ async def db_storage(request):
         )
 
         # Apply migrations from SQL files
-        await apply_migrations(engine, "sqlite")
+        await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
         storage = SQLAlchemyStorage(engine)
 
@@ -164,7 +89,7 @@ async def db_storage(request):
             engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
 
             # Apply migrations from SQL files
-            await apply_migrations(engine, "postgresql")
+            await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
             storage = SQLAlchemyStorage(engine)
 
@@ -214,7 +139,7 @@ async def db_storage(request):
             engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
 
             # Apply migrations from SQL files
-            await apply_migrations(engine, "mysql")
+            await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
             storage = SQLAlchemyStorage(engine)
 
@@ -256,7 +181,7 @@ async def sqlite_storage():
     )
 
     # Apply migrations from SQL files
-    await apply_migrations(engine, "sqlite")
+    await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
     storage = SQLAlchemyStorage(engine)
 
@@ -295,7 +220,7 @@ async def postgresql_storage():
         engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
 
         # Apply migrations from SQL files
-        await apply_migrations(engine, "postgresql")
+        await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
         storage = SQLAlchemyStorage(engine)
 
@@ -352,7 +277,7 @@ async def mysql_storage():
         engine = create_async_engine(db_url, echo=False, isolation_level="READ COMMITTED")
 
         # Apply migrations from SQL files
-        await apply_migrations(engine, "mysql")
+        await apply_dbmate_migrations(engine, SCHEMA_DIR)
 
         storage = SQLAlchemyStorage(engine)
 

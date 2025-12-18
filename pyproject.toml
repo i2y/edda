@@ -93,6 +93,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["edda"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"schema/db/migrations" = "edda/migrations"
+
+[tool.hatch.build.targets.sdist.force-include]
+"schema/db/migrations" = "edda/migrations"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

@@ -518,6 +518,7 @@ class SQLAlchemyStorage:
         self,
         engine: AsyncEngine,
         notify_listener: Any | None = None,
+        migrations_dir: str | None = None,
     ):
         """
         Initialize SQLAlchemy storage.
@@ -527,9 +528,12 @@ class SQLAlchemyStorage:
             notify_listener: Optional notify listener for PostgreSQL LISTEN/NOTIFY.
                             If provided and PostgreSQL is used, NOTIFY messages
                             will be sent after key operations.
+            migrations_dir: Optional path to migrations directory. If None,
+                           auto-detects from package or schema/ submodule.
         """
         self.engine = engine
         self._notify_listener = notify_listener
+        self._migrations_dir = migrations_dir
 
     @property
     def _is_postgresql(self) -> bool:
@@ -553,22 +557,21 @@ class SQLAlchemyStorage:
         self._notify_listener = listener
 
     async def initialize(self) -> None:
-        """Initialize database connection and create tables.
+        """Initialize database connection and apply migrations.
 
-        This method creates all tables if they don't exist, and then performs
-        automatic schema migration to add any missing columns and update CHECK
-        constraints. This ensures compatibility when upgrading Edda versions.
+        This method automatically applies dbmate migration files to create
+        tables and update schema. It tracks applied migrations in the
+        schema_migrations table (compatible with dbmate CLI).
         """
-        # Create all tables and indexes
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        from pathlib import Path
 
-        # NOTE: Schema migrations are now handled by dbmate.
-        # See schema/db/migrations/ for migration files.
-        # Run `cd schema && dbmate up` to apply migrations.
-        # await self._auto_migrate_schema()
+        from .migrations import apply_dbmate_migrations
 
-        # Auto-migrate CHECK constraints
+        # Apply dbmate migrations
+        migrations_dir = Path(self._migrations_dir) if self._migrations_dir else None
+        await apply_dbmate_migrations(self.engine, migrations_dir)
+
+        # Auto-migrate CHECK constraints (for existing tables)
         await self._auto_migrate_check_constraints()
 
         # Initialize schema version
@@ -1777,30 +1780,42 @@ class SQLAlchemyStorage:
             if dialect_name == "sqlite":
                 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-                stmt: Any = sqlite_insert(SystemLock).values(
-                    lock_name=lock_name,
-                    locked_by=None,
-                    locked_at=None,
-                    lock_expires_at=None,
-                ).on_conflict_do_nothing(index_elements=["lock_name"])
+                stmt: Any = (
+                    sqlite_insert(SystemLock)
+                    .values(
+                        lock_name=lock_name,
+                        locked_by=None,
+                        locked_at=None,
+                        lock_expires_at=None,
+                    )
+                    .on_conflict_do_nothing(index_elements=["lock_name"])
+                )
             elif dialect_name == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-                stmt = pg_insert(SystemLock).values(
-                    lock_name=lock_name,
-                    locked_by=None,
-                    locked_at=None,
-                    lock_expires_at=None,
-                ).on_conflict_do_nothing(index_elements=["lock_name"])
+                stmt = (
+                    pg_insert(SystemLock)
+                    .values(
+                        lock_name=lock_name,
+                        locked_by=None,
+                        locked_at=None,
+                        lock_expires_at=None,
+                    )
+                    .on_conflict_do_nothing(index_elements=["lock_name"])
+                )
             else:  # mysql
                 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-                stmt = mysql_insert(SystemLock).values(
-                    lock_name=lock_name,
-                    locked_by=None,
-                    locked_at=None,
-                    lock_expires_at=None,
-                ).on_duplicate_key_update(lock_name=lock_name)  # No-op update
+                stmt = (
+                    mysql_insert(SystemLock)
+                    .values(
+                        lock_name=lock_name,
+                        locked_by=None,
+                        locked_at=None,
+                        lock_expires_at=None,
+                    )
+                    .on_duplicate_key_update(lock_name=lock_name)
+                )  # No-op update
 
             await session.execute(stmt)
             await session.commit()

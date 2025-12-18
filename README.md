@@ -223,23 +223,43 @@ pip install "git+https://github.com/i2y/edda.git[postgresql,viewer]"
 
 ### Database Schema Migration
 
-For manual schema management using [dbmate](https://github.com/amacneil/dbmate):
+**Automatic Migration (Default)**
+
+Edda automatically applies database migrations at startup. No manual commands needed:
+
+```python
+from edda import EddaApp
+
+# Migrations are applied automatically
+app = EddaApp(db_url="postgresql://user:pass@localhost/dbname")
+```
+
+This is safe in multi-worker environments - Edda handles concurrent startup gracefully.
+
+**Manual Migration with dbmate (Optional)**
+
+For explicit schema control, you can disable auto-migration and use [dbmate](https://github.com/amacneil/dbmate):
+
+```python
+# Disable auto-migration
+app = EddaApp(
+    db_url="postgresql://...",
+    auto_migrate=False  # Use dbmate-managed schema
+)
+```
 
 ```bash
 # Install dbmate
 brew install dbmate  # macOS
-# Linux: curl -fsSL https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 -o /usr/local/bin/dbmate && chmod +x /usr/local/bin/dbmate
 
 # Add schema submodule
 git submodule add https://github.com/durax-io/schema.git schema
 
-# Run migration
+# Run migration manually
 DATABASE_URL="postgresql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/postgresql up
-DATABASE_URL="mysql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/mysql up
-DATABASE_URL="sqlite:./workflow.db" dbmate -d ./schema/db/migrations/sqlite up
 ```
 
-**Note**: EddaApp auto-creates tables by default (`auto_migrate=True`). Use dbmate when you need explicit migration control.
+> **Note**: Edda's auto-migration uses the same SQL files as dbmate, maintaining full compatibility.
 
 ### Development Installation
 
