@@ -221,6 +221,26 @@ pip install "git+https://github.com/i2y/edda.git[postgresql,viewer]"
 
 > **Tip**: For PostgreSQL, install the `postgres-notify` extra for near-instant event delivery using LISTEN/NOTIFY instead of polling.
 
+### Database Schema Migration
+
+For manual schema management using [dbmate](https://github.com/amacneil/dbmate):
+
+```bash
+# Install dbmate
+brew install dbmate  # macOS
+# Linux: curl -fsSL https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 -o /usr/local/bin/dbmate && chmod +x /usr/local/bin/dbmate
+
+# Add schema submodule
+git submodule add https://github.com/durax-io/schema.git schema
+
+# Run migration
+DATABASE_URL="postgresql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/postgresql up
+DATABASE_URL="mysql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/mysql up
+DATABASE_URL="sqlite:./workflow.db" dbmate -d ./schema/db/migrations/sqlite up
+```
+
+**Note**: EddaApp auto-creates tables by default (`auto_migrate=True`). Use dbmate when you need explicit migration control.
+
 ### Development Installation
 
 If you want to contribute to Edda or modify the framework itself:

@@ -310,6 +310,36 @@ app = EddaApp(
 )
 ```
 
+### Manual Schema Migration (dbmate)
+
+Edda auto-creates tables by default (`auto_migrate=True`). For explicit schema control, use [dbmate](https://github.com/amacneil/dbmate):
+
+```bash
+# Install dbmate
+brew install dbmate  # macOS
+# Linux: curl -fsSL https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 -o /usr/local/bin/dbmate && chmod +x /usr/local/bin/dbmate
+
+# Add schema submodule to your project
+git submodule add https://github.com/durax-io/schema.git schema
+
+# Run migration
+DATABASE_URL="postgresql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/postgresql up
+DATABASE_URL="mysql://user:pass@localhost/dbname" dbmate -d ./schema/db/migrations/mysql up
+DATABASE_URL="sqlite:./workflow.db" dbmate -d ./schema/db/migrations/sqlite up
+
+# Check status
+dbmate -d ./schema/db/migrations/postgresql status
+```
+
+Disable auto-migration in EddaApp:
+
+```python
+app = EddaApp(
+    db_url="postgresql://...",
+    auto_migrate=False  # Use dbmate-managed schema
+)
+```
+
 ## Next Steps
 
 - **[Quick Start](quick-start.md)**: Build your first workflow in 5 minutes

@@ -182,8 +182,13 @@ async def storage_with_old_schema():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Auto-migration is now handled by dbmate. See schema/db/migrations/")
 class TestAutoMigration:
-    """Test suite for automatic schema migration."""
+    """Test suite for automatic schema migration.
+
+    NOTE: These tests are skipped because schema migrations are now handled
+    externally by dbmate. See the schema/ directory for migration files.
+    """
 
     async def test_auto_migration_adds_missing_column(self, storage_with_old_schema):
         """Test that initialize() adds the missing 'continued_from' column."""
