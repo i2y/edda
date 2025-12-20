@@ -368,15 +368,21 @@ class ReplayEngine:
                     traceback.format_exception(type(error), error, error.__traceback__)
                 )
 
-                # Mark as failed with detailed error information
-                await ctx._update_status(
-                    "failed",
-                    {
-                        "error_message": str(error),
-                        "error_type": type(error).__name__,
-                        "stack_trace": stack_trace,
-                    },
+                error_data = {
+                    "error_message": str(error),
+                    "error_type": type(error).__name__,
+                    "stack_trace": stack_trace,
+                }
+
+                await self.storage.append_history(
+                    instance_id=instance_id,
+                    activity_id="workflow_failed",
+                    event_type="WorkflowFailed",
+                    event_data=error_data,
                 )
+
+                # Mark as failed with detailed error information
+                await ctx._update_status("failed", error_data)
 
                 # Call hook: workflow failed
                 if self.hooks and hasattr(self.hooks, "on_workflow_failed"):
@@ -576,15 +582,21 @@ class ReplayEngine:
                 traceback.format_exception(type(error), error, error.__traceback__)
             )
 
-            # Mark as failed with detailed error information
-            await ctx._update_status(
-                "failed",
-                {
-                    "error_message": str(error),
-                    "error_type": type(error).__name__,
-                    "stack_trace": stack_trace,
-                },
+            error_data = {
+                "error_message": str(error),
+                "error_type": type(error).__name__,
+                "stack_trace": stack_trace,
+            }
+
+            await self.storage.append_history(
+                instance_id=instance_id,
+                activity_id="workflow_failed",
+                event_type="WorkflowFailed",
+                event_data=error_data,
             )
+
+            # Mark as failed with detailed error information
+            await ctx._update_status("failed", error_data)
             raise
 
     async def resume_by_name(
@@ -775,14 +787,20 @@ class ReplayEngine:
                     traceback.format_exception(type(error), error, error.__traceback__)
                 )
 
-                await ctx._update_status(
-                    "failed",
-                    {
-                        "error_message": str(error),
-                        "error_type": type(error).__name__,
-                        "stack_trace": stack_trace,
-                    },
+                error_data = {
+                    "error_message": str(error),
+                    "error_type": type(error).__name__,
+                    "stack_trace": stack_trace,
+                }
+
+                await self.storage.append_history(
+                    instance_id=new_instance_id,
+                    activity_id="workflow_failed",
+                    event_type="WorkflowFailed",
+                    event_data=error_data,
                 )
+
+                await ctx._update_status("failed", error_data)
 
                 if self.hooks and hasattr(self.hooks, "on_workflow_failed"):
                     await self.hooks.on_workflow_failed(new_instance_id, workflow_name, error)

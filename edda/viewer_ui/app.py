@@ -309,6 +309,10 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                     all_workflows = service.get_all_workflows()
                     workflow_names = list(all_workflows.keys())
 
+                    workflow_select: Any = None
+                    params_container: Any = None
+                    param_fields: dict[str, Any] = {}
+
                     if not workflow_names:
                         ui.label("No workflows registered").classes("text-red-500")
                         ui.button("Close", on_click=start_dialog.close)
@@ -322,9 +326,6 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                         # Container for dynamic parameter fields
                         params_container = ui.column().classes("w-full mb-4")
-
-                        # Store input field references
-                        param_fields: dict[str, Any] = {}
 
                     # Factory functions for creating field managers with proper closures
                     # These must be defined outside the loop to avoid closure issues
@@ -778,6 +779,8 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                     def update_parameter_fields() -> None:
                         """Update parameter input fields based on selected workflow."""
+                        if workflow_select is None or params_container is None:
+                            return
                         selected_workflow = workflow_select.value
                         if not selected_workflow:
                             return
@@ -1106,13 +1109,17 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                     update_parameter_fields()
 
                     # Update fields when workflow selection changes
-                    workflow_select.on_value_change(lambda _: update_parameter_fields())
+                    if workflow_select is not None:
+                        workflow_select.on_value_change(lambda _: update_parameter_fields())
 
                     # Action buttons
                     with ui.row().classes("w-full gap-2"):
 
                         async def handle_start() -> None:
                             """Handle workflow start."""
+                            if workflow_select is None:
+                                ui.notify("No workflows available", type="negative")
+                                return
                             try:
                                 selected_workflow = workflow_select.value
                                 if not selected_workflow:
