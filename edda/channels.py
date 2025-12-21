@@ -129,6 +129,24 @@ class WaitForTimerException(Exception):
         super().__init__(f"Waiting for timer: {timer_id}")
 
 
+class ChannelModeConflictError(Exception):
+    """
+    Raised when subscribing with a different mode than the channel's established mode.
+
+    A channel's mode is locked when the first subscription is created. Subsequent
+    subscriptions must use the same mode.
+    """
+
+    def __init__(self, channel: str, existing_mode: str, requested_mode: str) -> None:
+        self.channel = channel
+        self.existing_mode = existing_mode
+        self.requested_mode = requested_mode
+        super().__init__(
+            f"Channel '{channel}' is already configured as '{existing_mode}' mode. "
+            f"Cannot subscribe with '{requested_mode}' mode."
+        )
+
+
 # =============================================================================
 # Subscription Functions
 # =============================================================================
@@ -149,6 +167,10 @@ async def subscribe(
               - "broadcast": All subscribers receive all messages (fan-out pattern)
               - "competing": Each message goes to only one subscriber (work queue pattern)
               - "direct": Receive messages sent via send_to() to this instance
+
+    Raises:
+        ChannelModeConflictError: If the channel is already configured with a different mode
+        ValueError: If mode is not 'broadcast', 'competing', or 'direct'
 
     The "direct" mode is syntactic sugar that subscribes to "channel:instance_id" internally,
     allowing simpler code when receiving direct messages:
@@ -203,6 +225,11 @@ async def subscribe(
         raise ValueError(
             f"Invalid subscription mode: {mode}. Must be 'broadcast', 'competing', or 'direct'"
         )
+
+    # Check for mode conflict
+    existing_mode = await ctx.storage.get_channel_mode(actual_channel)
+    if existing_mode is not None and existing_mode != actual_mode:
+        raise ChannelModeConflictError(channel, existing_mode, mode)
 
     await ctx.storage.subscribe_to_channel(ctx.instance_id, actual_channel, actual_mode)
 

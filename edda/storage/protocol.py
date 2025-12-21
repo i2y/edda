@@ -990,6 +990,18 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def get_channel_mode(self, channel: str) -> str | None:
+        """
+        Get the mode for a channel (from any existing subscription).
+
+        Args:
+            channel: Channel name
+
+        Returns:
+            The mode ('broadcast' or 'competing') or None if no subscriptions exist
+        """
+        ...
+
     async def register_channel_receive_and_release_lock(
         self,
         instance_id: str,

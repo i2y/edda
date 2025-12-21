@@ -3170,6 +3170,26 @@ class SQLAlchemyStorage:
                 "cursor_message_id": subscription.cursor_message_id,
             }
 
+    async def get_channel_mode(self, channel: str) -> str | None:
+        """
+        Get the mode for a channel (from any existing subscription).
+
+        Args:
+            channel: Channel name
+
+        Returns:
+            The mode ('broadcast' or 'competing') or None if no subscriptions exist
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(ChannelSubscription.mode)
+                .where(ChannelSubscription.channel == channel)
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return row
+
     async def register_channel_receive_and_release_lock(
         self,
         instance_id: str,
