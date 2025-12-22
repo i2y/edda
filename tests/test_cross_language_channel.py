@@ -56,6 +56,9 @@ SCHEMA_DIR = Path(__file__).parent.parent / "schema" / "db" / "migrations"
 # Path to Romancy repository (relative to this test file)
 ROMANCY_DIR = Path(__file__).parent.parent.parent / "romancy"
 
+# Path to Shikibu repository (relative to this test file)
+SHIKIBU_DIR = Path(__file__).parent.parent.parent / "shikibu"
+
 
 def is_go_available() -> bool:
     """Check if Go is available in PATH."""
@@ -65,6 +68,16 @@ def is_go_available() -> bool:
 def is_romancy_available() -> bool:
     """Check if Romancy repository is available."""
     return (ROMANCY_DIR / "cmd" / "crosstest" / "main.go").exists()
+
+
+def is_ruby_available() -> bool:
+    """Check if Ruby is available in PATH."""
+    return shutil.which("ruby") is not None
+
+
+def is_shikibu_available() -> bool:
+    """Check if Shikibu crosstest is available."""
+    return (SHIKIBU_DIR / "bin" / "crosstest").exists()
 
 
 # Skip all tests in this module if Go or Romancy is not available
@@ -228,6 +241,57 @@ def run_go_crosstest(
         raise RuntimeError(f"No JSON output from Go crosstest: {result.stdout}")
 
     return go_result
+
+
+def run_ruby_crosstest(
+    db_path: Path,
+    mode: str,
+    channel: str,
+    channel_mode: str = "broadcast",
+    timeout: int = 10,
+    message: str | None = None,
+    data: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    target_instance: str | None = None,
+) -> dict[str, Any]:
+    """Run the Ruby crosstest CLI and return the result."""
+    cmd = [
+        "bundle",
+        "exec",
+        "ruby",
+        str(SHIKIBU_DIR / "bin" / "crosstest"),
+        f"--db={db_path}",
+        f"--channel={channel}",
+        f"--mode={mode}",
+        f"--channel-mode={channel_mode}",
+        f"--timeout={timeout}",
+    ]
+
+    if message:
+        cmd.append(f"--message={message}")
+    if data:
+        cmd.append(f"--data={json.dumps(data)}")
+    if metadata:
+        cmd.append(f"--metadata={json.dumps(metadata)}")
+    if target_instance:
+        cmd.append(f"--target-instance={target_instance}")
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout + 30,
+        cwd=SHIKIBU_DIR,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Ruby crosstest failed: {result.stderr}")
+
+    # Ruby outputs clean JSON to stdout (logs go to stderr)
+    try:
+        return json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        raise RuntimeError(f"No JSON output from Ruby crosstest: {result.stdout}")
 
 
 # ============================================================================
@@ -868,3 +932,576 @@ class TestPythonToGoStrict:
         finally:
             go_proc.kill()
             go_proc.wait()
+
+
+# ============================================================================
+# Ruby → Python Tests
+# ============================================================================
+
+
+# Skip conditions for Ruby tests
+ruby_skip_conditions = [
+    pytest.mark.skipif(not is_ruby_available(), reason="Ruby is not installed"),
+    pytest.mark.skipif(not is_shikibu_available(), reason="Shikibu crosstest not found"),
+]
+
+
+@pytest.mark.asyncio
+class TestRubyToPython:
+    """
+    Test Ruby (Shikibu) publishing and Python (Edda) receiving.
+
+    These tests verify that messages published from Ruby can be
+    correctly received by Python workflows.
+    """
+
+    pytestmark = ruby_skip_conditions
+
+    async def test_broadcast_mode(self, cross_db, edda_app):
+        """Test Ruby publishes, Python receives (broadcast mode)."""
+        db_path, storage = cross_db
+        channel = "ruby-to-py-broadcast"
+
+        # Start Python subscriber workflow
+        sub_instance_id = await py_subscriber.start(
+            channel=channel,
+            timeout_seconds=15,
+            channel_mode="broadcast",
+        )
+
+        # Wait for subscriber to be waiting
+        await asyncio.sleep(2)
+
+        # Ruby publishes a message
+        ruby_result = run_ruby_crosstest(
+            db_path=db_path,
+            mode="publisher",
+            channel=channel,
+            message="Hello from Ruby!",
+            data={"nested": {"value": 456}},
+            metadata={"source": "ruby", "test": "ruby-to-py"},
+        )
+
+        assert ruby_result.get("published") is True
+
+        # Wait for Python subscriber to complete
+        py_result = await wait_for_workflow(storage, sub_instance_id, timeout=20)
+
+        assert py_result is not None
+        assert py_result.get("received") is True
+
+        # Verify message content
+        msg = py_result.get("message", {})
+        assert msg.get("text") == "Hello from Ruby!"
+        assert msg.get("data", {}).get("nested", {}).get("value") == 456
+
+        # Verify metadata
+        metadata = py_result.get("metadata", {})
+        assert metadata.get("source") == "ruby"
+
+    async def test_competing_mode(self, cross_db, edda_app):
+        """Test competing mode with Ruby publisher."""
+        db_path, storage = cross_db
+        channel = "ruby-to-py-competing"
+
+        # Start Python subscriber
+        py_instance_id = await py_subscriber.start(
+            channel=channel,
+            timeout_seconds=15,
+            channel_mode="competing",
+        )
+
+        # Start another Python subscriber
+        py_instance_id_2 = await py_subscriber.start(
+            channel=channel,
+            timeout_seconds=15,
+            channel_mode="competing",
+        )
+
+        # Wait for subscribers to be ready
+        await asyncio.sleep(2)
+
+        # Ruby publishes a single message
+        ruby_result = run_ruby_crosstest(
+            db_path=db_path,
+            mode="publisher",
+            channel=channel,
+            message="Competing message from Ruby",
+            data={"id": 1},
+        )
+
+        assert ruby_result.get("published") is True
+
+        # Wait for results
+        await asyncio.sleep(3)
+
+        # Get both Python results
+        py_result_1 = await wait_for_workflow(storage, py_instance_id, timeout=10)
+        py_result_2 = await wait_for_workflow(storage, py_instance_id_2, timeout=10)
+
+        # At least one should receive (competing mode delivers to one)
+        py1_received = py_result_1 and py_result_1.get("received") is True
+        py2_received = py_result_2 and py_result_2.get("received") is True
+
+        assert py1_received or py2_received, "No subscriber received the message"
+
+    async def test_direct_mode(self, cross_db, edda_app):
+        """Test Ruby sends direct message to Python subscriber."""
+        db_path, storage = cross_db
+        channel = "direct-ruby-to-py"
+
+        # Start Python subscriber in direct mode
+        sub_instance_id = await py_subscriber.start(
+            channel=channel,
+            timeout_seconds=15,
+            channel_mode="direct",
+        )
+
+        # Wait for subscriber to be waiting
+        await asyncio.sleep(2)
+
+        # Ruby sends a direct message to the Python subscriber
+        ruby_result = run_ruby_crosstest(
+            db_path=db_path,
+            mode="send-to",
+            channel=channel,
+            message="Direct message from Ruby!",
+            data={"direct": True, "value": 777},
+            metadata={"source": "ruby", "type": "direct"},
+            target_instance=sub_instance_id,
+        )
+
+        assert ruby_result.get("sent") is True, f"Ruby send-to failed: {ruby_result}"
+
+        # Wait for Python subscriber to complete
+        py_result = await wait_for_workflow(storage, sub_instance_id, timeout=20)
+
+        assert py_result is not None, "Python subscriber did not complete"
+        assert py_result.get("received") is True, f"Python did not receive: {py_result}"
+
+        # Verify message content
+        msg = py_result.get("message", {})
+        assert msg.get("text") == "Direct message from Ruby!"
+        assert msg.get("data", {}).get("direct") is True
+        assert msg.get("data", {}).get("value") == 777
+
+        # Verify metadata
+        metadata = py_result.get("metadata", {})
+        assert metadata.get("source") == "ruby"
+        assert metadata.get("type") == "direct"
+
+
+# ============================================================================
+# Python → Ruby Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+class TestPythonToRuby:
+    """
+    Test Python (Edda) publishing and Ruby (Shikibu) receiving.
+    """
+
+    pytestmark = ruby_skip_conditions
+
+    async def test_broadcast_mode(self, cross_db, edda_app):
+        """Test Python publishes, Ruby receives (broadcast mode)."""
+        db_path, storage = cross_db
+        channel = "py-to-ruby-broadcast"
+
+        # Start Ruby subscriber in background
+        ruby_proc = subprocess.Popen(
+            [
+                "bundle",
+                "exec",
+                "ruby",
+                str(SHIKIBU_DIR / "bin" / "crosstest"),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=broadcast",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=SHIKIBU_DIR,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Python publishes
+            instance_id = await py_publisher.start(
+                channel=channel,
+                message_data={
+                    "text": "Hello from Python to Ruby!",
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "data": {"nested": {"value": 789}},
+                },
+                metadata={"source": "python", "test": "py-to-ruby"},
+            )
+
+            result = await wait_for_workflow(storage, instance_id)
+            assert result is not None
+            assert result.get("published") is True
+
+            stdout, stderr = ruby_proc.communicate(timeout=20)
+            ruby_result = json.loads(stdout.strip())
+
+            assert ruby_result.get("received") is True, f"Ruby did not receive: {ruby_result}"
+
+            msg = ruby_result.get("message", {})
+            assert msg.get("text") == "Hello from Python to Ruby!"
+            assert msg.get("data", {}).get("nested", {}).get("value") == 789
+
+        finally:
+            ruby_proc.kill()
+            ruby_proc.wait()
+
+    async def test_direct_mode(self, cross_db, edda_app):
+        """Test Python sends direct message to Ruby subscriber."""
+        db_path, storage = cross_db
+        channel = "py-to-ruby-direct"
+
+        # Start Ruby subscriber in direct mode
+        ruby_proc = subprocess.Popen(
+            [
+                "bundle",
+                "exec",
+                "ruby",
+                str(SHIKIBU_DIR / "bin" / "crosstest"),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=direct",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=SHIKIBU_DIR,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Find Ruby subscriber's instance ID
+            async with storage.engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        """
+                    SELECT instance_id FROM workflow_instances
+                    WHERE workflow_name = 'crosstest_subscriber'
+                    AND status = 'waiting_for_message'
+                    AND framework = 'ruby'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """
+                    )
+                )
+                row = result.fetchone()
+            assert row is not None, "No Ruby subscriber instance found"
+            ruby_instance_id = row[0]
+
+            # Python sends direct message
+            send_instance_id = await py_send_to.start(
+                target_instance_id=ruby_instance_id,
+                channel=channel,
+                message_data={
+                    "text": "Direct from Python to Ruby!",
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "data": {"direct": True},
+                },
+                metadata={"source": "python"},
+            )
+
+            send_result = await wait_for_workflow(storage, send_instance_id)
+            assert send_result is not None
+            assert send_result.get("sent") is True
+
+            stdout, stderr = ruby_proc.communicate(timeout=20)
+            ruby_result = json.loads(stdout.strip())
+
+            assert ruby_result.get("received") is True, f"Ruby did not receive: {ruby_result}"
+
+            msg = ruby_result.get("message", {})
+            assert msg.get("text") == "Direct from Python to Ruby!"
+
+        finally:
+            ruby_proc.kill()
+            ruby_proc.wait()
+
+
+# ============================================================================
+# Ruby → Go Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+class TestRubyToGo:
+    """
+    Test Ruby (Shikibu) publishing and Go (Romancy) receiving.
+    """
+
+    pytestmark = ruby_skip_conditions
+
+    async def test_broadcast_mode(self, go_binary, cross_db, edda_app):
+        """Test Ruby publishes, Go receives (broadcast mode)."""
+        db_path, storage = cross_db
+        channel = "ruby-to-go-broadcast"
+
+        # Start Go subscriber with compatible message type
+        go_proc = subprocess.Popen(
+            [
+                str(go_binary),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=broadcast",
+                "--message-type=compatible",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Ruby publishes
+            ruby_result = run_ruby_crosstest(
+                db_path=db_path,
+                mode="publisher",
+                channel=channel,
+                message="Hello from Ruby to Go!",
+                data={"cross": True, "value": 111},
+                metadata={"source": "ruby"},
+            )
+
+            assert ruby_result.get("published") is True
+
+            stdout, stderr = go_proc.communicate(timeout=20)
+            go_result = parse_go_json_output(stdout)
+
+            assert go_result is not None, f"No JSON output from Go: {stdout}"
+            assert go_result.get("received") is True, f"Go did not receive: {go_result}"
+
+            msg = go_result.get("message", {})
+            assert msg.get("text") == "Hello from Ruby to Go!"
+            assert msg.get("data", {}).get("cross") is True
+            assert msg.get("data", {}).get("value") == 111
+
+        finally:
+            go_proc.kill()
+            go_proc.wait()
+
+    async def test_direct_mode(self, go_binary, cross_db, edda_app):
+        """Test Ruby sends direct message to Go subscriber."""
+        db_path, storage = cross_db
+        channel = "ruby-to-go-direct"
+
+        # Start Go subscriber in direct mode
+        go_proc = subprocess.Popen(
+            [
+                str(go_binary),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=direct",
+                "--message-type=compatible",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Find Go subscriber's instance ID
+            async with storage.engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        """
+                    SELECT instance_id FROM workflow_instances
+                    WHERE workflow_name = 'crosstest_subscriber'
+                    AND status = 'waiting_for_message'
+                    AND framework = 'go'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """
+                    )
+                )
+                row = result.fetchone()
+            assert row is not None, "No Go subscriber instance found"
+            go_instance_id = row[0]
+
+            # Ruby sends direct message
+            ruby_result = run_ruby_crosstest(
+                db_path=db_path,
+                mode="send-to",
+                channel=channel,
+                message="Direct from Ruby to Go!",
+                data={"direct": True},
+                metadata={"source": "ruby"},
+                target_instance=go_instance_id,
+            )
+
+            assert ruby_result.get("sent") is True
+
+            stdout, stderr = go_proc.communicate(timeout=20)
+            go_result = parse_go_json_output(stdout)
+
+            assert go_result is not None, f"No JSON output from Go: {stdout}"
+            assert go_result.get("received") is True, f"Go did not receive: {go_result}"
+
+            msg = go_result.get("message", {})
+            assert msg.get("text") == "Direct from Ruby to Go!"
+
+        finally:
+            go_proc.kill()
+            go_proc.wait()
+
+
+# ============================================================================
+# Go → Ruby Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+class TestGoToRuby:
+    """
+    Test Go (Romancy) publishing and Ruby (Shikibu) receiving.
+    """
+
+    pytestmark = ruby_skip_conditions
+
+    async def test_broadcast_mode(self, go_binary, cross_db, edda_app):
+        """Test Go publishes, Ruby receives (broadcast mode)."""
+        db_path, storage = cross_db
+        channel = "go-to-ruby-broadcast"
+
+        # Start Ruby subscriber in background
+        ruby_proc = subprocess.Popen(
+            [
+                "bundle",
+                "exec",
+                "ruby",
+                str(SHIKIBU_DIR / "bin" / "crosstest"),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=broadcast",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=SHIKIBU_DIR,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Go publishes
+            go_result = run_go_crosstest(
+                binary_path=go_binary,
+                db_path=db_path,
+                mode="publisher",
+                channel=channel,
+                message="Hello from Go to Ruby!",
+                data={"cross": True, "value": 222},
+                metadata={"source": "go"},
+            )
+
+            assert go_result.get("published") is True
+
+            stdout, stderr = ruby_proc.communicate(timeout=20)
+            ruby_result = json.loads(stdout.strip())
+
+            assert ruby_result.get("received") is True, f"Ruby did not receive: {ruby_result}"
+
+            msg = ruby_result.get("message", {})
+            assert msg.get("text") == "Hello from Go to Ruby!"
+            assert msg.get("data", {}).get("cross") is True
+            assert msg.get("data", {}).get("value") == 222
+
+        finally:
+            ruby_proc.kill()
+            ruby_proc.wait()
+
+    async def test_direct_mode(self, go_binary, cross_db, edda_app):
+        """Test Go sends direct message to Ruby subscriber."""
+        db_path, storage = cross_db
+        channel = "go-to-ruby-direct"
+
+        # Start Ruby subscriber in direct mode
+        ruby_proc = subprocess.Popen(
+            [
+                "bundle",
+                "exec",
+                "ruby",
+                str(SHIKIBU_DIR / "bin" / "crosstest"),
+                f"--db={db_path}",
+                f"--channel={channel}",
+                "--mode=subscriber",
+                "--channel-mode=direct",
+                "--timeout=15",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=SHIKIBU_DIR,
+        )
+
+        try:
+            await asyncio.sleep(2)
+
+            # Find Ruby subscriber's instance ID
+            async with storage.engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        """
+                    SELECT instance_id FROM workflow_instances
+                    WHERE workflow_name = 'crosstest_subscriber'
+                    AND status = 'waiting_for_message'
+                    AND framework = 'ruby'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """
+                    )
+                )
+                row = result.fetchone()
+            assert row is not None, "No Ruby subscriber instance found"
+            ruby_instance_id = row[0]
+
+            # Go sends direct message
+            go_result = run_go_crosstest(
+                binary_path=go_binary,
+                db_path=db_path,
+                mode="send-to",
+                channel=channel,
+                message="Direct from Go to Ruby!",
+                data={"direct": True, "value": 333},
+                metadata={"source": "go"},
+                target_instance=ruby_instance_id,
+            )
+
+            assert go_result.get("sent") is True
+
+            stdout, stderr = ruby_proc.communicate(timeout=20)
+            ruby_result = json.loads(stdout.strip())
+
+            assert ruby_result.get("received") is True, f"Ruby did not receive: {ruby_result}"
+
+            msg = ruby_result.get("message", {})
+            assert msg.get("text") == "Direct from Go to Ruby!"
+            assert msg.get("data", {}).get("direct") is True
+            assert msg.get("data", {}).get("value") == 333
+
+        finally:
+            ruby_proc.kill()
+            ruby_proc.wait()
