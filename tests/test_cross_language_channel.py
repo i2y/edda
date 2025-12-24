@@ -290,8 +290,8 @@ def run_ruby_crosstest(
     # Ruby outputs clean JSON to stdout (logs go to stderr)
     try:
         return json.loads(result.stdout.strip())
-    except json.JSONDecodeError:
-        raise RuntimeError(f"No JSON output from Ruby crosstest: {result.stdout}")
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"No JSON output from Ruby crosstest: {result.stdout}") from err
 
 
 # ============================================================================
