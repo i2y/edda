@@ -192,7 +192,6 @@ async def _refresh_lock_periodically(
 
 async def cleanup_stale_locks_periodically(
     storage: StorageProtocol,
-    worker_id: str,
     interval: int = 60,
 ) -> None:
     """
@@ -204,34 +203,23 @@ async def cleanup_stale_locks_periodically(
     Note: This function only cleans up locks without resuming workflows.
     For automatic workflow resumption, use auto_resume_stale_workflows_periodically().
 
-    Uses system-level locking to ensure only one pod executes cleanup at a time.
+    Important: This function should only be run by a single worker (e.g., via leader
+    election). It does not perform its own distributed coordination.
 
     Example:
         >>> asyncio.create_task(
-        ...     cleanup_stale_locks_periodically(storage, worker_id, interval=60)
+        ...     cleanup_stale_locks_periodically(storage, interval=60)
         ... )
 
     Args:
         storage: Storage backend
-        worker_id: Unique identifier for this worker (for global lock coordination)
         interval: Cleanup interval in seconds (default: 60)
     """
     with suppress(asyncio.CancelledError):
         while True:
-            # Add jitter to prevent thundering herd in multi-pod deployments
+            # Add jitter to prevent thundering herd
             jitter = random.uniform(0, interval * 0.3)
             await asyncio.sleep(interval + jitter)
-
-            # Try to acquire global lock for this task
-            lock_acquired = await storage.try_acquire_system_lock(
-                lock_name="cleanup_stale_locks",
-                worker_id=worker_id,
-                timeout_seconds=interval,
-            )
-
-            if not lock_acquired:
-                # Another pod is handling this task
-                continue
 
             try:
                 # Clean up stale locks
@@ -239,18 +227,13 @@ async def cleanup_stale_locks_periodically(
 
                 if len(workflows) > 0:
                     logger.info("Cleaned up %d stale locks", len(workflows))
-            finally:
-                try:
-                    await storage.release_system_lock("cleanup_stale_locks", worker_id)
-                except Exception as e:
-                    # Best-effort cleanup - lock will expire eventually
-                    logger.debug("Failed to release system lock during cleanup: %s", e)
+            except Exception as e:
+                logger.error("Failed to cleanup stale locks: %s", e, exc_info=True)
 
 
 async def auto_resume_stale_workflows_periodically(
     storage: StorageProtocol,
     replay_engine: Any,
-    worker_id: str,
     interval: int = 60,
 ) -> None:
     """
@@ -259,38 +242,26 @@ async def auto_resume_stale_workflows_periodically(
     This combines lock cleanup with automatic workflow resumption, ensuring
     that workflows interrupted by worker crashes are automatically recovered.
 
-    Uses system-level locking to ensure only one pod executes this task at a time,
-    preventing duplicate workflow execution (CRITICAL for safety).
+    Important: This function should only be run by a single worker (e.g., via leader
+    election). It does not perform its own distributed coordination.
 
     Example:
         >>> asyncio.create_task(
         ...     auto_resume_stale_workflows_periodically(
-        ...         storage, replay_engine, worker_id, interval=60
+        ...         storage, replay_engine, interval=60
         ...     )
         ... )
 
     Args:
         storage: Storage backend
         replay_engine: ReplayEngine instance for resuming workflows
-        worker_id: Unique identifier for this worker (for global lock coordination)
         interval: Cleanup interval in seconds (default: 60)
     """
     with suppress(asyncio.CancelledError):
         while True:
-            # Add jitter to prevent thundering herd in multi-pod deployments
+            # Add jitter to prevent thundering herd
             jitter = random.uniform(0, interval * 0.3)
             await asyncio.sleep(interval + jitter)
-
-            # Try to acquire global lock for this task
-            lock_acquired = await storage.try_acquire_system_lock(
-                lock_name="auto_resume_stale_workflows",
-                worker_id=worker_id,
-                timeout_seconds=interval,
-            )
-
-            if not lock_acquired:
-                # Another pod is handling this task
-                continue
 
             try:
                 # Clean up stale locks and get workflows to resume
@@ -373,12 +344,8 @@ async def auto_resume_stale_workflows_periodically(
                                 e,
                                 exc_info=True,
                             )
-            finally:
-                try:
-                    await storage.release_system_lock("auto_resume_stale_workflows", worker_id)
-                except Exception as e:
-                    # Best-effort cleanup - lock will expire eventually
-                    logger.debug("Failed to release system lock during cleanup: %s", e)
+            except Exception as e:
+                logger.error("Failed to cleanup stale locks: %s", e, exc_info=True)
 
 
 class LockNotAcquiredError(Exception):

@@ -583,7 +583,6 @@ class EddaApp:
                 auto_resume_stale_workflows_periodically(
                     self.storage,
                     self.replay_engine,
-                    self.worker_id,
                     interval=60,
                 ),
                 name="leader_stale_workflow_resume",
@@ -628,7 +627,6 @@ class EddaApp:
                 auto_resume_stale_workflows_periodically(
                     self.storage,
                     self.replay_engine,
-                    self.worker_id,
                     interval=60,
                 ),
                 name="leader_stale_workflow_resume",
@@ -1411,7 +1409,8 @@ class EddaApp:
         from growing indefinitely with orphaned messages (messages that were
         published but never received by any subscriber).
 
-        Uses system-level locking to ensure only one pod executes cleanup at a time.
+        Important: This task should only be run by a single worker (e.g., via leader
+        election). It does not perform its own distributed coordination.
 
         Args:
             interval: Cleanup interval in seconds (default: 3600 = 1 hour)
@@ -1422,27 +1421,13 @@ class EddaApp:
         """
         while True:
             try:
-                # Add jitter to prevent thundering herd in multi-pod deployments
+                # Add jitter to prevent thundering herd
                 jitter = random.uniform(0, interval * 0.3)
                 await asyncio.sleep(interval + jitter)
 
-                # Try to acquire global lock for this task
-                lock_acquired = await self.storage.try_acquire_system_lock(
-                    lock_name="cleanup_old_messages",
-                    worker_id=self.worker_id,
-                    timeout_seconds=interval,
-                )
-
-                if not lock_acquired:
-                    # Another pod is handling this task
-                    continue
-
-                try:
-                    deleted_count = await self.storage.cleanup_old_channel_messages(retention_days)
-                    if deleted_count > 0:
-                        logger.info("Cleaned up %d old channel messages", deleted_count)
-                finally:
-                    await self.storage.release_system_lock("cleanup_old_messages", self.worker_id)
+                deleted_count = await self.storage.cleanup_old_channel_messages(retention_days)
+                if deleted_count > 0:
+                    logger.info("Cleaned up %d old channel messages", deleted_count)
             except Exception as e:
                 logger.error("Error cleaning up old messages: %s", e, exc_info=True)
 
