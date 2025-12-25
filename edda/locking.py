@@ -240,7 +240,11 @@ async def cleanup_stale_locks_periodically(
                 if len(workflows) > 0:
                     logger.info("Cleaned up %d stale locks", len(workflows))
             finally:
-                await storage.release_system_lock("cleanup_stale_locks", worker_id)
+                try:
+                    await storage.release_system_lock("cleanup_stale_locks", worker_id)
+                except Exception as e:
+                    # Best-effort cleanup - lock will expire eventually
+                    logger.debug("Failed to release system lock during cleanup: %s", e)
 
 
 async def auto_resume_stale_workflows_periodically(
@@ -370,7 +374,11 @@ async def auto_resume_stale_workflows_periodically(
                                 exc_info=True,
                             )
             finally:
-                await storage.release_system_lock("auto_resume_stale_workflows", worker_id)
+                try:
+                    await storage.release_system_lock("auto_resume_stale_workflows", worker_id)
+                except Exception as e:
+                    # Best-effort cleanup - lock will expire eventually
+                    logger.debug("Failed to release system lock during cleanup: %s", e)
 
 
 class LockNotAcquiredError(Exception):
