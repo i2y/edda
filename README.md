@@ -32,6 +32,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - ⚡ **Instant Notifications**: PostgreSQL LISTEN/NOTIFY for near-instant event delivery (optional)
 - 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
 - 🧠 **Mirascope Integration**: Durable LLM calls
+- 🦙 **LlamaIndex Integration**: Make LlamaIndex Workflows durable with crash recovery
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
 ## Use Cases
@@ -167,6 +168,9 @@ uv add edda-framework --extra viewer
 
 # With PostgreSQL instant notifications (LISTEN/NOTIFY)
 uv add edda-framework --extra postgres-notify
+
+# With LlamaIndex Workflow integration
+uv add edda-framework --extra llamaindex
 
 # All extras (PostgreSQL, MySQL, Viewer UI)
 uv add edda-framework --extra postgresql --extra mysql --extra viewer
