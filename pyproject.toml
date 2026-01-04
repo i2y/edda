@@ -79,6 +79,9 @@ mirascope = [
 graph = [
     "pydantic-graph>=0.1.0",
 ]
+llamaindex = [
+    "llama-index-core>=0.12.0",
+]
 
 [project.scripts]
 edda-viewer = "viewer_app:main"
