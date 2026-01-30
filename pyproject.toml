@@ -84,7 +84,7 @@ llamaindex = [
 ]
 
 [project.scripts]
-edda-viewer = "viewer_app:main"
+edda-viewer = "edda.viewer_app:main"
 
 [project.urls]
 Homepage = "https://github.com/i2y/edda"
