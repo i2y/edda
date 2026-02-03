@@ -89,7 +89,7 @@ def main() -> None:
     """Main entry point for the Edda Viewer CLI."""
     # Step 1: Check if nicegui is installed
     try:
-        import nicegui  # noqa: F401
+        import nicegui  # type: ignore[import-not-found]  # noqa: F401
     except ImportError:
         print("Error: Viewer dependencies are not installed.", file=sys.stderr)
         print("", file=sys.stderr)
