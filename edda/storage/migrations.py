@@ -182,9 +182,9 @@ async def migration_lock(engine: AsyncEngine, db_type: str) -> AsyncIterator[boo
         yield True
         return
 
-    acquired = False
-    try:
-        async with engine.connect() as conn:
+    async with engine.connect() as conn:
+        acquired = False
+        try:
             if db_type == "postgresql":
                 # Try to acquire advisory lock (non-blocking)
                 result = await conn.execute(
@@ -202,18 +202,17 @@ async def migration_lock(engine: AsyncEngine, db_type: str) -> AsyncIterator[boo
                 logger.debug("Could not acquire migration lock, another worker is migrating")
                 yield False
 
-    finally:
-        if acquired:
-            try:
-                async with engine.connect() as conn:
+        finally:
+            if acquired:
+                try:
                     if db_type == "postgresql":
                         await conn.execute(text(f"SELECT pg_advisory_unlock({MIGRATION_LOCK_KEY})"))
                         await conn.commit()
                     elif db_type == "mysql":
                         await conn.execute(text("SELECT RELEASE_LOCK('edda_migration')"))
                         await conn.commit()
-            except Exception as e:
-                logger.warning(f"Failed to release migration lock: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to release migration lock: {e}")
 
 
 def extract_version_from_filename(filename: str) -> str:
