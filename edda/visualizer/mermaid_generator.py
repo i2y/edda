@@ -8,6 +8,30 @@ extracted by the AST analyzer.
 from typing import Any
 
 
+def escape_mermaid_label(text: str, max_len: int = 60) -> str:
+    """Escape characters that break Mermaid node label syntax.
+
+    Replaces braces (which clash with hexagon `{{...}}` and diamond `{...}`
+    shape syntax), brackets, and quotes. Truncates overly long labels.
+
+    Used by both the base ``MermaidGenerator`` and the hybrid generator in
+    ``edda.viewer_ui.components`` to keep AST-extracted argument expressions
+    (e.g. f-strings like ``f"workflow.continue:{session_id}"``) safe to embed
+    in node labels.
+    """
+    text = (
+        text.replace('"', "'")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace("[", ".")
+        .replace("]", "")
+        .replace("'", "")
+    )
+    if len(text) > max_len:
+        text = text[: max_len - 3] + "..."
+    return text
+
+
 class MermaidGenerator:
     """
     Generator for Mermaid flowchart diagrams.
@@ -96,12 +120,12 @@ class MermaidGenerator:
             elif step_type == "wait_event":
                 # Event waiting
                 node_id = self._next_node_id()
-                event_type = step.get("event_type", "unknown")
+                event_type = escape_mermaid_label(step.get("event_type", "unknown"))
                 timeout = step.get("timeout")
 
                 label = f"wait_event:<br/>{event_type}"
                 if timeout:
-                    label += f"<br/>timeout: {timeout}s"
+                    label += f"<br/>timeout: {escape_mermaid_label(str(timeout))}s"
 
                 self.lines.append(f"    {node_id}{{{{{label}}}}}")
                 self.lines.append(f"    {current_id} --> {node_id}")
