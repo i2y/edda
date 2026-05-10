@@ -3673,11 +3673,10 @@ class SQLAlchemyStorage:
 
             # Delete old messages
             result = await session.execute(
-                delete(ChannelMessage)
-                .where(ChannelMessage.published_at < cutoff_time)
-                .returning(ChannelMessage.id)
+                delete(ChannelMessage).where(ChannelMessage.published_at < cutoff_time)
             )
-            deleted_ids = result.fetchall()
             await self._commit_if_not_in_transaction(session)
 
-            return len(deleted_ids)
+            # MySQL doesn't support DELETE ... RETURNING, so use rowcount.
+            # rowcount is reliable across PostgreSQL/MySQL/SQLite for plain DELETE.
+            return result.rowcount or 0  # type: ignore[attr-defined]
