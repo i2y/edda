@@ -65,11 +65,11 @@ async def fstring_workflow(ctx, session_id: str):
         assert "session_id" in event_type
 
     def test_constant_event_type_extracted_directly(self):
-        source = '''
+        source = """
 @workflow
 async def const_workflow(ctx):
     await wait_event(ctx, event_type="workflow.continue")
-'''
+"""
         workflows = WorkflowAnalyzer().analyze(source)
         wait_steps = [s for s in workflows[0]["steps"] if s.get("type") == "wait_event"]
         assert wait_steps[0]["event_type"] == "workflow.continue"
@@ -181,11 +181,11 @@ class TestEndToEndWaitEventEscape:
     """Source code -> AST analyzer -> Mermaid (no broken syntax)."""
 
     def test_fstring_workflow_source_to_mermaid_is_valid(self):
-        source = '''
+        source = """
 @workflow
 async def fstring_workflow(ctx, session_id: str):
     await wait_event(ctx, event_type=f"workflow.continue:{session_id}")
-'''
+"""
         workflows = WorkflowAnalyzer().analyze(source)
         mermaid = MermaidGenerator().generate(workflows[0])
 
