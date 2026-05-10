@@ -127,7 +127,9 @@ class MermaidGenerator:
                 if timeout:
                     label += f"<br/>timeout: {escape_mermaid_label(str(timeout))}s"
 
-                self.lines.append(f"    {node_id}{{{{{label}}}}}")
+                # Quoted hexagon form (id{{"label"}}): mermaid 11 rejects bare
+                # parens / colons inside unquoted hexagons.
+                self.lines.append(f'    {node_id}{{{{"{label}"}}}}')
                 self.lines.append(f"    {current_id} --> {node_id}")
                 self.lines.append(f"    style {node_id} fill:#fff4e6")
                 current_id = node_id

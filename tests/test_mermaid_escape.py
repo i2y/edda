@@ -127,6 +127,28 @@ class TestMermaidGeneratorWaitEvent:
         assert "wait_event:<br/>payment.completed" in mermaid
         assert "timeout: 30s" in mermaid
 
+    def test_hexagon_uses_quoted_form(self):
+        # Mermaid 11 rejects bare parens / colons in unquoted hexagon labels.
+        # The escape helper introduces parens (from { and }), so the hexagon
+        # MUST be emitted in quoted form id{{"..."}} or rendering breaks.
+        workflow = {
+            "name": "any_workflow",
+            "steps": [
+                {
+                    "type": "wait_event",
+                    "event_type": "f'workflow.continue:{session_id}'",
+                    "timeout": None,
+                }
+            ],
+        }
+        mermaid = MermaidGenerator().generate(workflow)
+        hexagon_lines = [
+            line for line in mermaid.splitlines() if "{{" in line and "wait_event" in line
+        ]
+        assert len(hexagon_lines) == 1
+        assert '{{"' in hexagon_lines[0]
+        assert '"}}' in hexagon_lines[0]
+
 
 class TestHybridMermaidGeneratorWaitEvent:
     """Verify ``HybridMermaidGenerator`` (viewer UI) also escapes."""
