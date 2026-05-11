@@ -7,7 +7,7 @@ from typing import Any
 
 from edda.viewer_ui.theme import get_edge_color, get_mermaid_node_style, get_mermaid_style
 from edda.visualizer.ast_analyzer import WorkflowAnalyzer
-from edda.visualizer.mermaid_generator import MermaidGenerator
+from edda.visualizer.mermaid_generator import MermaidGenerator, escape_mermaid_label
 
 
 def generate_interactive_mermaid(
@@ -350,14 +350,16 @@ class HybridMermaidGenerator(MermaidGenerator):
             elif step_type == "wait_event":
                 # Event waiting
                 node_id = self._next_node_id()
-                event_type = step.get("event_type", "unknown")
+                event_type = escape_mermaid_label(step.get("event_type", "unknown"))
                 timeout = step.get("timeout")
 
                 label = f"wait_event:<br/>{event_type}"
                 if timeout:
-                    label += f"<br/>timeout: {timeout}s"
+                    label += f"<br/>timeout: {escape_mermaid_label(str(timeout))}s"
 
-                self.lines.append(f"    {node_id}{{{{{label}}}}}")
+                # Quoted hexagon form (id{{"label"}}): mermaid 11 rejects bare
+                # parens / colons inside unquoted hexagons.
+                self.lines.append(f'    {node_id}{{{{"{label}"}}}}')
                 self.lines.append(f"    {current_id} --> {node_id}")
                 wait_event_style = get_mermaid_style("waiting_event", self.is_dark)
                 self.lines.append(f"    style {node_id} {wait_event_style}")
@@ -406,21 +408,7 @@ class HybridMermaidGenerator(MermaidGenerator):
         """
         # Condition node (diamond shape)
         cond_id = self._next_node_id()
-        test_expr = condition.get("test", "condition")
-
-        # Sanitize test expression for Mermaid - remove ALL problematic characters
-        # Replace dict/list accessors and special chars
-        test_expr = (
-            test_expr.replace('"', "'")
-            .replace("{", "(")
-            .replace("}", ")")
-            .replace("[", ".")
-            .replace("]", "")
-            .replace("'", "")
-        )
-        # Limit length to avoid overflow
-        if len(test_expr) > 40:
-            test_expr = test_expr[:37] + "..."
+        test_expr = escape_mermaid_label(condition.get("test", "condition"), max_len=40)
 
         # Use diamond shape for condition - correct Mermaid syntax
         self.lines.append(f"    {cond_id}{{{test_expr}?}}")
@@ -777,19 +765,7 @@ class HybridMermaidGenerator(MermaidGenerator):
         """
         # Match node (diamond shape for the subject)
         match_id = self._next_node_id()
-        subject = match.get("subject", "value")
-
-        # Sanitize subject expression for Mermaid
-        subject = (
-            subject.replace('"', "'")
-            .replace("{", "(")
-            .replace("}", ")")
-            .replace("[", ".")
-            .replace("]", "")
-            .replace("'", "")
-        )
-        if len(subject) > 30:
-            subject = subject[:27] + "..."
+        subject = escape_mermaid_label(match.get("subject", "value"), max_len=30)
 
         self.lines.append(f"    {match_id}{{{{match {subject}}}}}")
         self.lines.append(f"    {prev_id} --> {match_id}")
