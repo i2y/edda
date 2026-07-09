@@ -55,8 +55,19 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies (all database drivers and opentelemetry)
-        run: uv sync --extra dev --extra postgresql --extra mysql --extra opentelemetry
+      - name: Install dependencies (all database drivers, opentelemetry and agent)
+        run: uv sync --extra dev --extra postgresql --extra mysql --extra opentelemetry --extra agent
+
+      # edda.agent's second wall needs these. Without them its sandbox-enforcement
+      # tests skip cleanly (see tests/integrations/agent/conftest.py::srt_available),
+      # so this step is a nice-to-have, not a gate. Ubuntu blocks unprivileged user
+      # namespaces by default, which bubblewrap requires.
+      - name: Install sandbox system dependencies (for edda.agent)
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap socat ripgrep
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Run tests (all databases)
         env:

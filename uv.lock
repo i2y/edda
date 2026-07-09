@@ -779,6 +779,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+agent = [
+    { name = "sandbox-runtime" },
+]
 cpu-monitor = [
     { name = "psutil" },
 ]
@@ -863,6 +866,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.2.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.2" },
+    { name = "sandbox-runtime", marker = "extra == 'agent'", specifier = ">=0.2.0,<0.3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
     { name = "starlette", marker = "extra == 'dev'", specifier = ">=0.40.0" },
     { name = "testcontainers", extras = ["mysql"], marker = "extra == 'dev'", specifier = ">=4.0.0" },
@@ -871,7 +875,7 @@ requires-dist = [
     { name = "tsuno", marker = "extra == 'server'", specifier = ">=0.1.3" },
     { name = "uvloop", specifier = ">=0.22.1" },
 ]
-provides-extras = ["dev", "server", "viewer", "postgresql", "postgres-notify", "mysql", "mcp", "opentelemetry", "cpu-monitor", "mirascope", "graph", "llamaindex"]
+provides-extras = ["dev", "server", "viewer", "postgresql", "postgres-notify", "mysql", "mcp", "agent", "opentelemetry", "cpu-monitor", "mirascope", "graph", "llamaindex"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3197,6 +3201,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8d/35/3654a973ebe5b32e1fd4a08ed2d46755af7267da7ac710d97420d7b8657d/ruff-0.14.2-py3-none-win32.whl", hash = "sha256:41775927d287685e08f48d8eb3f765625ab0b7042cc9377e20e64f4eb0056ee9", size = 12415318, upload-time = "2025-10-23T19:36:53.961Z" },
     { url = "https://files.pythonhosted.org/packages/71/30/3758bcf9e0b6a4193a6f51abf84254aba00887dfa8c20aba18aa366c5f57/ruff-0.14.2-py3-none-win_amd64.whl", hash = "sha256:0df3424aa5c3c08b34ed8ce099df1021e3adaca6e90229273496b839e5a7e1af", size = 13565279, upload-time = "2025-10-23T19:36:56.578Z" },
     { url = "https://files.pythonhosted.org/packages/2e/5d/aa883766f8ef9ffbe6aa24f7192fb71632f31a30e77eb39aa2b0dc4290ac/ruff-0.14.2-py3-none-win_arm64.whl", hash = "sha256:ea9d635e83ba21569fbacda7e78afbfeb94911c9434aff06192d9bc23fd5495a", size = 12554956, upload-time = "2025-10-23T19:36:58.714Z" },
+]
+
+[[package]]
+name = "sandbox-runtime"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "click" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/36/3aacccf31602eebb731059f256c5369ec9e10bd2fceabedf6f85672416f1/sandbox_runtime-0.2.0.tar.gz", hash = "sha256:bc205f8d93790b304e14f0a0e5ee229f6504186d1cdf2a90be01e8bb1bb07ef3", size = 671708, upload-time = "2025-12-31T21:19:56.433Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/d6/8fcfa949c7d53013bae642757b824e7b75dbbc552e4a9fa5981001c68d29/sandbox_runtime-0.2.0-py3-none-any.whl", hash = "sha256:8fae29ed936caeb4294007bf5dee6ec0fca4aaaf35b2a4af34fa6e496d247372", size = 66413, upload-time = "2025-12-31T21:19:54.907Z" },
 ]
 
 [[package]]

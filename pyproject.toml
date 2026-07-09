@@ -64,6 +64,12 @@ mysql = [
 mcp = [
     "mcp>=1.22.0",
 ]
+agent = [
+    # Unofficial Python mirror (thoo/sandbox-runtime-py) of Anthropic's research-preview
+    # anthropic-experimental/sandbox-runtime. The upper cap is deliberate: 0.x minors of a
+    # research preview may change the config schema that edda.agent hands to its runner.
+    "sandbox-runtime>=0.2.0,<0.3",
+]
 opentelemetry = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
@@ -227,6 +233,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "pydantic_graph.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sandbox_runtime.*"
 ignore_missing_imports = true
 
 [dependency-groups]
