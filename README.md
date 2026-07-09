@@ -34,6 +34,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - 🧠 **Mirascope Integration**: Durable LLM calls
 - 🦙 **LlamaIndex Integration**: Make LlamaIndex Workflows durable with crash recovery
 - 📊 **pydantic-graph Integration**: Durable graph-based workflows (experimental)
+- 🛡️ **Sandboxed Agents**: Run external agent CLIs / MCP servers as isolated, durable activities with OS-level sandboxing (experimental)
 - 🌍 **ASGI/WSGI Support**: Deploy with your preferred server (uvicorn, gunicorn, uWSGI)
 
 ## Use Cases
@@ -175,6 +176,9 @@ uv add edda-framework --extra llamaindex
 
 # With pydantic-graph integration (experimental)
 uv add edda-framework --extra graph
+
+# With Agent process-isolation layer (experimental)
+uv add edda-framework --extra agent
 
 # All extras (PostgreSQL, MySQL, Viewer UI)
 uv add edda-framework --extra postgresql --extra mysql --extra viewer
