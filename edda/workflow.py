@@ -156,6 +156,49 @@ class Workflow:
         )
         return instance_id
 
+    async def start_detached(self, lock_timeout_seconds: int | None = None, **kwargs: Any) -> str:
+        """
+        Start a new workflow instance without waiting for its body to run.
+
+        Like start(), but returns the instance ID immediately and runs the
+        workflow on a background task instead of inline. Use this for
+        long-running workflows, or interactive/REPL callers, where you want the
+        instance ID right away and will fetch the result later via the storage
+        API (e.g. app.storage.get_instance(instance_id)).
+
+        Note: start() runs the workflow body inline until it first suspends
+        (wait_event/sleep/channel) or completes, so a workflow with no
+        suspension point blocks the caller until it is done. start_detached()
+        avoids that.
+
+        Args:
+            lock_timeout_seconds: Override lock timeout for this specific execution
+                                (None = use decorator default or global default 300s)
+            **kwargs: Input parameters for the workflow (can include Pydantic models)
+
+        Returns:
+            Instance ID of the started workflow
+
+        Raises:
+            RuntimeError: If replay engine not initialized
+        """
+        if _replay_engine is None:
+            raise RuntimeError(
+                "Replay engine not initialized. "
+                "Ensure EddaApp is properly initialized before starting workflows."
+            )
+
+        processed_kwargs = {k: to_json_dict(v) for k, v in kwargs.items()}
+        actual_timeout = lock_timeout_seconds or self.lock_timeout_seconds
+
+        instance_id: str = await _replay_engine.start_workflow_detached(
+            workflow_name=self.name,
+            workflow_func=self.func,
+            input_data=processed_kwargs,
+            lock_timeout_seconds=actual_timeout,
+        )
+        return instance_id
+
     async def resume(self, instance_id: str, event: Any = None) -> None:
         """
         Resume an existing workflow instance.

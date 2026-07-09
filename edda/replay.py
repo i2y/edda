@@ -6,6 +6,7 @@ allowing workflows to resume from where they left off by replaying their
 execution history.
 """
 
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -61,6 +62,9 @@ class ReplayEngine:
         self.worker_id = worker_id
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
+        # Strong references to in-flight detached workflow tasks (start_workflow_detached),
+        # so the event loop does not garbage-collect them before they finish.
+        self._detached_tasks: set[asyncio.Task[Any]] = set()
 
     def _prepare_workflow_input(
         self,
@@ -145,27 +149,35 @@ class ReplayEngine:
 
         return processed_input
 
-    async def start_workflow(
+    async def _create_new_instance(
         self,
         workflow_name: str,
         workflow_func: Callable[..., Any],
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
+        instance_id: str | None = None,
     ) -> str:
-        """
-        Start a new workflow instance.
+        """Create the durable storage row for a new workflow instance.
+
+        This is the front half of start_workflow: it makes the instance durable
+        (status 'running', unlocked) and returns its ID, but does not execute the
+        body. start_workflow runs the body inline immediately after;
+        start_workflow_detached runs it on a background task, so the row already
+        exists by the time the ID is handed back to the caller.
 
         Args:
             workflow_name: Name of the workflow
-            workflow_func: The workflow function to execute
+            workflow_func: The workflow function (used only for source extraction)
             input_data: Input parameters for the workflow
             lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
+            instance_id: Pre-generated instance ID, or None to generate one.
 
         Returns:
-            Instance ID of the started workflow
+            Instance ID of the created workflow.
         """
-        # Generate instance ID
-        instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
+        # Generate instance ID (unless the caller pre-generated one, e.g. detached start)
+        if instance_id is None:
+            instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
 
         # Extract source code for visualization
         try:
@@ -197,6 +209,46 @@ class ReplayEngine:
             input_data=input_data,
             lock_timeout_seconds=lock_timeout_seconds,
         )
+
+        return instance_id
+
+    async def start_workflow(
+        self,
+        workflow_name: str,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+        lock_timeout_seconds: int | None = None,
+        instance_id: str | None = None,
+        _already_created: bool = False,
+    ) -> str:
+        """
+        Start a new workflow instance.
+
+        Args:
+            workflow_name: Name of the workflow
+            workflow_func: The workflow function to execute
+            input_data: Input parameters for the workflow
+            lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
+            instance_id: Pre-generated instance ID. Internal; used by
+                start_workflow_detached() so the ID is known before execution.
+                None means generate one.
+            _already_created: Internal. When True the instance row already exists
+                (created by start_workflow_detached) so creation is skipped and
+                only the body is executed. Requires instance_id to be set.
+
+        Returns:
+            Instance ID of the started workflow
+        """
+        # Create the durable instance row (unless a detached start already did it).
+        if not _already_created:
+            instance_id = await self._create_new_instance(
+                workflow_name=workflow_name,
+                workflow_func=workflow_func,
+                input_data=input_data,
+                lock_timeout_seconds=lock_timeout_seconds,
+                instance_id=instance_id,
+            )
+        assert instance_id is not None  # set by _create_new_instance or the caller
 
         # Execute the workflow with distributed lock
         async with workflow_lock(self.storage, instance_id, self.worker_id):
@@ -389,6 +441,80 @@ class ReplayEngine:
                     await self.hooks.on_workflow_failed(instance_id, workflow_name, error)
 
                 raise
+
+    async def start_workflow_detached(
+        self,
+        workflow_name: str,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+        lock_timeout_seconds: int | None = None,
+    ) -> str:
+        """
+        Start a workflow without waiting for its body to run.
+
+        Unlike start_workflow(), this returns the instance ID immediately and
+        runs the workflow on a background task. It never blocks the caller for
+        the duration of the workflow body, so it is the right entry point for
+        interactive/REPL callers and any long-running workflow whose result is
+        retrieved later via get_instance().
+
+        The instance row is created synchronously up front (so the ID is
+        immediately queryable via get_instance), then the body runs on a
+        background task through start_workflow(), reusing the exact same path
+        (lock acquisition, suspension handling, compensation) with no duplicated
+        logic.
+
+        Args:
+            workflow_name: Name of the workflow
+            workflow_func: The workflow function to execute
+            input_data: Input parameters for the workflow
+            lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
+
+        Returns:
+            Instance ID of the started workflow
+        """
+        # Create the durable row synchronously so the instance is queryable the
+        # moment we return the ID...
+        instance_id = await self._create_new_instance(
+            workflow_name=workflow_name,
+            workflow_func=workflow_func,
+            input_data=input_data,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
+
+        # ...then run the body on a background task, skipping re-creation.
+        task = asyncio.create_task(
+            self.start_workflow(
+                workflow_name=workflow_name,
+                workflow_func=workflow_func,
+                input_data=input_data,
+                lock_timeout_seconds=lock_timeout_seconds,
+                instance_id=instance_id,
+                _already_created=True,
+            )
+        )
+        self._detached_tasks.add(task)
+        task.add_done_callback(self._on_detached_done)
+
+        return instance_id
+
+    def _on_detached_done(self, task: asyncio.Task[Any]) -> None:
+        """Drop a finished detached task and surface a failure that would otherwise be silent.
+
+        The workflow instance is already marked 'failed' in storage by
+        start_workflow(); this only makes the background error visible in logs
+        instead of asyncio's "Task exception was never retrieved" warning.
+        """
+        self._detached_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Detached workflow task ended with an unobserved error: %s",
+                error,
+                exc_info=error,
+            )
 
     async def resume_workflow(
         self,

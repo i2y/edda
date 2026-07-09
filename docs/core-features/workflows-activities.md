@@ -36,6 +36,26 @@ instance_id = await my_workflow.start(param1="hello", param2=42)
 instance_id = await my_workflow.start(data=MyInput(...))
 ```
 
+`start()` runs the workflow body inline until it first suspends (on `wait_event` /
+`sleep` / a channel receive) or completes, then returns the instance ID. A workflow
+with no suspension point therefore blocks the caller until it finishes.
+
+Use `start_detached()` when you want the instance ID back immediately and the body
+run on a background task instead — for long-running workflows, or an interactive/REPL
+caller that must not block:
+
+```python
+# Returns as soon as the instance is created; the body runs in the background
+instance_id = await my_workflow.start_detached(param1="hello")
+
+# Fetch the outcome later
+instance = await app.storage.get_instance(instance_id)
+print(instance["status"])       # "running" | "completed" | "failed" | ...
+```
+
+Both take the same arguments and record the same history; they differ only in
+whether they wait for the body to run.
+
 ### CloudEvents Auto-Registration (Opt-in)
 
 By default, workflows are NOT automatically registered as CloudEvents handlers (security).
