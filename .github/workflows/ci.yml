@@ -10,8 +10,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    env:
+      # .python-version pins 3.12, which uv prefers over whatever `uv python install`
+      # added. UV_PYTHON makes every uv command in this job use the matrix version.
+      UV_PYTHON: ${{ matrix.python-version }}
 
     services:
       postgres:
@@ -57,6 +63,9 @@ jobs:
 
       - name: Install dependencies (all database drivers and opentelemetry)
         run: uv sync --extra dev --extra postgresql --extra mysql --extra opentelemetry
+
+      - name: Check Python version
+        run: uv run python -c "import sys; assert sys.version.startswith('${{ matrix.python-version }}.'), sys.version"
 
       - name: Run tests (all databases)
         env:
