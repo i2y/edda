@@ -5,6 +5,7 @@ NiceGUI application for interactive workflow instance visualization.
 import asyncio
 import contextlib
 import json
+import os
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +17,11 @@ from edda import EddaApp
 from edda.viewer_ui.components import generate_hybrid_mermaid, generate_interactive_mermaid
 from edda.viewer_ui.data_service import WorkflowDataService
 from edda.viewer_ui.theme import TAILWIND_CLASSES, get_status_badge_classes
+
+
+def _edda_app_url() -> str:
+    """Base URL of the EddaApp that the Viewer starts and cancels workflows on."""
+    return os.getenv("EDDA_APP_URL", "http://localhost:8001")
 
 
 def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> None:
@@ -1245,10 +1251,7 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
                                     # → {model_name: {field1: value1, field2: value2, ...}}
                                     params = {pydantic_model_name: params}
 
-                                # Get EddaApp URL from environment or use default
-                                import os
-
-                                edda_app_url = os.getenv("EDDA_APP_URL", "http://localhost:8001")
+                                edda_app_url = _edda_app_url()
 
                                 ui.notify(
                                     f"Starting workflow '{selected_workflow}'...", type="info"
@@ -1655,8 +1658,9 @@ def start_viewer(edda_app: EddaApp, port: int = 8080, reload: bool = False) -> N
 
                         if result:
                             # Call cancel API
-                            edda_url = "http://localhost:8001"
-                            success, message = await service.cancel_workflow(instance_id, edda_url)
+                            success, message = await service.cancel_workflow(
+                                instance_id, _edda_app_url()
+                            )
 
                             if success:
                                 ui.notify(message, type="positive")
