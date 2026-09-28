@@ -280,11 +280,15 @@ class EddaMCPServer:
             # Forward to EddaApp
             await self._edda_app(scope, request.receive, send)
 
-            # Return response
+            # Return response (ASGI headers are latin-1 bytes; Response wants str)
+            headers = {
+                key.decode("latin-1"): value.decode("latin-1")
+                for key, value in response_data["headers"]
+            }
             return Response(
                 content=response_data["body"],
                 status_code=response_data["status"],
-                headers=cast(dict[str, str], dict(response_data["headers"])),
+                headers=headers,
             )
 
         # Add cancel route

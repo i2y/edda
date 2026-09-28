@@ -1,6 +1,8 @@
 """Tests for MCP cancel tool functionality."""
 
 import asyncio
+import json
+from typing import Any
 
 import pytest
 
@@ -164,3 +166,69 @@ async def test_replay_engine_property(mcp_server_with_cancellable_tool):
 
     # Should be the same instance as EddaApp's replay_engine
     assert server.replay_engine is server._edda_app.replay_engine
+
+
+async def post_to_asgi(app: Any, path: str) -> tuple[int, dict[str, str], bytes]:
+    """Send a bodyless POST straight to an ASGI app and collect the response."""
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    await app(scope, receive, send)
+
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    headers = {key.decode(): value.decode() for key, value in start["headers"]}
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], headers, body
+
+
+@pytest.mark.asyncio
+async def test_cancel_route_via_asgi_app(tmp_path):
+    """Test that POST /cancel/{instance_id} on asgi_app() cancels the workflow."""
+    # File DB: with :memory:, EddaApp's background tasks share the handler's connection
+    server = EddaMCPServer(
+        name="Cancel Route Test Service",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'edda.db'}",
+    )
+
+    @server.durable_tool(description="Wait for approval")
+    async def wait_for_approval(ctx: WorkflowContext, order_id: str):
+        await wait_event(ctx, "order.approved")
+        return {"order_id": order_id}
+
+    await server.initialize()
+    try:
+        app = server.asgi_app()
+        instance_id = await server._workflows["wait_for_approval"].start(order_id="A1")
+
+        status, headers, body = await post_to_asgi(app, f"/cancel/{instance_id}")
+        assert status == 200
+        assert headers["content-type"] == "application/json"
+        assert json.loads(body) == {"status": "cancelled", "instance_id": instance_id}
+
+        instance = await server.storage.get_instance(instance_id)
+        assert instance["status"] == "cancelled"
+
+        # Unknown instances get EddaApp's 400, not a 500 from the wrapper
+        status, _, _ = await post_to_asgi(app, "/cancel/nonexistent-id")
+        assert status == 400
+    finally:
+        await server.shutdown()
