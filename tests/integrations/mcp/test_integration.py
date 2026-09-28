@@ -1,6 +1,7 @@
 """E2E integration tests for MCP server."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -181,3 +182,45 @@ async def test_pydantic_model_integration(mcp_server_with_tool):
     # Verify workflow started
     instance = await server.storage.get_instance(instance_id)
     assert instance["workflow_name"] == "process_order"
+
+
+@pytest.mark.asyncio
+async def test_tools_via_mcp_client(tmp_path):
+    """Test that durable tools can be listed and called through an MCP client."""
+    from mcp import Client
+
+    # File DB: with :memory:, EddaApp's background tasks share the tools' connection
+    server = EddaMCPServer(
+        name="MCP Client Test Service",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'edda.db'}",
+    )
+
+    @activity
+    async def shout(ctx: WorkflowContext, value: str):
+        return {"processed": value.upper()}
+
+    @server.durable_tool(description="Shout the input value")
+    async def shout_value(ctx: WorkflowContext, value: str):
+        return await shout(ctx, value)
+
+    await server.initialize()
+    try:
+        async with Client(server._mcp) as client:
+            tools = await client.list_tools()
+            assert {tool.name for tool in tools.tools} == {
+                "shout_value",
+                "shout_value_status",
+                "shout_value_result",
+                "shout_value_cancel",
+            }
+
+            started = await client.call_tool("shout_value", {"value": "hello"})
+            assert not started.is_error
+            match = re.search(r"Instance ID: ([\w-]+)", started.content[0].text)
+            assert match is not None
+
+            result = await client.call_tool("shout_value_result", {"instance_id": match.group(1)})
+            assert not result.is_error
+            assert "HELLO" in result.content[0].text
+    finally:
+        await server.shutdown()

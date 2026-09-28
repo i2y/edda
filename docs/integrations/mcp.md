@@ -185,7 +185,7 @@ Use the `@server.prompt()` decorator to define prompts that can access workflow 
 
 ```python
 from edda.integrations.mcp import EddaMCPServer
-from mcp.server.fastmcp.prompts.base import UserMessage
+from mcp.server.mcpserver.prompts.base import UserMessage
 from mcp.types import TextContent
 
 server = EddaMCPServer(
@@ -318,9 +318,9 @@ Edda's MCP integration follows the [MCP Tools specification](https://modelcontex
          ▼
 ┌─────────────────┐
 │  EddaMCPServer  │
-│   ┌─────────┐   │
-│   │ FastMCP │   │  ← Official MCP SDK
-│   └─────────┘   │
+│  ┌───────────┐  │
+│  │ MCPServer │  │  ← Official MCP SDK
+│  └───────────┘  │
 │   ┌─────────┐   │
 │   │ EddaApp │   │  ← Durable Execution
 │   └─────────┘   │

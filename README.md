@@ -864,7 +864,7 @@ This enables AI assistants to work with workflows that take minutes, hours, or e
 Define reusable prompt templates that can access workflow state:
 
 ```python
-from mcp.server.fastmcp.prompts.base import UserMessage
+from mcp.server.mcpserver.prompts.base import UserMessage
 from mcp.types import TextContent
 
 @server.prompt(description="Analyze a workflow execution")

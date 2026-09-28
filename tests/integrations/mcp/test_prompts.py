@@ -5,7 +5,7 @@ import pytest
 # Skip all tests if mcp is not installed
 pytest.importorskip("mcp")
 
-from mcp.server.fastmcp.prompts.base import UserMessage  # type: ignore[import-not-found]
+from mcp.server.mcpserver.prompts.base import UserMessage  # type: ignore[import-not-found]
 from mcp.types import TextContent  # type: ignore[import-not-found]
 
 from edda import WorkflowContext, activity
@@ -35,8 +35,8 @@ async def test_prompt_registration(mcp_server):
         """Test prompt function."""
         return UserMessage(content=TextContent(type="text", text=f"Test: {arg}"))
 
-    # Prompt should be registered with FastMCP
-    # We can't easily inspect FastMCP's internal registry, but we can call the function
+    # Prompt should be registered with MCPServer
+    # We can't easily inspect MCPServer's internal registry, but we can call the function
     result = await test_prompt("value")
     assert isinstance(result, UserMessage)
     assert result.role == "user"
@@ -147,7 +147,7 @@ async def test_sync_prompt(mcp_server):
         """Synchronous prompt function."""
         return UserMessage(content=TextContent(type="text", text=f"Sync: {value}"))
 
-    # FastMCP handles both sync and async
+    # MCPServer handles both sync and async
     result = sync_prompt("test")
     assert isinstance(result, UserMessage)
     assert "Sync: test" in result.content.text

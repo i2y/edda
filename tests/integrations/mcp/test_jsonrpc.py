@@ -39,7 +39,7 @@ async def mcp_server():
 @pytest.mark.asyncio
 async def test_tool_list_contains_generated_tools(mcp_server):
     """Test that MCP server registers 3 tools for each durable_tool."""
-    # The FastMCP instance should have registered 3 tools:
+    # The MCPServer instance should have registered 3 tools:
     # 1. greet_workflow (main tool)
     # 2. greet_workflow_status
     # 3. greet_workflow_result
@@ -47,7 +47,7 @@ async def test_tool_list_contains_generated_tools(mcp_server):
     # Verify workflow is registered in Edda
     assert "greet_workflow" in mcp_server._workflows
 
-    # Note: We can't directly inspect FastMCP's tool registry,
+    # Note: We can't directly inspect MCPServer's tool registry,
     # but we've verified the decorator registers them with @server._mcp.tool()
 
 

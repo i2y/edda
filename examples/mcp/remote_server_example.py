@@ -107,7 +107,7 @@ if __name__ == "__main__":
     sys.stderr.write("\n")
     sys.stderr.write("To connect from MCP clients (e.g., Claude Desktop), use:\n")
     sys.stderr.write('  "command": "npx",\n')
-    sys.stderr.write('  "args": ["mcp-remote", "http://localhost:8000",\n')
+    sys.stderr.write('  "args": ["mcp-remote", "http://localhost:8000/mcp",\n')
     sys.stderr.write('           "--header", "Authorization: Bearer ' + auth_token + '"]\n')
     sys.stderr.write("\n")
     sys.stderr.write("Press Ctrl+C to stop\n")
