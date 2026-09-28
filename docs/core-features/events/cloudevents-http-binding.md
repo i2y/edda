@@ -150,7 +150,7 @@ All error responses include structured information to help clients decide whethe
 Example retry implementation:
 
 ```python
-import httpx
+import httpx2
 import asyncio
 
 async def send_cloudevent_with_retry(event_data: dict, max_retries: int = 3):
@@ -158,7 +158,7 @@ async def send_cloudevent_with_retry(event_data: dict, max_retries: int = 3):
 
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(
                     "http://localhost:8001/",
                     json=event_data,
@@ -187,7 +187,7 @@ async def send_cloudevent_with_retry(event_data: dict, max_retries: int = 3):
                     else:
                         raise Exception(f"Max retries exceeded: {error['error']}")
 
-        except httpx.ConnectError:
+        except httpx2.ConnectError:
             # Connection error - Retry
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
@@ -245,7 +245,7 @@ Using the official CloudEvents Python SDK:
 
 ```python
 from cloudevents.http import CloudEvent, to_structured
-import httpx
+import httpx2
 
 async def send_event():
     """Send CloudEvent using official SDK."""
@@ -263,7 +263,7 @@ async def send_event():
     headers, body = to_structured(event)
 
     # Send to Edda
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         response = await client.post(
             "http://localhost:8001/",
             headers=headers,

@@ -12,7 +12,7 @@ import random
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 from cloudevents.conversion import to_structured
 from cloudevents.http import CloudEvent
 
@@ -75,7 +75,7 @@ class OutboxRelayer:
 
         self._task: asyncio.Task[Any] | None = None
         self._running = False
-        self._http_client: httpx.AsyncClient | None = None
+        self._http_client: httpx2.AsyncClient | None = None
 
     async def start(self) -> None:
         """
@@ -88,7 +88,7 @@ class OutboxRelayer:
             return
 
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=30.0)
+        self._http_client = httpx2.AsyncClient(timeout=30.0)
 
         # Start background task
         self._task = asyncio.create_task(self._poll_loop())
@@ -281,7 +281,7 @@ class OutboxRelayer:
             await self.storage.mark_outbox_published(event_id)
             logger.info(f"Successfully published event {event_id}")
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             # HTTP error with status code - distinguish 4xx (client) vs 5xx (server)
             status_code = e.response.status_code
             error_msg = f"HTTP {status_code}: {str(e)}"
@@ -301,7 +301,7 @@ class OutboxRelayer:
                 )
                 await self.storage.mark_outbox_failed(event_id, error_msg)
 
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             # Network error (connection timeout, DNS failure, etc.) - retry
             error_msg = f"Network error: {str(e)}"
             logger.warning(

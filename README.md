@@ -357,7 +357,8 @@ from edda import activity, WorkflowContext
 async def call_external_api(ctx: WorkflowContext, url: str):
     # Automatically retries up to 5 times with exponential backoff
     # Delays: 1s, 2s, 4s, 8s, 16s
-    response = await httpx.get(url, timeout=10)
+    async with httpx2.AsyncClient() as client:
+        response = await client.get(url, timeout=10)
     return response.json()
 ```
 

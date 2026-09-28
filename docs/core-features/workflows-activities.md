@@ -140,7 +140,8 @@ def create_user_record(ctx: WorkflowContext, user_id: str, email: str) -> dict:
 @activity
 async def async_activity(ctx: WorkflowContext, data: str) -> dict:
     """Async activity - recommended for I/O operations"""
-    result = await httpx.get(f"https://api.example.com/{data}")
+    async with httpx2.AsyncClient() as client:
+        result = await client.get(f"https://api.example.com/{data}")
     return result.json()
 
 @workflow
@@ -976,7 +977,8 @@ async def order_workflow(ctx: WorkflowContext, order_id: str, amount: float):
 @activity
 async def fetch_user_data(ctx: WorkflowContext, user_id: str) -> dict:
     # Async I/O operations (recommended)
-    result = await httpx.get(f"https://api.example.com/users/{user_id}")
+    async with httpx2.AsyncClient() as client:
+        result = await client.get(f"https://api.example.com/users/{user_id}")
     return result.json()
 ```
 

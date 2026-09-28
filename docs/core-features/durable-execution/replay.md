@@ -249,7 +249,7 @@ async def generate_id(ctx: WorkflowContext) -> str:
 ```python
 @activity
 async def call_external_api(ctx: WorkflowContext) -> dict:
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         response = await client.get("https://api.example.com/data")
         return response.json()
 

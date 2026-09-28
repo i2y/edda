@@ -333,13 +333,13 @@ class WorkflowDataService:
         Returns:
             Tuple of (success: bool, message: str)
         """
-        import httpx
+        import httpx2
 
         try:
             logger.debug("Attempting to cancel workflow: %s", instance_id)
             logger.debug("API URL: %s/cancel/%s", edda_app_url, instance_id)
 
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(
                     f"{edda_app_url}/cancel/{instance_id}",
                     timeout=10.0,
@@ -358,12 +358,12 @@ class WorkflowDataService:
                 else:
                     return False, f"Server error: HTTP {response.status_code}"
 
-        except httpx.ConnectError as e:
+        except httpx2.ConnectError as e:
             error_msg = f"Cannot connect to EddaApp at {edda_app_url}. Is it running?"
             logger.warning("Connection error: %s", e)
             return False, error_msg
 
-        except httpx.TimeoutException as e:
+        except httpx2.TimeoutException as e:
             error_msg = "Request timed out. The server may be busy."
             logger.warning("Timeout error: %s", e)
             return False, error_msg
@@ -855,7 +855,7 @@ class WorkflowDataService:
         """
         import uuid
 
-        import httpx
+        import httpx2
         from cloudevents.conversion import to_structured
         from cloudevents.http import CloudEvent
 
@@ -884,7 +884,7 @@ class WorkflowDataService:
             logger.debug("CloudEvent type: %s", workflow_name)
 
             # Send CloudEvent to EddaApp
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(
                     edda_app_url,
                     headers=headers,
@@ -904,12 +904,12 @@ class WorkflowDataService:
                 else:
                     return False, f"Server error: HTTP {response.status_code}", None
 
-        except httpx.ConnectError as e:
+        except httpx2.ConnectError as e:
             error_msg = f"Cannot connect to EddaApp at {edda_app_url}. Is it running?"
             logger.warning("Connection error: %s", e)
             return False, error_msg, None
 
-        except httpx.TimeoutException as e:
+        except httpx2.TimeoutException as e:
             error_msg = "Request timed out. The server may be busy."
             logger.warning("Timeout error: %s", e)
             return False, error_msg, None

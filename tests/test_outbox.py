@@ -377,7 +377,7 @@ class TestOutboxRelayer:
         self, sqlite_storage, outbox_relayer, create_test_instance
     ):
         """Test that 4xx HTTP errors mark event as invalid (permanent failure)."""
-        import httpx
+        import httpx2
 
         # Add event to outbox
         event_id = str(uuid.uuid4())
@@ -394,7 +394,7 @@ class TestOutboxRelayer:
             mock_response = MagicMock()
             mock_response.status_code = 400
             mock_response.raise_for_status = MagicMock(
-                side_effect=httpx.HTTPStatusError(
+                side_effect=httpx2.HTTPStatusError(
                     "400 Bad Request",
                     request=MagicMock(),
                     response=mock_response,
@@ -425,7 +425,7 @@ class TestOutboxRelayer:
         self, sqlite_storage, outbox_relayer, create_test_instance
     ):
         """Test that 5xx HTTP errors mark event as failed (retry)."""
-        import httpx
+        import httpx2
 
         # Add event to outbox
         event_id = str(uuid.uuid4())
@@ -442,7 +442,7 @@ class TestOutboxRelayer:
             mock_response = MagicMock()
             mock_response.status_code = 503
             mock_response.raise_for_status = MagicMock(
-                side_effect=httpx.HTTPStatusError(
+                side_effect=httpx2.HTTPStatusError(
                     "503 Service Unavailable",
                     request=MagicMock(),
                     response=mock_response,
@@ -478,7 +478,7 @@ class TestOutboxRelayer:
         self, sqlite_storage, outbox_relayer, create_test_instance
     ):
         """Test that network errors (RequestError) mark event as failed (retry)."""
-        import httpx
+        import httpx2
 
         # Add event to outbox
         event_id = str(uuid.uuid4())
@@ -492,7 +492,7 @@ class TestOutboxRelayer:
 
         # Mock HTTP client to raise RequestError (network error)
         with patch.object(outbox_relayer, "_http_client", create=True) as mock_client:
-            mock_client.post = AsyncMock(side_effect=httpx.RequestError("Connection timeout"))
+            mock_client.post = AsyncMock(side_effect=httpx2.RequestError("Connection timeout"))
 
             # Try to publish (should fail with network error)
             await outbox_relayer._poll_and_publish()

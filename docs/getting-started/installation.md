@@ -50,7 +50,7 @@ uv add edda-framework --extra postgresql --extra mysql --extra viewer
 - **Base**: SQLite support via `aiosqlite` (always included)
 - **postgresql**: `asyncpg` driver for PostgreSQL
 - **mysql**: `aiomysql` driver for MySQL
-- **viewer**: `nicegui` and `httpx` for workflow visualization UI
+- **viewer**: `nicegui` for workflow visualization UI
 - **postgres-notify**: `asyncpg` driver for PostgreSQL LISTEN/NOTIFY instant notifications
 
 ### Using pip
