@@ -7,6 +7,7 @@ due to worker crashes, ensuring robustness in distributed deployments.
 
 import asyncio
 import contextlib
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,23 @@ async def set_lock_expired(storage, instance_id: str) -> None:
             .where(WorkflowInstance.instance_id == instance_id)
             .values(lock_expires_at=datetime.now(UTC) - timedelta(seconds=1))
         )
+
+
+async def run_periodic_until(periodic: Coroutine[Any, Any, None], done: asyncio.Event) -> None:
+    """Run a periodic task until `done` is set, then cancel it.
+
+    Set `done` after the iteration's last DB call so the cancel lands in the task's
+    sleep. Cancelling mid-query makes SQLAlchemy discard the connection, and with
+    StaticPool + :memory: the replacement connection opens an empty database.
+    """
+    task = asyncio.create_task(periodic)
+    try:
+        async with asyncio.timeout(5):
+            await done.wait()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 # Test workflows and activities (prefixed with 'recovery_' to avoid pytest confusion)
@@ -174,7 +192,7 @@ class TestStaleWorkflowRecovery:
     """Tests for automatic workflow recovery."""
 
     async def test_periodic_cleanup_without_replay_engine(
-        self, sqlite_storage, create_test_instance
+        self, sqlite_storage, create_test_instance, monkeypatch
     ):
         """
         Test that cleanup without replay_engine only cleans locks.
@@ -207,21 +225,24 @@ class TestStaleWorkflowRecovery:
         # Make lock stale
         await set_lock_expired(sqlite_storage, "stale-1")
 
-        # Create a task that runs cleanup once and then exits
-        cleanup_task = asyncio.create_task(
+        # Signal once cleanup has run
+        cleaned = asyncio.Event()
+        cleanup_stale_locks = sqlite_storage.cleanup_stale_locks
+
+        async def cleanup_and_signal() -> list[dict[str, str]]:
+            workflows = await cleanup_stale_locks()
+            cleaned.set()
+            return workflows
+
+        monkeypatch.setattr(sqlite_storage, "cleanup_stale_locks", cleanup_and_signal)
+
+        await run_periodic_until(
             cleanup_stale_locks_periodically(
                 storage=sqlite_storage,
                 interval=0.1,  # Fast interval for testing
-            )
+            ),
+            cleaned,
         )
-
-        # Wait for cleanup to run
-        await asyncio.sleep(0.2)
-
-        # Cancel the task
-        cleanup_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await cleanup_task
 
         # Verify lock was cleaned
         instance = await sqlite_storage.get_instance("stale-1")
@@ -262,26 +283,19 @@ class TestStaleWorkflowRecovery:
         # Make lock stale
         await set_lock_expired(sqlite_storage, "stale-2")
 
-        # Create mock replay engine
+        # Create mock replay engine that signals once it is called
+        resumed = asyncio.Event()
         mock_replay_engine = MagicMock()
-        mock_replay_engine.resume_by_name = AsyncMock()
+        mock_replay_engine.resume_by_name = AsyncMock(side_effect=lambda *_: resumed.set())
 
-        # Create a task that runs cleanup once and then exits
-        cleanup_task = asyncio.create_task(
+        await run_periodic_until(
             auto_resume_stale_workflows_periodically(
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
                 interval=0.1,
-            )
+            ),
+            resumed,
         )
-
-        # Wait for cleanup to run
-        await asyncio.sleep(0.2)
-
-        # Cancel the task
-        cleanup_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await cleanup_task
 
         # Verify lock was cleaned
         instance = await sqlite_storage.get_instance("stale-2")
@@ -331,30 +345,25 @@ class TestStaleWorkflowRecovery:
         # Create mock replay engine that fails on the second workflow
         mock_replay_engine = MagicMock()
         resume_calls: list[tuple[str, str]] = []
+        all_attempted = asyncio.Event()
 
         async def mock_resume(instance_id: str, workflow_name: str) -> Any:
             resume_calls.append((instance_id, workflow_name))
+            if len(resume_calls) == 3:
+                all_attempted.set()
             if instance_id == "stale-1":
                 raise Exception("Simulated resume failure")
 
         mock_replay_engine.resume_by_name = AsyncMock(side_effect=mock_resume)
 
-        # Create a task that runs cleanup once and then exits
-        cleanup_task = asyncio.create_task(
+        await run_periodic_until(
             auto_resume_stale_workflows_periodically(
                 storage=sqlite_storage,
                 replay_engine=mock_replay_engine,
                 interval=0.1,
-            )
+            ),
+            all_attempted,
         )
-
-        # Wait for cleanup to run
-        await asyncio.sleep(0.2)
-
-        # Cancel the task
-        cleanup_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await cleanup_task
 
         # Verify all locks were cleaned
         for i in range(3):
