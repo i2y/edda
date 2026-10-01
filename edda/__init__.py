@@ -20,6 +20,8 @@ Example:
     ... )
 """
 
+import importlib.metadata
+
 from edda.activity import activity
 from edda.app import EddaApp
 from edda.channels import (
@@ -48,7 +50,10 @@ from edda.retry import RetryPolicy
 from edda.workflow import workflow
 from edda.wsgi import create_wsgi_app
 
-__version__ = "0.1.0"
+try:
+    __version__ = importlib.metadata.version("edda-framework")
+except importlib.metadata.PackageNotFoundError:  # imported from a source tree that isn't installed
+    __version__ = "0.0.0"
 
 __all__ = [
     # Core
