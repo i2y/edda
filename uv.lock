@@ -845,7 +845,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'postgres-notify'", specifier = ">=0.30.0" },
     { name = "asyncpg", marker = "extra == 'postgresql'", specifier = ">=0.30.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=25.9.0" },
-    { name = "cloudevents", specifier = ">=1.12.0" },
+    { name = "cloudevents", specifier = ">=1.12.0,<2" },
     { name = "httpx2", specifier = ">=2.13.1" },
     { name = "llama-index-core", marker = "extra == 'llamaindex'", specifier = ">=0.12.0" },
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=2.2.0" },
