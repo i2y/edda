@@ -333,7 +333,7 @@ class TestOutboxRelayer:
 
         await relayer.stop()
 
-    async def test_relayer_polling_loop(self, sqlite_storage, create_test_instance):
+    async def test_relayer_polling_loop(self, sqlite_storage, create_test_instance, monkeypatch):
         """Test that relayer continuously polls for events."""
         relayer = OutboxRelayer(
             storage=sqlite_storage,
@@ -353,6 +353,16 @@ class TestOutboxRelayer:
             content_type="application/json",
         )
 
+        # Signal once the event has been marked published
+        published = asyncio.Event()
+        mark_outbox_published = sqlite_storage.mark_outbox_published
+
+        async def mark_and_signal(event_id: str) -> None:
+            await mark_outbox_published(event_id)
+            published.set()
+
+        monkeypatch.setattr(sqlite_storage, "mark_outbox_published", mark_and_signal)
+
         # Start relayer
         await relayer.start()
 
@@ -363,10 +373,10 @@ class TestOutboxRelayer:
             mock_client.post = AsyncMock(return_value=mock_response)
             mock_client.aclose = AsyncMock()  # Mock aclose as async
 
-            # Wait for polling to happen
-            await asyncio.sleep(0.2)
-
-            # Stop relayer
+            # Stop only after the poll's DB work: stop() cancels the loop, and
+            # cancelling mid-query wipes the in-memory database
+            async with asyncio.timeout(5):
+                await published.wait()
             await relayer.stop()
 
             # Verify event was published
