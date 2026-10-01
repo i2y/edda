@@ -275,7 +275,7 @@ async def multi_service_orchestration(ctx: WorkflowContext, request_id: str):
 Send CloudEvents to resume waiting workflows:
 
 ```python
-import httpx
+import httpx2
 from cloudevents.http import CloudEvent
 from cloudevents.conversion import to_structured
 
@@ -292,7 +292,7 @@ event = CloudEvent({
 
 # Send to Edda
 headers, body = to_structured(event)
-async with httpx.AsyncClient() as client:
+async with httpx2.AsyncClient() as client:
     response = await client.post(
         "http://localhost:8001/",
         headers=headers,

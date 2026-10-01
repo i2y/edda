@@ -79,8 +79,8 @@ class TestStartSaga:
         params = {"user_id": 123}
         edda_app_url = "http://localhost:8001"
 
-        # Mock httpx.AsyncClient
-        with patch("httpx.AsyncClient") as mock_client_class:
+        # Mock httpx2.AsyncClient
+        with patch("httpx2.AsyncClient") as mock_client_class:
             # Create mock response
             mock_response = MagicMock()
             mock_response.status_code = 200
@@ -104,7 +104,7 @@ class TestStartSaga:
             assert "started successfully" in message
             assert instance_id is None  # CloudEvent returns immediately
 
-            # Verify httpx.post was called
+            # Verify httpx2.post was called
             mock_client.post.assert_called_once()
             call_args = mock_client.post.call_args
 
@@ -134,7 +134,7 @@ class TestStartSaga:
         params = {}
         edda_app_url = "http://localhost:8001"
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_response = MagicMock()
             mock_response.status_code = 200
             mock_response.text = '{"status": "accepted"}'
@@ -175,8 +175,8 @@ class TestStartSaga:
         params = {"user_id": 123}
         edda_app_url = "http://localhost:9999"  # Non-existent server
 
-        with patch("httpx.AsyncClient") as mock_client_class:
-            from httpx import ConnectError
+        with patch("httpx2.AsyncClient") as mock_client_class:
+            from httpx2 import ConnectError
 
             mock_client = AsyncMock()
             mock_client.post.side_effect = ConnectError("Connection refused")
@@ -200,8 +200,8 @@ class TestStartSaga:
         params = {"user_id": 123}
         edda_app_url = "http://localhost:8001"
 
-        with patch("httpx.AsyncClient") as mock_client_class:
-            from httpx import TimeoutException
+        with patch("httpx2.AsyncClient") as mock_client_class:
+            from httpx2 import TimeoutException
 
             mock_client = AsyncMock()
             mock_client.post.side_effect = TimeoutException("Request timed out")
@@ -225,7 +225,7 @@ class TestStartSaga:
         params = {"user_id": 123}
         edda_app_url = "http://localhost:8001"
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_response = MagicMock()
             mock_response.status_code = 500
             mock_response.text = '{"error": "Internal server error"}'
@@ -282,7 +282,7 @@ class TestEndToEnd:
             assert "e2e_test_workflow" in all_workflows
 
             # Mock HTTP client to send CloudEvent
-            with patch("httpx.AsyncClient") as mock_client_class:
+            with patch("httpx2.AsyncClient") as mock_client_class:
                 mock_response = MagicMock()
                 mock_response.status_code = 200
                 mock_response.text = '{"status": "accepted"}'

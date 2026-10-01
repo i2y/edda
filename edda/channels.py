@@ -1007,7 +1007,7 @@ async def send_event(
         datacontenttype: Content type (defaults to "application/json")
 
     Raises:
-        httpx.HTTPError: If the HTTP request fails
+        httpx2.HTTPError: If the HTTP request fails
 
     Example:
         >>> # With dict
@@ -1017,7 +1017,7 @@ async def send_event(
         >>> order = OrderCreated(order_id="123", amount=99.99)
         >>> await send_event("order.created", "order-service", order)
     """
-    import httpx
+    import httpx2
     from cloudevents.conversion import to_structured
     from cloudevents.http import CloudEvent
 
@@ -1049,7 +1049,7 @@ async def send_event(
     headers, body = to_structured(event)
 
     # Send to Knative Broker via HTTP POST
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         response = await client.post(
             broker_url,
             headers=headers,

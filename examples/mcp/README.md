@@ -157,7 +157,7 @@ Add this to your MCP client configuration (e.g., Claude Desktop):
       "command": "npx",
       "args": [
         "mcp-remote",
-        "http://localhost:8000",
+        "http://localhost:8000/mcp",
         "--header",
         "Authorization: Bearer your-secret-token"
       ]

@@ -13,11 +13,11 @@ if TYPE_CHECKING:
     from edda.storage.protocol import StorageProtocol
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 except ImportError as e:
     raise ImportError(
-        "MCP Python SDK is required for MCP integration. "
-        "Install it with: pip install edda-framework[mcp]"
+        "MCP Python SDK 2.x is required for MCP integration. "
+        "Install it with: pip install 'edda-framework[mcp]'"
     ) from e
 
 
@@ -25,7 +25,7 @@ class EddaMCPServer:
     """
     MCP (Model Context Protocol) server for Edda durable workflows.
 
-    Integrates EddaApp (CloudEvents + Workflows) with FastMCP to provide
+    Integrates EddaApp (CloudEvents + Workflows) with MCPServer to provide
     long-running workflow tools via the MCP protocol.
 
     Example:
@@ -102,7 +102,7 @@ class EddaMCPServer:
             outbox_enabled=outbox_enabled,
             broker_url=broker_url or "",
         )
-        self._mcp = FastMCP(name, json_response=True, stateless_http=True)
+        self._mcp = MCPServer(name)
         self._token_verifier = token_verifier
 
         # Registry of durable tools (workflow_name -> Workflow instance)
@@ -202,7 +202,7 @@ class EddaMCPServer:
 
                 Example:
                     ```python
-                    from fastmcp.prompts.prompt import PromptMessage, TextContent
+                    from mcp.types import PromptMessage, TextContent
 
                     @server.prompt(description="Analyze workflow results")
                     async def analyze_workflow(instance_id: str) -> PromptMessage:
@@ -226,7 +226,7 @@ class EddaMCPServer:
         """
 
         def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
-            # Use FastMCP's native prompt decorator
+            # Use MCPServer's native prompt decorator
             prompt_desc = description or f.__doc__ or f"Prompt: {f.__name__}"
             return self._mcp.prompt(description=prompt_desc)(f)
 
@@ -242,7 +242,7 @@ class EddaMCPServer:
         we get the MCP's Starlette app directly and add Edda endpoints to it.
 
         Routing:
-        - POST /    -> FastMCP (MCP tools via streamable HTTP)
+        - POST /mcp -> MCPServer (MCP tools via streamable HTTP)
         - POST /cancel/{instance_id} -> Workflow cancellation
         - Other POST -> CloudEvents
 
@@ -253,10 +253,10 @@ class EddaMCPServer:
         from starlette.responses import Response
 
         # Get MCP's Starlette app (Issue #1367 workaround: use directly)
-        app = self._mcp.streamable_http_app()
+        app = self._mcp.streamable_http_app(json_response=True, stateless_http=True)
 
         # Add Edda endpoints to Starlette router BEFORE wrapping with middleware
-        # Note: MCP's streamable HTTP is already mounted at "/" by default
+        # Note: MCP's streamable HTTP is already mounted at "/mcp" by default
         # We add additional routes for Edda's CloudEvents and cancellation
 
         async def edda_cancel_handler(request: Request) -> Response:

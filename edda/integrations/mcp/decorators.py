@@ -84,10 +84,10 @@ def create_durable_tool(
             "isError": False,
         }
 
-    # Override the function's signature for introspection (FastMCP uses this for schema generation)
+    # Override the function's signature for introspection (MCPServer uses this for schema generation)
     start_tool.__signature__ = inspect.Signature(parameters=params)  # type: ignore[attr-defined]
 
-    # Register with FastMCP (call as function, not decorator syntax)
+    # Register with MCPServer (call as function, not decorator syntax)
     server._mcp.tool(name=workflow_name, description=tool_description)(start_tool)
 
     # 3. Generate status tool

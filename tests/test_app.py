@@ -11,7 +11,7 @@ import signal
 import subprocess
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 from edda import EddaApp, activity, workflow
@@ -288,7 +288,7 @@ application = app
             assert poll_result is None, "Tsuno server should be running"
 
             # Try to connect with retries
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx2.AsyncClient(timeout=10.0) as client:
                 for attempt in range(3):
                     try:
                         response = await client.get("http://127.0.0.1:18000/health")
@@ -296,7 +296,7 @@ application = app
                         # 404=not found, 405=method not allowed, 400=bad request, 500=server error
                         assert response.status_code in [404, 200, 202, 400, 405, 500]
                         break
-                    except (httpx.ConnectError, httpx.ReadTimeout):
+                    except (httpx2.ConnectError, httpx2.ReadTimeout):
                         # This is acceptable - server may not have /health endpoint or be slow
                         if attempt < 2:
                             await asyncio.sleep(2.0)
@@ -399,7 +399,7 @@ application = app
             assert poll_result is None, "Tsuno server should be running with multiple workers"
 
             # Try to send a request with retries
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx2.AsyncClient(timeout=10.0) as client:
                 for attempt in range(3):
                     try:
                         # Send a test CloudEvent
@@ -422,7 +422,7 @@ application = app
                         assert response.status_code in [200, 202, 404, 400, 500]
                         break
 
-                    except (httpx.ConnectError, httpx.ReadTimeout):
+                    except (httpx2.ConnectError, httpx2.ReadTimeout):
                         # Server might not be fully ready
                         if attempt < 2:
                             await asyncio.sleep(2.0)

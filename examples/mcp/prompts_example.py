@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 # Import prompt types from MCP
-from mcp.server.fastmcp.prompts.base import UserMessage  # type: ignore[import-not-found]
+from mcp.server.mcpserver.prompts.base import UserMessage  # type: ignore[import-not-found]
 from mcp.types import TextContent  # type: ignore[import-not-found]
 
 from edda import WorkflowContext, activity, workflow
