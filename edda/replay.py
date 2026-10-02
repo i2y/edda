@@ -450,9 +450,10 @@ class ReplayEngine:
             workflow_func: The workflow function to execute
         """
         # Create context for replay
+        workflow_name = instance["workflow_name"]
         ctx = WorkflowContext(
             instance_id=instance_id,
-            workflow_name=instance["workflow_name"],
+            workflow_name=workflow_name,
             storage=self.storage,
             worker_id=self.worker_id,
             is_replaying=True,
@@ -485,6 +486,10 @@ class ReplayEngine:
 
             # Mark as completed
             await ctx._update_status("completed", {"result": result_dict})
+
+            # Call hook: workflow complete
+            if self.hooks and hasattr(self.hooks, "on_workflow_complete"):
+                await self.hooks.on_workflow_complete(instance_id, workflow_name, result)
 
         except WaitForTimerException as exc:
             # Workflow is waiting for a timer (again)
@@ -570,6 +575,11 @@ class ReplayEngine:
 
                 # Ensure status is "cancelled"
                 await ctx._update_status("cancelled", {"reason": "Workflow cancelled by user"})
+
+                # Call hook: workflow cancelled
+                if self.hooks and hasattr(self.hooks, "on_workflow_cancelled"):
+                    await self.hooks.on_workflow_cancelled(instance_id, workflow_name)
+
                 return
 
             # Execute compensations before marking as failed
@@ -597,6 +607,10 @@ class ReplayEngine:
 
             # Mark as failed with detailed error information
             await ctx._update_status("failed", error_data)
+
+            # Call hook: workflow failed
+            if self.hooks and hasattr(self.hooks, "on_workflow_failed"):
+                await self.hooks.on_workflow_failed(instance_id, workflow_name, error)
             raise
 
     async def resume_by_name(
