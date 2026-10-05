@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +51,41 @@ async def run_periodic_until(periodic: Coroutine[Any, Any, None], done: asyncio.
             await task
 
 
+async def mark_workflow_crashed(storage, instance_id: str, worker_id: str = "crashed_worker"):
+    """Reset a workflow to running with a stale lock as if the worker crashed"""
+    await storage.try_acquire_lock(instance_id, worker_id)
+    async with AsyncSession(storage.engine, expire_on_commit=False) as conn:
+        await conn.execute(
+            text(
+                "UPDATE workflow_instances SET status = 'running' WHERE instance_id = :instance_id"
+            ),
+            {"instance_id": instance_id},
+        )
+        await conn.commit()
+    await set_lock_expired(storage, instance_id)
+
+
+class RecordingHooks:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def on_workflow_start(
+        self, instance_id: str, workflow_name: str, input_data: dict
+    ) -> None:
+        self.calls.append(("on_workflow_start", instance_id, workflow_name, input_data))
+
+    async def on_workflow_complete(self, instance_id: str, workflow_name: str, result: Any) -> None:
+        self.calls.append(("on_workflow_complete", instance_id, workflow_name, result))
+
+    async def on_workflow_failed(
+        self, instance_id: str, workflow_name: str, error: Exception
+    ) -> None:
+        self.calls.append(("on_workflow_failed", instance_id, workflow_name, error))
+
+    def calls_named(self, name: str) -> list[tuple]:
+        return [call for call in self.calls if call[0] == name]
+
+
 # Test workflows and activities (prefixed with 'recovery_' to avoid pytest confusion)
 @activity
 async def recovery_activity(_ctx: WorkflowContext, value: int) -> int:
@@ -61,6 +97,15 @@ async def recovery_activity(_ctx: WorkflowContext, value: int) -> int:
 async def recovery_workflow(ctx: WorkflowContext, value: int) -> int:
     """Test workflow that calls recovery_activity."""
     result = await recovery_activity(ctx, value)
+    return result
+
+
+@workflow
+async def recovery_failing_workflow(ctx: WorkflowContext, value: int) -> int:
+    """Succeeds on first start, then fails during replay"""
+    result = await recovery_activity(ctx, value)
+    if ctx.is_replaying:
+        raise RuntimeError("recovery failed")
     return result
 
 
@@ -446,3 +491,95 @@ class TestStaleWorkflowRecovery:
         assert instance is not None
         assert instance["status"] == "completed"
         assert instance["output_data"]["result"] == 20  # 10 * 2
+
+    async def test_resume_calls_on_workflow_complete(self, sqlite_storage) -> None:
+        """
+        Integration test with real ReplayEngine.
+
+        This test verifies that resuming a crashed workflow
+        fires on_workflow_complete
+        """
+
+        hooks = RecordingHooks()
+        replay_engine = ReplayEngine(
+            storage=sqlite_storage,
+            service_name="test_service",
+            worker_id="test_worker",
+            hooks=hooks,
+        )
+        set_replay_engine(replay_engine)
+
+        instance_id = await recovery_workflow.start(value=10)
+
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "completed"
+        assert instance["output_data"]["result"] == 20
+
+        # start will also fill the calls, so clear it out before resume
+        hooks.calls.clear()
+
+        await mark_workflow_crashed(sqlite_storage, instance_id)
+
+        workflows_to_resume = await sqlite_storage.cleanup_stale_locks()
+        assert len(workflows_to_resume) == 1
+
+        await replay_engine.resume_by_name(instance_id, "recovery_workflow")
+
+        complete_calls = hooks.calls_named("on_workflow_complete")
+        assert complete_calls == [("on_workflow_complete", instance_id, "recovery_workflow", 20)]
+        assert hooks.calls_named("on_workflow_failed") == []
+
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "completed"
+        assert instance["output_data"]["result"] == 20
+
+    async def test_resume_calls_on_workflow_failed(self, sqlite_storage) -> None:
+        """
+        Integration test with real ReplayEngine.
+
+        This test verifies that raising error during replay
+        calls on_workflow_failed
+        """
+
+        hooks = RecordingHooks()
+        replay_engine = ReplayEngine(
+            storage=sqlite_storage,
+            service_name="test_service",
+            worker_id="test_worker",
+            hooks=hooks,
+        )
+        set_replay_engine(replay_engine)
+
+        instance_id = await recovery_failing_workflow.start(value=10)
+
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "completed"
+
+        # start will also fill the calls, so clear it out before resume
+        hooks.calls.clear()
+
+        await mark_workflow_crashed(sqlite_storage, instance_id)
+
+        workflows_to_resume = await sqlite_storage.cleanup_stale_locks()
+        assert len(workflows_to_resume) == 1
+
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await replay_engine.resume_by_name(instance_id, "recovery_failing_workflow")
+
+        failed_calls = hooks.calls_named("on_workflow_failed")
+        assert len(failed_calls) == 1
+        hook_name, hook_instance_id, workflow_name, error = failed_calls[0]
+        assert hook_name == "on_workflow_failed"
+        assert hook_instance_id == instance_id
+        assert workflow_name == "recovery_failing_workflow"
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "recovery failed"
+        assert hooks.calls_named("on_workflow_complete") == []
+
+        instance = await sqlite_storage.get_instance(instance_id)
+        assert instance is not None
+        assert instance["status"] == "failed"
+        assert "recovery failed" in instance["output_data"]["error_message"]
