@@ -67,17 +67,18 @@ jobs:
       - name: Check Python version
         run: uv run python -c "import sys; assert sys.version.startswith('${{ matrix.python-version }}.'), sys.version"
 
-      - name: Run tests (all databases)
-        env:
-          EDDA_TEST_POSTGRES_URL: postgresql+asyncpg://edda:edda_test_password@localhost:5432/edda_test
-          EDDA_TEST_MYSQL_URL: mysql+aiomysql://edda:edda_test_password@localhost:3306/edda_test
-        run: uv run pytest -v --tb=short
-
-      - name: Type check
-        run: uv run mypy edda
-
+      # Fast checks first, so lint failures show up before the ~10 minute test run
       - name: Lint with ruff
         run: uv run ruff check edda tests
 
       - name: Check formatting
         run: uv run black --check edda tests
+
+      - name: Type check
+        run: uv run mypy edda
+
+      - name: Run tests (all databases)
+        env:
+          EDDA_TEST_POSTGRES_URL: postgresql+asyncpg://edda:edda_test_password@localhost:5432/edda_test
+          EDDA_TEST_MYSQL_URL: mysql+aiomysql://edda:edda_test_password@localhost:3306/edda_test
+        run: uv run pytest -v --tb=short
