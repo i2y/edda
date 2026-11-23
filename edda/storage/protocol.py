@@ -914,6 +914,26 @@ class StorageProtocol(Protocol):
         """Publish DOWN messages for terminated monitored actors (leader sweep)."""
         ...
 
+    async def grant_capability(
+        self,
+        capability_id: str,
+        kind: str,
+        target: str,
+        secret_hash: str,
+        granted_by: str | None = None,
+        expires_at: str | None = None,
+    ) -> None:
+        """Persist a capability grant (secret stored only as a hash)."""
+        ...
+
+    async def revoke_capability(self, capability_id: str) -> None:
+        """Remove a capability grant by ID (idempotent)."""
+        ...
+
+    async def check_capability(self, kind: str, target: str, secret_hash: str) -> bool:
+        """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.

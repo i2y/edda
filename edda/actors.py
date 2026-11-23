@@ -10,7 +10,10 @@ with ``send_to()``. Emission is performed by the leader's periodic sweep,
 so a notification arrives at most one sweep interval after termination.
 """
 
-from typing import TYPE_CHECKING, Any
+import hashlib
+import secrets
+import uuid
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
@@ -65,3 +68,47 @@ async def monitor(ctx: "WorkflowContext", target_instance_id: str, channel: str)
 async def unmonitor(ctx: "WorkflowContext", target_instance_id: str) -> None:
     """Remove a monitor registration (idempotent)."""
     await ctx.storage.unmonitor_actor(ctx.instance_id, target_instance_id)
+
+
+_CAP_KINDS = {"actor", "channel_pub", "channel_sub", "fs_write"}
+
+
+def _hash_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+async def issue_capability(
+    ctx: "WorkflowContext", kind: str, target: str, expires_at: str | None = None
+) -> str:
+    """
+    Mint a capability for (kind, target) and return the bearer token
+    ``cap:{kind}:{target}:{secret}``. Only the hash of the secret is stored;
+    the plaintext is returned exactly once here.
+    """
+    if kind not in _CAP_KINDS:
+        raise ValueError(f"unknown capability kind: {kind}")
+    secret = secrets.token_hex(24)
+    await ctx.storage.grant_capability(
+        capability_id=f"cap-{uuid.uuid4()}",
+        kind=kind,
+        target=target,
+        secret_hash=_hash_secret(secret),
+        granted_by=ctx.instance_id,
+        expires_at=expires_at,
+    )
+    return f"cap:{kind}:{target}:{secret}"
+
+
+async def check_capability(ctx: "WorkflowContext", kind: str, target: str, token: str) -> bool:
+    """
+    Verify a capability token for (kind, target). Accepts either the raw
+    secret or the full ``cap:kind:target:secret`` token form.
+    """
+    if token.startswith("cap:"):
+        token = token.rsplit(":", 1)[-1]
+    return await ctx.storage.check_capability(kind, target, _hash_secret(token))
+
+
+async def revoke_capability(ctx: "WorkflowContext", capability_id: str) -> None:
+    """Remove a capability grant by ID (idempotent)."""
+    await ctx.storage.revoke_capability(capability_id)

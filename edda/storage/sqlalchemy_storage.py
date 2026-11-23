@@ -3187,6 +3187,65 @@ class SQLAlchemyStorage:
             return len(monitors)
 
     # -------------------------------------------------------------------------
+    # Capability Methods
+    # -------------------------------------------------------------------------
+
+    async def grant_capability(
+        self,
+        capability_id: str,
+        kind: str,
+        target: str,
+        secret_hash: str,
+        granted_by: str | None = None,
+        expires_at: str | None = None,
+    ) -> None:
+        """Persist a capability grant (secret is stored only as a hash)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO actor_capabilities "
+                    "(id, kind, target, secret_hash, granted_by, expires_at) "
+                    "VALUES (:i, :k, :t, :h, :g, :e)"
+                ),
+                {"i": capability_id, "k": kind, "t": target,
+                 "h": secret_hash, "g": granted_by, "e": expires_at},
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def revoke_capability(self, capability_id: str) -> None:
+        """Remove a capability grant by ID (idempotent)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                text("DELETE FROM actor_capabilities WHERE id = :i"), {"i": capability_id}
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def check_capability(self, kind: str, target: str, secret_hash: str) -> bool:
+        """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text(
+                    "SELECT expires_at FROM actor_capabilities "
+                    "WHERE kind = :k AND target = :t AND secret_hash = :h"
+                ),
+                {"k": kind, "t": target, "h": secret_hash},
+            )
+            row = result.first()
+            if not row:
+                return False
+            expires_at = row[0]
+            if expires_at is None:
+                return True
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            return bool(expires_at > datetime.now(UTC))
+
+    # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
     # -------------------------------------------------------------------------
 
