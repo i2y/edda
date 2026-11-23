@@ -942,6 +942,18 @@ class StorageProtocol(Protocol):
         """Return the blob for hash, or None if absent."""
         ...
 
+    async def fs_get(self, path: str) -> dict[str, Any] | None:
+        """Return FS object at path (data/version/owner), or None."""
+        ...
+
+    async def fs_put(self, path: str, data: bytes, owner: str, expected_version: int) -> None:
+        """CAS write; raises FSConflictError on version mismatch."""
+        ...
+
+    async def fs_delete(self, path: str, expected_version: int) -> None:
+        """Delete path (expected 0 = unconditional, >0 = version-checked)."""
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.

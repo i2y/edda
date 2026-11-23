@@ -62,3 +62,15 @@ class RetryExhaustedError(Exception):
     """
 
     pass
+
+
+class FSConflictError(Exception):
+    """Optimistic-concurrency conflict on the shared actor filesystem."""
+
+
+class FSForbiddenError(Exception):
+    """Permission denied on the shared actor filesystem."""
+
+
+class FSOutsideActivityError(Exception):
+    """FS operation attempted outside an activity body or during replay."""

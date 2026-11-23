@@ -59,6 +59,7 @@ class WorkflowContext:
         # no lock).
         self.lock_id = lock_id
         self.is_replaying = is_replaying
+        self._activity_depth = 0
         self.hooks = hooks
 
         # Activity ID tracking for deterministic replay

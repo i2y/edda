@@ -3285,6 +3285,69 @@ class SQLAlchemyStorage:
             row = result.first()
             return bytes(row[0]) if row else None
 
+    async def fs_get(self, path: str) -> dict[str, Any] | None:
+        """Return the FS object at path (dict with data/version/owner), or None."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text("SELECT data, version, owner FROM actor_fs WHERE path = :p"),
+                {"p": path},
+            )
+            row = result.first()
+            if not row:
+                return None
+            return {"data": bytes(row[0]), "version": row[1], "owner": row[2]}
+
+    async def fs_put(self, path: str, data: bytes, owner: str, expected_version: int) -> None:
+        """CAS write: expected 0 = create, >0 = update iff version matches.
+
+        Raises FSConflictError on version mismatch or existing path.
+        """
+        from edda.exceptions import FSConflictError
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            if expected_version == 0:
+                result = await session.execute(
+                    text(
+                        "INSERT INTO actor_fs (path, owner, data, version) "
+                        "SELECT :p, :o, :d, 1 "
+                        "WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = :p2)"
+                    ),
+                    {"p": path, "o": owner, "d": data, "p2": path},
+                )
+            else:
+                result = await session.execute(
+                    text(
+                        "UPDATE actor_fs SET data = :d, owner = :o, "
+                        "version = version + 1 "
+                        "WHERE path = :p AND version = :v"
+                    ),
+                    {"d": data, "o": owner, "p": path, "v": expected_version},
+                )
+            if result.rowcount == 0:
+                raise FSConflictError(f"actor_fs version conflict: {path}")
+            await self._commit_if_not_in_transaction(session)
+
+    async def fs_delete(self, path: str, expected_version: int) -> None:
+        """Delete path (expected 0 = unconditional, >0 = version-checked)."""
+        from edda.exceptions import FSConflictError
+
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            if expected_version == 0:
+                result = await session.execute(
+                    text("DELETE FROM actor_fs WHERE path = :p"), {"p": path}
+                )
+            else:
+                result = await session.execute(
+                    text("DELETE FROM actor_fs WHERE path = :p AND version = :v"),
+                    {"p": path, "v": expected_version},
+                )
+            if expected_version > 0 and result.rowcount == 0:
+                raise FSConflictError(f"actor_fs version conflict: {path}")
+            await self._commit_if_not_in_transaction(session)
+
     # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
     # -------------------------------------------------------------------------
