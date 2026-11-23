@@ -303,6 +303,15 @@ async def auto_resume_stale_workflows_periodically(
                 except Exception as e:
                     logger.error("Failed to requeue channel waits: %s", e, exc_info=True)
 
+                # Deliver DOWN notifications for terminated actors and free
+                # their registered names.
+                try:
+                    downs = await storage.emit_actor_down_for_terminated()
+                    if downs:
+                        logger.info("Emitted %d actor DOWN notification(s)", downs)
+                except Exception as e:
+                    logger.error("Failed to emit actor DOWN notifications: %s", e, exc_info=True)
+
                 # Clean up stale locks and get workflows to resume
                 workflows_to_resume = await storage.cleanup_stale_locks()
 

@@ -3072,6 +3072,121 @@ class SQLAlchemyStorage:
             ]
 
     # -------------------------------------------------------------------------
+    # Actor Registry / Monitor (Erlang register/whereis/monitor equivalents)
+    # -------------------------------------------------------------------------
+
+    async def register_actor_name(
+        self, name: str, instance_id: str, framework: str = "python"
+    ) -> None:
+        """Bind a unique actor name to an instance. Fails if name is taken."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                text("INSERT INTO actor_names (name, instance_id, framework) VALUES (:n, :i, :f)"),
+                {"n": name, "i": instance_id, "f": framework},
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def unregister_actor_name(self, name: str) -> None:
+        """Remove an actor name binding (idempotent)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(text("DELETE FROM actor_names WHERE name = :n"), {"n": name})
+            await self._commit_if_not_in_transaction(session)
+
+    async def whereis_actor(self, name: str) -> str | None:
+        """Resolve an actor name to an instance ID, or None if unbound."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text("SELECT instance_id FROM actor_names WHERE name = :n"), {"n": name}
+            )
+            row = result.first()
+            return row[0] if row else None
+
+    async def monitor_actor(
+        self, watcher_instance_id: str, target_instance_id: str, channel: str
+    ) -> None:
+        """Register that watcher is notified on channel when target terminates."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            if self._is_postgresql:
+                sql = (
+                    "INSERT INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
+                    "VALUES (:w, :t, :c) ON CONFLICT (watcher_instance_id, target_instance_id) DO NOTHING"
+                )
+            elif self.engine.dialect.name == "mysql":
+                sql = (
+                    "INSERT IGNORE INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
+                    "VALUES (:w, :t, :c)"
+                )
+            else:
+                sql = (
+                    "INSERT OR IGNORE INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
+                    "VALUES (:w, :t, :c)"
+                )
+            await session.execute(
+                text(sql),
+                {"w": watcher_instance_id, "t": target_instance_id, "c": channel},
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def unmonitor_actor(self, watcher_instance_id: str, target_instance_id: str) -> None:
+        """Remove a monitor registration (idempotent)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                text(
+                    "DELETE FROM actor_monitors "
+                    "WHERE watcher_instance_id = :w AND target_instance_id = :t"
+                ),
+                {"w": watcher_instance_id, "t": target_instance_id},
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def emit_actor_down_for_terminated(self) -> int:
+        """
+        Publish a DOWN message to each monitor channel whose target is in a
+        terminal status, then remove the monitor rows and the target's
+        actor_names bindings — all in one transaction (leader sweep, safe to
+        run repeatedly). Returns the number of notifications emitted.
+        """
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text(
+                    "SELECT m.id, m.target_instance_id, m.channel, w.status "
+                    "FROM actor_monitors m "
+                    "JOIN workflow_instances w ON w.instance_id = m.target_instance_id "
+                    "WHERE w.status IN ('completed', 'failed', 'cancelled', 'recurred')"
+                )
+            )
+            monitors = result.all()
+            import uuid as _uuid
+
+            if not monitors:
+                await session.commit()
+                return 0
+
+            now = datetime.now(UTC).isoformat()
+            for m_id, target_id, channel, status in monitors:
+                payload = json.dumps({"type": "DOWN", "actor": target_id, "status": status})
+                await session.execute(
+                    text(
+                        "INSERT INTO channel_messages (channel, message_id, data_type, data, published_at) "
+                        "VALUES (:c, :m, 'json', :d, :p)"
+                    ),
+                    {"c": channel, "m": str(_uuid.uuid4()), "d": payload, "p": now},
+                )
+                await session.execute(text("DELETE FROM actor_monitors WHERE id = :i"), {"i": m_id})
+            for target_id in {m[1] for m in monitors}:
+                await session.execute(
+                    text("DELETE FROM actor_names WHERE instance_id = :i"), {"i": target_id}
+                )
+            await session.commit()
+            return len(monitors)
+
+    # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
     # -------------------------------------------------------------------------
 

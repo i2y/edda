@@ -886,6 +886,34 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def register_actor_name(
+        self, name: str, instance_id: str, framework: str = "python"
+    ) -> None:
+        """Bind a unique actor name to an instance."""
+        ...
+
+    async def unregister_actor_name(self, name: str) -> None:
+        """Remove an actor name binding (idempotent)."""
+        ...
+
+    async def whereis_actor(self, name: str) -> str | None:
+        """Resolve an actor name to an instance ID, or None."""
+        ...
+
+    async def monitor_actor(
+        self, watcher_instance_id: str, target_instance_id: str, channel: str
+    ) -> None:
+        """Register a DOWN notification for when target terminates."""
+        ...
+
+    async def unmonitor_actor(self, watcher_instance_id: str, target_instance_id: str) -> None:
+        """Remove a monitor registration (idempotent)."""
+        ...
+
+    async def emit_actor_down_for_terminated(self) -> int:
+        """Publish DOWN messages for terminated monitored actors (leader sweep)."""
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.
