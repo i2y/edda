@@ -934,6 +934,14 @@ class StorageProtocol(Protocol):
         """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
         ...
 
+    async def put_blob(self, hash: str, data: bytes, created_by: str | None = None) -> None:
+        """Store data under its content hash (idempotent CAS write)."""
+        ...
+
+    async def get_blob(self, hash: str) -> bytes | None:
+        """Return the blob for hash, or None if absent."""
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.

@@ -3208,8 +3208,14 @@ class SQLAlchemyStorage:
                     "(id, kind, target, secret_hash, granted_by, expires_at) "
                     "VALUES (:i, :k, :t, :h, :g, :e)"
                 ),
-                {"i": capability_id, "k": kind, "t": target,
-                 "h": secret_hash, "g": granted_by, "e": expires_at},
+                {
+                    "i": capability_id,
+                    "k": kind,
+                    "t": target,
+                    "h": secret_hash,
+                    "g": granted_by,
+                    "e": expires_at,
+                },
             )
             await self._commit_if_not_in_transaction(session)
 
@@ -3244,6 +3250,40 @@ class SQLAlchemyStorage:
             if expires_at.tzinfo is None:
                 expires_at = expires_at.replace(tzinfo=UTC)
             return bool(expires_at > datetime.now(UTC))
+
+    async def put_blob(self, hash: str, data: bytes, created_by: str | None = None) -> None:
+        """Store data under its content hash (idempotent CAS write)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            if self._is_postgresql:
+                sql = (
+                    "INSERT INTO payload_blobs (hash, data, size_bytes, created_by) "
+                    "VALUES (:h, :d, :s, :c) ON CONFLICT (hash) DO NOTHING"
+                )
+            elif self.engine.dialect.name == "mysql":
+                sql = (
+                    "INSERT IGNORE INTO payload_blobs (hash, data, size_bytes, created_by) "
+                    "VALUES (:h, :d, :s, :c)"
+                )
+            else:
+                sql = (
+                    "INSERT OR IGNORE INTO payload_blobs (hash, data, size_bytes, created_by) "
+                    "VALUES (:h, :d, :s, :c)"
+                )
+            await session.execute(
+                text(sql), {"h": hash, "d": data, "s": len(data), "c": created_by}
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def get_blob(self, hash: str) -> bytes | None:
+        """Return the blob for hash, or None if absent."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text("SELECT data FROM payload_blobs WHERE hash = :h"), {"h": hash}
+            )
+            row = result.first()
+            return bytes(row[0]) if row else None
 
     # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
