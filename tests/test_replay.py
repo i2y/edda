@@ -419,7 +419,8 @@ class TestReplayEngineLocking:
         async def test_func(ctx: WorkflowContext) -> dict:
             # During execution, verify lock is held
             instance = await sqlite_storage.get_instance(instance_id)
-            assert instance["locked_by"] == "worker-lock-test"
+            # Lock identity carries an epoch suffix: worker_id#<epoch>
+            assert instance["locked_by"].startswith("worker-lock-test#")
             return {"success": True}
 
         result = await replay_engine.execute_with_lock(

@@ -259,6 +259,7 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
             try:
                 compensation_activity_id = f"compensation_{compensation_id}"
                 await ctx.storage.append_history(
+                    lock_id=ctx.lock_id,
                     instance_id=ctx.instance_id,
                     activity_id=compensation_activity_id,
                     event_type="CompensationExecuted",
@@ -294,6 +295,7 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
             try:
                 compensation_activity_id = f"compensation_{compensation_id}"
                 await ctx.storage.append_history(
+                    lock_id=ctx.lock_id,
                     instance_id=ctx.instance_id,
                     activity_id=compensation_activity_id,
                     event_type="CompensationFailed",

@@ -35,6 +35,7 @@ class WorkflowContext:
         worker_id: str,
         is_replaying: bool = False,
         hooks: Any = None,
+        lock_id: str | None = None,
     ):
         """
         Initialize workflow context.
@@ -46,11 +47,17 @@ class WorkflowContext:
             worker_id: Worker ID holding the lock
             is_replaying: Whether this is a replay execution
             hooks: Optional WorkflowHooks implementation for observability
+            lock_id: Epoch-bearing lock identity; when set, status/activity
+                writes are fenced by ``locked_by == lock_id``.
         """
         self.instance_id = instance_id
         self.workflow_name = workflow_name
         self._storage = storage  # Private: use properties/methods instead
         self.worker_id = worker_id
+        # Epoch-bearing lock identity; fenced storage writes use this when
+        # set. None means unfenced (e.g. standalone/test contexts holding
+        # no lock).
+        self.lock_id = lock_id
         self.is_replaying = is_replaying
         self.hooks = hooks
 
@@ -331,7 +338,9 @@ class WorkflowContext:
         )
 
         # Update current activity ID
-        await self.storage.update_instance_activity(self.instance_id, activity_id)
+        await self.storage.update_instance_activity(
+            self.instance_id, activity_id, lock_id=self.lock_id
+        )
 
     async def _record_activity_failed(
         self,
@@ -392,7 +401,9 @@ class WorkflowContext:
             status: New status (e.g., "completed", "failed", "waiting_for_event")
             output_data: Optional output data for completed workflows
         """
-        await self.storage.update_instance_status(self.instance_id, status, output_data)
+        await self.storage.update_instance_status(
+            self.instance_id, status, output_data, lock_id=self.lock_id
+        )
 
     async def _push_compensation(self, compensation_action: Any, activity_id: str) -> None:
         """

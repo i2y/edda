@@ -232,6 +232,7 @@ class StorageProtocol(Protocol):
         instance_id: str,
         status: str,
         output_data: dict[str, Any] | None = None,
+        lock_id: str | None = None,
     ) -> None:
         """
         Update workflow instance status.
@@ -243,7 +244,9 @@ class StorageProtocol(Protocol):
         """
         ...
 
-    async def update_instance_activity(self, instance_id: str, activity_id: str) -> None:
+    async def update_instance_activity(
+        self, instance_id: str, activity_id: str, lock_id: str | None = None
+    ) -> None:
         """
         Update the current activity ID for a workflow instance.
 
@@ -412,6 +415,7 @@ class StorageProtocol(Protocol):
         activity_id: str,
         event_type: str,
         event_data: dict[str, Any] | bytes,
+        lock_id: str | None = None,
     ) -> None:
         """
         Append an event to workflow execution history.
@@ -864,6 +868,24 @@ class StorageProtocol(Protocol):
     # Workflow Resumption Methods
     # -------------------------------------------------------------------------
 
+    async def claim_resumable_workflows(
+        self,
+        worker_id: str,
+        limit: int | None = None,
+        timeout_seconds: int = 300,
+    ) -> list[dict[str, Any]]:
+        """
+        Atomically claim resumable workflows (status='running', unlocked).
+
+        Each returned row is already locked by worker_id — use an
+        epoch-bearing identity so downstream writes are fenced.
+
+        Returns:
+            List of claimed workflows (instance_id, workflow_name,
+            source_hash, status)
+        """
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.
@@ -1009,7 +1031,7 @@ class StorageProtocol(Protocol):
         channel: str,
         activity_id: str | None = None,
         timeout_seconds: int | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.
 
@@ -1026,9 +1048,27 @@ class StorageProtocol(Protocol):
             activity_id: Current activity ID to record
             timeout_seconds: Optional timeout in seconds for the message wait
 
+        Returns:
+            True if the wait was registered, False if a pending message was
+            found inside the registration transaction (workflow left running,
+            lock released, so the resumable sweep replays into it).
+
         Raises:
             RuntimeError: If the worker doesn't hold the lock
             ValueError: If workflow is not subscribed to the channel
+        """
+        ...
+
+    async def requeue_channel_waits_with_pending(self) -> int:
+        """
+        Requeue 'waiting_for_message' workflows that have pending messages.
+
+        Backstop for the residual missed-wakeup race under read-committed
+        isolation. Should be called periodically (e.g., from the stale-lock
+        cleanup loop).
+
+        Returns:
+            Number of workflows requeued.
         """
         ...
 
@@ -1044,7 +1084,9 @@ class StorageProtocol(Protocol):
             Returns messages with id > cursor_message_id (messages not yet seen)
 
         For competing mode:
-            Returns unclaimed messages (not in channel_message_claims)
+            Returns messages not hidden by a claim, i.e. unclaimed messages,
+            messages claimed by this instance (replay drain), and messages
+            whose claim is stale or owned by a terminal workflow instance.
 
         Args:
             instance_id: Workflow instance ID
@@ -1072,7 +1114,10 @@ class StorageProtocol(Protocol):
             instance_id: Workflow instance claiming the message
 
         Returns:
-            True if claim succeeded, False if already claimed by another instance
+            True if claim succeeded, False if a different live instance holds
+            a fresh claim. Claims are taken over when stale (older than the
+            channel-claim staleness window) or when the owner workflow is
+            terminal, and re-claiming is idempotent for the same instance.
         """
         ...
 

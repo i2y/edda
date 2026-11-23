@@ -23,7 +23,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda import workflow
 from edda.hooks import WorkflowHooks
-from edda.locking import auto_resume_stale_workflows_periodically, generate_worker_id
+from edda.locking import (
+    auto_resume_stale_workflows_periodically,
+    generate_worker_id,
+    new_lock_identity,
+)
 from edda.outbox.relayer import OutboxRelayer
 from edda.replay import ReplayEngine
 from edda.retry import RetryPolicy
@@ -992,8 +996,9 @@ class EddaApp:
             # Distributed Coroutines: Acquire lock FIRST to prevent race conditions
             # This ensures only ONE pod processes this timer, even if multiple pods
             # check timers simultaneously
+            lock_id = new_lock_identity(self.worker_id)
             lock_acquired = await self.storage.try_acquire_lock(
-                instance_id, self.worker_id, timeout_seconds=300
+                instance_id, lock_id, timeout_seconds=300
             )
 
             if not lock_acquired:
@@ -1048,7 +1053,7 @@ class EddaApp:
                     continue
 
                 await self.replay_engine.resume_by_name(
-                    instance_id, workflow_name, already_locked=True
+                    instance_id, workflow_name, already_locked=True, lock_id=lock_id
                 )
 
                 logger.debug(
@@ -1062,7 +1067,7 @@ class EddaApp:
 
             finally:
                 # Always release the lock, even if an error occurred
-                await self.storage.release_lock(instance_id, self.worker_id)
+                await self.storage.release_lock(instance_id, lock_id)
 
     async def _check_expired_timers_periodically(self, interval: int = 10) -> None:
         """
@@ -1128,7 +1133,8 @@ class EddaApp:
 
             # Lock-First pattern: Try to acquire the lock before processing
             # If we can't get the lock, another worker is processing this workflow
-            lock_acquired = await self.storage.try_acquire_lock(instance_id, self.worker_id)
+            lock_id = new_lock_identity(self.worker_id)
+            lock_acquired = await self.storage.try_acquire_lock(instance_id, lock_id)
             if not lock_acquired:
                 logger.debug(
                     "Could not acquire lock for workflow %s, skipping (another worker is processing)",
@@ -1199,7 +1205,7 @@ class EddaApp:
                     continue
 
                 await self.replay_engine.resume_by_name(
-                    instance_id, workflow_name, already_locked=True
+                    instance_id, workflow_name, already_locked=True, lock_id=lock_id
                 )
 
                 logger.debug(
@@ -1213,7 +1219,7 @@ class EddaApp:
 
             finally:
                 # Always release the lock
-                await self.storage.release_lock(instance_id, self.worker_id)
+                await self.storage.release_lock(instance_id, lock_id)
 
     async def _check_expired_message_subscriptions_periodically(self, interval: int = 10) -> None:
         """
@@ -1359,7 +1365,13 @@ class EddaApp:
             Number of workflows successfully processed (lock acquired and resumed).
         """
         effective_batch = self._max_workflows_per_batch
-        resumable = await self.storage.find_resumable_workflows(limit=effective_batch)
+        # Atomic batch claim: SKIP LOCKED select + conditional lock update in
+        # one transaction, stamped with an epoch identity so resumed runs and
+        # their fenced writes all share this claim epoch.
+        lock_id = new_lock_identity(self.worker_id)
+        resumable = await self.storage.claim_resumable_workflows(
+            worker_id=lock_id, limit=effective_batch
+        )
         processed_count = 0
 
         for workflow_info in resumable:
@@ -1371,24 +1383,19 @@ class EddaApp:
             workflow_name = workflow_info["workflow_name"]
 
             try:
-                # Try to acquire lock (Lock-First pattern)
-                lock_acquired = await self.storage.try_acquire_lock(instance_id, self.worker_id)
-                if not lock_acquired:
-                    # Another worker got it first, skip (doesn't count toward limit)
-                    continue
-
+                # Row was already claimed atomically by claim_resumable_workflows
                 try:
                     # Resume the workflow
                     if self.replay_engine is None:
                         logger.error("ReplayEngine not initialized, skipping %s", instance_id)
                         continue
                     await self.replay_engine.resume_by_name(
-                        instance_id, workflow_name, already_locked=True
+                        instance_id, workflow_name, already_locked=True, lock_id=lock_id
                     )
                     processed_count += 1
                 finally:
                     # Always release lock
-                    await self.storage.release_lock(instance_id, self.worker_id)
+                    await self.storage.release_lock(instance_id, lock_id)
 
             except Exception as e:
                 logger.error("Error resuming %s: %s", instance_id, e, exc_info=True)

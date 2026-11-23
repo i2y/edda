@@ -347,27 +347,32 @@ async def receive(
             raise RuntimeError(f"Unexpected cached result type: {type(cached_result)}")
 
     # Check for pending messages in the queue
+    msg_dict = None
+    msg_id = ""
+    competing = False
     pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, actual_channel)
     if pending:
-        # Get the first pending message
-        msg_dict = pending[0]
-        msg_id = msg_dict["message_id"]
-
-        # For competing mode, try to claim the message
         subscription = await _get_subscription(ctx, actual_channel)
-        if subscription and subscription.get("mode") == "competing":
-            claimed = await ctx.storage.claim_channel_message(msg_id, ctx.instance_id)
-            if not claimed:
-                # Another worker claimed it, check next message
-                # For simplicity, raise exception to retry
-                raise WaitForChannelMessageException(
-                    channel=actual_channel,
-                    timeout_seconds=timeout_seconds,
-                    activity_id=activity_id,
+        competing = bool(subscription and subscription.get("mode") == "competing")
+
+        if competing:
+            # Claim the first claimable message; a fresh claim by another
+            # live instance just skips it rather than retrying the whole
+            # pending scan.
+            for candidate in pending:
+                claimed = await ctx.storage.claim_channel_message(
+                    candidate["message_id"], ctx.instance_id
                 )
-            # Delete the message after claiming (competing mode)
-            await ctx.storage.delete_channel_message(msg_id)
+                if claimed:
+                    msg_dict = candidate
+                    msg_id = candidate["message_id"]
+                    break
         else:
+            msg_dict = pending[0]
+            msg_id = msg_dict["message_id"]
+
+    if msg_dict is not None:
+        if not competing:
             # Broadcast mode - update cursor
             await ctx.storage.update_delivery_cursor(
                 actual_channel, ctx.instance_id, msg_dict["id"]
@@ -404,6 +409,11 @@ async def receive(
                 "published_at": message.published_at.isoformat(),
             },
         )
+
+        # Competing mode consumes the message: delete it (with the claim)
+        # once history is durable so it cannot be delivered again.
+        if competing:
+            await ctx.storage.delete_channel_message(msg_id)
 
         return message
 

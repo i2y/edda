@@ -42,6 +42,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 logger = logging.getLogger(__name__)
 
+# How old a channel-message claim must be before another competing consumer
+# may take it over. Aligned with the workflow lock lease (300s).
+CHANNEL_CLAIM_STALE_SECONDS = 300
+
+# How old an outbox 'processing' claim must be before another relayer may
+# reclaim it. Aligned with the workflow lock lease (300s).
+OUTBOX_CLAIM_STALE_SECONDS = 300
+
 
 # Declarative base for ORM models
 class Base(DeclarativeBase):
@@ -264,6 +272,7 @@ class OutboxEvent(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(50), server_default=text("'pending'"))
     retry_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1286,13 +1295,24 @@ class SQLAlchemyStorage:
         instance_id: str,
         status: str,
         output_data: dict[str, Any] | None = None,
+        lock_id: str | None = None,
     ) -> None:
-        """Update workflow instance status."""
+        """Update workflow instance status.
+
+        When lock_id is given the update is fenced: it only applies while
+        ``locked_by == lock_id`` still holds, and raises LockLostError
+        otherwise.
+        """
+        from edda.locking import LockLostError
+
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
+            conditions = [WorkflowInstance.instance_id == instance_id]
+            if lock_id is not None:
+                conditions.append(WorkflowInstance.locked_by == lock_id)
             stmt = (
                 update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
+                .where(and_(*conditions))
                 .values(
                     status=status,
                     updated_at=func.now(),
@@ -1302,18 +1322,34 @@ class SQLAlchemyStorage:
             if output_data is not None:
                 stmt = stmt.values(output_data=json.dumps(output_data))
 
-            await session.execute(stmt)
+            result = await session.execute(stmt)
+            if lock_id is not None and (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                await session.rollback()
+                raise LockLostError(f"Lock lost for instance {instance_id}")
             await self._commit_if_not_in_transaction(session)
 
-    async def update_instance_activity(self, instance_id: str, activity_id: str) -> None:
-        """Update the current activity ID for a workflow instance."""
+    async def update_instance_activity(
+        self, instance_id: str, activity_id: str, lock_id: str | None = None
+    ) -> None:
+        """Update the current activity ID for a workflow instance.
+
+        Fenced like update_instance_status when lock_id is given.
+        """
+        from edda.locking import LockLostError
+
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            await session.execute(
+            conditions = [WorkflowInstance.instance_id == instance_id]
+            if lock_id is not None:
+                conditions.append(WorkflowInstance.locked_by == lock_id)
+            result = await session.execute(
                 update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
+                .where(and_(*conditions))
                 .values(current_activity_id=activity_id, updated_at=func.now())
             )
+            if lock_id is not None and (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                await session.rollback()
+                raise LockLostError(f"Lock lost for instance {instance_id}")
             await self._commit_if_not_in_transaction(session)
 
     async def list_instances(
@@ -1514,74 +1550,42 @@ class SQLAlchemyStorage:
         timeout_seconds: int = 300,
     ) -> bool:
         """
-        Try to acquire lock using SELECT FOR UPDATE.
+        Try to acquire lock with a single conditional UPDATE.
 
-        This implements distributed locking with automatic stale lock detection.
-        Returns True if lock was acquired, False if already locked by another worker.
-        Can acquire locks that have timed out.
+        Atomically claims the row only when it is unlocked or its lease has
+        expired (same-worker reclaims create a new epoch on the caller side).
+        Returns True if the lock was acquired.
 
         Note: ALWAYS uses separate session (not external session).
         """
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
-            # Calculate timeout threshold and current time
-            # Use UTC time consistently (timezone-aware to match DateTime(timezone=True) columns)
             current_time = datetime.now(UTC)
 
-            # SELECT FOR UPDATE SKIP LOCKED to prevent blocking (PostgreSQL/MySQL)
-            # SKIP LOCKED: If row is already locked, return None immediately (no blocking)
+            # Read custom timeout (plain SELECT; the UPDATE below is atomic)
             result = await session.execute(
-                select(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
-                .with_for_update(skip_locked=True)
-            )
-            instance = result.scalar_one_or_none()
-
-            if instance is None:
-                # Instance doesn't exist
-                await session.commit()
-                return False
-
-            # Determine actual timeout (priority: instance > parameter > default)
-            actual_timeout = int(
-                instance.lock_timeout_seconds
-                if instance.lock_timeout_seconds is not None
-                else timeout_seconds
-            )
-
-            # Check if we can acquire the lock
-            # Lock is available if: not locked OR lock has expired
-            # Note: SQLite stores datetime without timezone, add UTC timezone
-            if instance.locked_by is None:
-                can_acquire = True
-            elif instance.lock_expires_at is not None:
-                lock_expires_at_utc = (
-                    instance.lock_expires_at.replace(tzinfo=UTC)
-                    if instance.lock_expires_at.tzinfo is None
-                    else instance.lock_expires_at
+                select(WorkflowInstance.lock_timeout_seconds).where(
+                    WorkflowInstance.instance_id == instance_id
                 )
-                can_acquire = lock_expires_at_utc < current_time
-            else:
-                can_acquire = False
-
-            # Debug logging
-            logger.debug(
-                f"Lock acquisition check: instance_id={instance_id}, "
-                f"locked_by={instance.locked_by}, lock_expires_at={instance.lock_expires_at}, "
-                f"current_time={current_time}, can_acquire={can_acquire}"
             )
-
-            if not can_acquire:
-                # Already locked by another worker
-                logger.debug(f"Lock acquisition failed: already locked by {instance.locked_by}")
+            row = result.one_or_none()
+            if row is None:
                 await session.commit()
                 return False
+            actual_timeout = int(row[0] if row[0] is not None else timeout_seconds)
 
-            # Acquire the lock and set expiry time
             lock_expires_at = current_time + timedelta(seconds=actual_timeout)
-            await session.execute(
+            result = await session.execute(
                 update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        or_(
+                            WorkflowInstance.locked_by.is_(None),
+                            WorkflowInstance.lock_expires_at < current_time,
+                        ),
+                    )
+                )
                 .values(
                     locked_by=worker_id,
                     locked_at=current_time,
@@ -1589,9 +1593,8 @@ class SQLAlchemyStorage:
                     updated_at=current_time,
                 )
             )
-
             await session.commit()
-            return True
+            return bool(result.rowcount and result.rowcount > 0)  # type: ignore[attr-defined]
 
     async def release_lock(self, instance_id: str, worker_id: str) -> None:
         """
@@ -1882,8 +1885,13 @@ class SQLAlchemyStorage:
         activity_id: str,
         event_type: str,
         event_data: dict[str, Any] | bytes,
+        lock_id: str | None = None,
     ) -> None:
-        """Append an event to workflow execution history."""
+        """Append an event to workflow execution history.
+
+        Fenced when lock_id is given: a guard update proves the caller still
+        holds ``locked_by == lock_id`` before the row is inserted.
+        """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             # Determine data type and storage columns
@@ -1895,6 +1903,25 @@ class SQLAlchemyStorage:
                 data_type = "json"
                 event_data_json = json.dumps(event_data)
                 event_data_bin = None
+
+            if lock_id is not None:
+                # Fenced write: prove we still hold the lock epoch before the
+                # history row becomes visible.
+                guard = await session.execute(
+                    update(WorkflowInstance)
+                    .where(
+                        and_(
+                            WorkflowInstance.instance_id == instance_id,
+                            WorkflowInstance.locked_by == lock_id,
+                        )
+                    )
+                    .values(updated_at=func.now())
+                )
+                if (guard.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                    from edda.locking import LockLostError
+
+                    await session.rollback()
+                    raise LockLostError(f"Lock lost for instance {instance_id}")
 
             history = WorkflowHistory(
                 instance_id=instance_id,
@@ -2313,23 +2340,35 @@ class SQLAlchemyStorage:
         # Explicitly begin transaction before SELECT FOR UPDATE
         # This ensures proper transaction isolation for SKIP LOCKED
         async with self._session_scope(session) as session, session.begin():
-            # 1. SELECT FOR UPDATE to lock rows (both 'pending' and 'failed' for retry)
+            # 1. SELECT FOR UPDATE to lock rows. Claims 'pending' and 'failed'
+            # (retry), plus 'processing' rows whose claim went stale — a
+            # crashed relayer must not strand events forever.
+            stale_before = datetime.now(UTC) - timedelta(seconds=OUTBOX_CLAIM_STALE_SECONDS)
             result = await session.execute(
                 select(OutboxEvent)
-                .where(OutboxEvent.status.in_(["pending", "failed"]))
+                .where(
+                    or_(
+                        OutboxEvent.status.in_(["pending", "failed"]),
+                        and_(
+                            OutboxEvent.status == "processing",
+                            func.coalesce(OutboxEvent.claimed_at, OutboxEvent.published_at)
+                            < stale_before,
+                        ),
+                    )
+                )
                 .order_by(OutboxEvent.created_at.asc())
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
             rows = result.scalars().all()
 
-            # 2. Mark as 'processing' to prevent duplicate fetches
+            # 2. Mark as 'processing' and stamp the claim time
             if rows:
                 event_ids = [row.event_id for row in rows]
                 await session.execute(
                     update(OutboxEvent)
                     .where(OutboxEvent.event_id.in_(event_ids))
-                    .values(status="processing")
+                    .values(status="processing", claimed_at=datetime.now(UTC))
                 )
 
             # 3. Return events (now with status='processing')
@@ -2359,7 +2398,7 @@ class SQLAlchemyStorage:
             await session.execute(
                 update(OutboxEvent)
                 .where(OutboxEvent.event_id == event_id)
-                .values(status="published", published_at=func.now())
+                .values(status="published", published_at=func.now(), claimed_at=None)
             )
             await self._commit_if_not_in_transaction(session)
 
@@ -2379,6 +2418,7 @@ class SQLAlchemyStorage:
                     status="failed",
                     retry_count=OutboxEvent.retry_count + 1,
                     last_error=error,
+                    claimed_at=None,
                 )
             )
             await self._commit_if_not_in_transaction(session)
@@ -2393,6 +2433,7 @@ class SQLAlchemyStorage:
                 .values(
                     status="failed",
                     last_error=error,
+                    claimed_at=None,
                 )
             )
             await self._commit_if_not_in_transaction(session)
@@ -2407,6 +2448,7 @@ class SQLAlchemyStorage:
                 .values(
                     status="invalid",
                     last_error=error,
+                    claimed_at=None,
                 )
             )
             await self._commit_if_not_in_transaction(session)
@@ -2421,6 +2463,7 @@ class SQLAlchemyStorage:
                 .values(
                     status="expired",
                     last_error=error,
+                    claimed_at=None,
                 )
             )
             await self._commit_if_not_in_transaction(session)
@@ -2954,6 +2997,80 @@ class SQLAlchemyStorage:
                 for row in result.fetchall()
             ]
 
+    async def claim_resumable_workflows(
+        self,
+        worker_id: str,
+        limit: int | None = None,
+        timeout_seconds: int = 300,
+    ) -> list[dict[str, Any]]:
+        """
+        Atomically claim resumable workflows (status='running', unlocked).
+
+        find_resumable_workflows + per-instance try_acquire_lock in one step:
+        candidates are selected with FOR UPDATE SKIP LOCKED (PostgreSQL/MySQL)
+        so concurrent resumption loops take disjoint batches, then claimed
+        with the caller's lock identity. Each returned row is already locked
+        by worker_id — the resumer must use that same identity for its writes
+        and release.
+
+        Args:
+            worker_id: Lock identity to stamp on claimed rows (use an
+                epoch-bearing identity so downstream writes are fenced)
+            limit: Max workflows to claim (default 10)
+            timeout_seconds: Lock lease in seconds
+
+        Returns:
+            List of claimed workflows (instance_id, workflow_name,
+            source_hash, status)
+        """
+        if limit is None:
+            limit = 10
+
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            now = datetime.now(UTC)
+            expires = now + timedelta(seconds=timeout_seconds)
+
+            result = await session.execute(
+                select(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.status == "running",
+                        WorkflowInstance.locked_by.is_(None),
+                        WorkflowInstance.framework == "python",
+                    )
+                )
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            rows = result.scalars().all()
+            if not rows:
+                await session.commit()
+                return []
+
+            instance_ids = [r.instance_id for r in rows]
+            await session.execute(
+                update(WorkflowInstance)
+                .where(WorkflowInstance.instance_id.in_(instance_ids))
+                .values(
+                    locked_by=worker_id,
+                    locked_at=now,
+                    lock_expires_at=expires,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+
+            return [
+                {
+                    "instance_id": r.instance_id,
+                    "workflow_name": r.workflow_name,
+                    "source_hash": r.source_hash,
+                    "status": r.status,
+                }
+                for r in rows
+            ]
+
     # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
     # -------------------------------------------------------------------------
@@ -3197,9 +3314,14 @@ class SQLAlchemyStorage:
         channel: str,
         activity_id: str | None = None,
         timeout_seconds: int | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.
+
+        Re-checks for pending messages inside the registration transaction:
+        if a message is already deliverable, the wait is NOT registered and
+        the instance stays running. This closes the missed-wakeup window
+        between the caller pending check and the wait registration.
 
         Args:
             instance_id: Workflow instance ID
@@ -3207,6 +3329,11 @@ class SQLAlchemyStorage:
             channel: Channel name being waited on
             activity_id: Current activity ID to record
             timeout_seconds: Optional timeout in seconds for the message wait
+
+        Returns:
+            True if the wait was registered, False if a pending message was
+            found inside the registration transaction (workflow left running,
+            lock released, so the resumable sweep replays into it).
 
         Raises:
             RuntimeError: If the worker doesn't hold the lock
@@ -3244,6 +3371,28 @@ class SQLAlchemyStorage:
             if subscription is None:
                 raise ValueError(f"Instance {instance_id} is not subscribed to channel {channel}")
 
+            # Re-check pending inside the tx. A publish committed between the
+            # caller check and this point must not leave the workflow
+            # sleeping on a message nobody will deliver again.
+            pending_check = await self._has_pending_channel_message(
+                session, instance_id, channel, subscription
+            )
+            if pending_check:
+                # Release the lock only; keep status='running' so the
+                # resumable-workflow sweep replays into the pending message.
+                await session.execute(
+                    update(WorkflowInstance)
+                    .where(WorkflowInstance.instance_id == instance_id)
+                    .values(
+                        locked_by=None,
+                        locked_at=None,
+                        lock_expires_at=None,
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+                await session.commit()
+                return False
+
             # Update subscription to mark as waiting
             current_time = datetime.now(UTC)
             subscription.activity_id = activity_id
@@ -3268,6 +3417,104 @@ class SQLAlchemyStorage:
             )
 
             await session.commit()
+            return True
+
+    async def _has_pending_channel_message(
+        self,
+        session: AsyncSession,
+        instance_id: str,
+        channel: str,
+        subscription: ChannelSubscription,
+    ) -> bool:
+        """True if a deliverable message exists for this subscription.
+
+        Must be called on the registration transaction session so the check
+        and the wait registration are atomic.
+        """
+        if subscription.mode == "broadcast":
+            cursor = subscription.cursor_message_id or 0
+            result = await session.execute(
+                select(ChannelMessage.id)
+                .where(
+                    and_(
+                        ChannelMessage.channel == channel,
+                        ChannelMessage.id > cursor,
+                    )
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+        # competing: same visibility rule as get_pending_channel_messages,
+        # a fresh claim by a different live instance hides the message.
+        stale_before = datetime.now(UTC) - timedelta(seconds=CHANNEL_CLAIM_STALE_SECONDS)
+        terminal_owners = select(WorkflowInstance.instance_id).where(
+            WorkflowInstance.status.in_(["completed", "failed", "cancelled"])
+        )
+        hidden_claims = select(ChannelMessageClaim.message_id).where(
+            and_(
+                ChannelMessageClaim.instance_id != instance_id,
+                ChannelMessageClaim.claimed_at >= stale_before,
+                ChannelMessageClaim.instance_id.not_in(terminal_owners),
+            )
+        )
+        result = await session.execute(
+            select(ChannelMessage.id)
+            .where(
+                and_(
+                    ChannelMessage.channel == channel,
+                    ChannelMessage.message_id.not_in(hidden_claims),
+                )
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def requeue_channel_waits_with_pending(self) -> int:
+        """Requeue 'waiting_for_message' workflows that have pending messages.
+
+        Backstop for the residual missed-wakeup race: under read-committed
+        isolation the waiting-subscriber scan of a publisher can still run
+        before the wait registration commits. Any instance left waiting while
+        a deliverable message exists is flipped back to running so the
+        resumable sweep replays it.
+
+        Returns:
+            Number of workflows requeued.
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                select(ChannelSubscription)
+                .join(
+                    WorkflowInstance,
+                    WorkflowInstance.instance_id == ChannelSubscription.instance_id,
+                )
+                .where(
+                    and_(
+                        WorkflowInstance.status == "waiting_for_message",
+                        WorkflowInstance.locked_by.is_(None),
+                        WorkflowInstance.framework == "python",
+                        ChannelSubscription.activity_id.isnot(None),
+                    )
+                )
+            )
+            waiting_subs = result.scalars().all()
+
+            requeued = 0
+            for sub in waiting_subs:
+                if await self._has_pending_channel_message(
+                    session, sub.instance_id, sub.channel, sub
+                ):
+                    await session.execute(
+                        update(WorkflowInstance)
+                        .where(WorkflowInstance.instance_id == sub.instance_id)
+                        .values(status="running", updated_at=datetime.now(UTC))
+                    )
+                    requeued += 1
+
+            await self._commit_if_not_in_transaction(session)
+            return requeued
 
     async def get_pending_channel_messages(
         self,
@@ -3317,14 +3564,26 @@ class SQLAlchemyStorage:
                     .order_by(ChannelMessage.published_at.asc())
                 )
             else:  # competing
-                # Get unclaimed messages (not in channel_message_claims)
-                subquery = select(ChannelMessageClaim.message_id)
+                # Hidden only when a *different live* instance holds a fresh
+                # claim. Own claims stay visible (replay drain), and stale or
+                # terminal-owner claims are reclaimable.
+                stale_before = datetime.now(UTC) - timedelta(seconds=CHANNEL_CLAIM_STALE_SECONDS)
+                terminal_owners = select(WorkflowInstance.instance_id).where(
+                    WorkflowInstance.status.in_(["completed", "failed", "cancelled"])
+                )
+                hidden_claims = select(ChannelMessageClaim.message_id).where(
+                    and_(
+                        ChannelMessageClaim.instance_id != instance_id,
+                        ChannelMessageClaim.claimed_at >= stale_before,
+                        ChannelMessageClaim.instance_id.not_in(terminal_owners),
+                    )
+                )
                 msg_result = await session.execute(
                     select(ChannelMessage)
                     .where(
                         and_(
                             ChannelMessage.channel == channel,
-                            ChannelMessage.message_id.not_in(subquery),
+                            ChannelMessage.message_id.not_in(hidden_claims),
                         )
                     )
                     .order_by(ChannelMessage.published_at.asc())
@@ -3355,33 +3614,60 @@ class SQLAlchemyStorage:
         """
         Claim a message for competing consumption.
 
-        Uses INSERT with conflict check to ensure only one subscriber claims.
+        Succeeds when the message is unclaimed, already claimed by this
+        instance (idempotent, refreshes claimed_at), or the existing claim is
+        stale (claimed_at older than CHANNEL_CLAIM_STALE_SECONDS) or owned by
+        a terminal workflow instance. This prevents an orphaned claim left by
+        a crashed consumer from hiding the message forever.
 
         Args:
-            message_id: Message ID to claim
+            message_id: Message UUID to claim
             instance_id: Workflow instance claiming the message
 
         Returns:
-            True if claim succeeded, False if already claimed
+            True if claim succeeded, False if another live instance holds it
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            try:
-                # Check if already claimed
-                result = await session.execute(
-                    select(ChannelMessageClaim).where(ChannelMessageClaim.message_id == message_id)
-                )
-                if result.scalar_one_or_none() is not None:
-                    return False  # Already claimed
+            now = datetime.now(UTC)
+            stale_before = now - timedelta(seconds=CHANNEL_CLAIM_STALE_SECONDS)
+            terminal_owners = select(WorkflowInstance.instance_id).where(
+                WorkflowInstance.status.in_(["completed", "failed", "cancelled"])
+            )
 
+            # Takeover path: same instance (idempotent), stale, or dead owner
+            result = await session.execute(
+                update(ChannelMessageClaim)
+                .where(
+                    and_(
+                        ChannelMessageClaim.message_id == message_id,
+                        or_(
+                            ChannelMessageClaim.instance_id == instance_id,
+                            ChannelMessageClaim.claimed_at < stale_before,
+                            ChannelMessageClaim.instance_id.in_(terminal_owners),
+                        ),
+                    )
+                )
+                .values(instance_id=instance_id, claimed_at=now)
+            )
+            await self._commit_if_not_in_transaction(session)
+            if result.rowcount and result.rowcount > 0:  # type: ignore[attr-defined]
+                return True
+
+            # Fresh claim (no existing row)
+            try:
                 claim = ChannelMessageClaim(
                     message_id=message_id,
                     instance_id=instance_id,
+                    claimed_at=now,
                 )
                 session.add(claim)
+                await session.flush()
                 await self._commit_if_not_in_transaction(session)
                 return True
             except Exception:
+                # Another claimant won the INSERT race
+                await session.rollback()
                 return False
 
     async def delete_channel_message(self, message_id: str) -> None:

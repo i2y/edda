@@ -12,6 +12,8 @@ Tests cover:
 - Multiple workers competing for messages
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 import pytest_asyncio
 
@@ -158,10 +160,11 @@ class TestCompetingModeMessageClaiming:
         # Worker1 claims the message
         await sqlite_storage.claim_channel_message(message_id, worker1)
 
-        # After claiming - neither worker sees the message as pending
+        # After claiming - the claim owner still sees the message (replay
+        # drain visibility), but other workers must not.
         pending1 = await sqlite_storage.get_pending_channel_messages(worker1, "jobs")
         pending2 = await sqlite_storage.get_pending_channel_messages(worker2, "jobs")
-        assert len(pending1) == 0
+        assert len(pending1) == 1
         assert len(pending2) == 0
 
 
@@ -430,3 +433,113 @@ class TestCompetingModeEdgeCases:
         assert len(pending) == 1
         assert pending[0]["metadata"]["priority"] == "high"
         assert pending[0]["metadata"]["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+class TestCompetingClaimTakeover:
+    """Claim takeover and orphan-claim recovery semantics."""
+
+    @pytest_asyncio.fixture
+    async def two_workers(self, sqlite_storage, create_test_instance):
+        workers = []
+        for i in (1, 2):
+            iid = f"takeover-worker-{i}"
+            await create_test_instance(
+                instance_id=iid,
+                workflow_name="takeover_wf",
+                owner_service="test-service",
+                input_data={},
+            )
+            await sqlite_storage.update_instance_status(iid, "running")
+            await sqlite_storage.subscribe_to_channel(iid, "jobs", "competing")
+            workers.append(iid)
+        return workers
+
+    async def _backdate_claim(self, sqlite_storage, message_id: str, seconds: int) -> None:
+        from sqlalchemy import update
+
+        from edda.storage.sqlalchemy_storage import ChannelMessageClaim
+
+        async with sqlite_storage.engine.begin() as conn:
+            await conn.execute(
+                update(ChannelMessageClaim)
+                .where(ChannelMessageClaim.message_id == message_id)
+                .values(claimed_at=datetime.now(UTC) - timedelta(seconds=seconds))
+            )
+
+    async def test_stale_claim_takeover(self, sqlite_storage, two_workers):
+        """A stale claim must not hide the message forever."""
+        w1, w2 = two_workers
+        mid = await sqlite_storage.publish_to_channel("jobs", {"t": 1}, None)
+
+        assert await sqlite_storage.claim_channel_message(mid, w1)
+        assert len(await sqlite_storage.get_pending_channel_messages(w2, "jobs")) == 0
+        # Owner still sees its own claim (replay drain)
+        assert len(await sqlite_storage.get_pending_channel_messages(w1, "jobs")) == 1
+
+        await self._backdate_claim(sqlite_storage, mid, 400)  # > 300s staleness
+
+        assert len(await sqlite_storage.get_pending_channel_messages(w2, "jobs")) == 1
+        assert await sqlite_storage.claim_channel_message(mid, w2)
+
+    async def test_terminal_owner_takeover(self, sqlite_storage, two_workers):
+        """Claims owned by terminal instances are reclaimable."""
+        w1, w2 = two_workers
+        mid = await sqlite_storage.publish_to_channel("jobs", {"t": 2}, None)
+        assert await sqlite_storage.claim_channel_message(mid, w1)
+
+        await sqlite_storage.update_instance_status(w1, "completed")
+
+        assert len(await sqlite_storage.get_pending_channel_messages(w2, "jobs")) == 1
+        assert await sqlite_storage.claim_channel_message(mid, w2)
+
+    async def test_fresh_claim_blocks_takeover(self, sqlite_storage, two_workers):
+        """A fresh claim by a live instance cannot be taken over."""
+        w1, w2 = two_workers
+        mid = await sqlite_storage.publish_to_channel("jobs", {"t": 3}, None)
+        assert await sqlite_storage.claim_channel_message(mid, w1)
+        assert not await sqlite_storage.claim_channel_message(mid, w2)
+
+    async def test_same_instance_reclaim_idempotent(self, sqlite_storage, two_workers):
+        """Re-claiming your own claim succeeds (replay drain)."""
+        w1, _ = two_workers
+        mid = await sqlite_storage.publish_to_channel("jobs", {"t": 4}, None)
+        assert await sqlite_storage.claim_channel_message(mid, w1)
+        assert await sqlite_storage.claim_channel_message(mid, w1)
+
+    async def test_requeue_waits_with_pending(self, sqlite_storage, create_test_instance):
+        """The sweep flips waiting workflows with pending messages back to running."""
+        iid = "requeue-inst"
+        await create_test_instance(instance_id=iid, workflow_name="requeue_wf", input_data={})
+        await sqlite_storage.update_instance_status(iid, "running")
+        await sqlite_storage.subscribe_to_channel(iid, "jobs", "competing")
+        await sqlite_storage.try_acquire_lock(iid, "worker-x")
+        assert await sqlite_storage.register_channel_receive_and_release_lock(
+            iid, "worker-x", "jobs", activity_id="act-1"
+        )
+        inst = await sqlite_storage.get_instance(iid)
+        assert inst["status"] == "waiting_for_message"
+
+        # A message published after the wait registration leaves the wait
+        # stranded (residual race) — the sweep must requeue it.
+        await sqlite_storage.publish_to_channel("jobs", {"late": True}, None)
+        assert await sqlite_storage.requeue_channel_waits_with_pending() == 1
+        inst = await sqlite_storage.get_instance(iid)
+        assert inst["status"] == "running"
+
+    async def test_register_skips_wait_when_pending(self, sqlite_storage, create_test_instance):
+        """Register must not sleep when a pending message already exists."""
+        iid = "reg-skip-inst"
+        await create_test_instance(instance_id=iid, workflow_name="reg_wf", input_data={})
+        await sqlite_storage.update_instance_status(iid, "running")
+        await sqlite_storage.subscribe_to_channel(iid, "jobs", "competing")
+        await sqlite_storage.publish_to_channel("jobs", {"early": True}, None)
+
+        await sqlite_storage.try_acquire_lock(iid, "worker-x")
+        registered = await sqlite_storage.register_channel_receive_and_release_lock(
+            iid, "worker-x", "jobs", activity_id="act-1"
+        )
+        assert registered is False
+        inst = await sqlite_storage.get_instance(iid)
+        assert inst["status"] == "running"  # stays resumable
+        assert inst["locked_by"] is None

@@ -16,7 +16,7 @@ from typing import Any
 from edda.channels import WaitForChannelMessageException, WaitForTimerException
 from edda.compensation import execute_compensations
 from edda.context import WorkflowContext
-from edda.locking import workflow_lock
+from edda.locking import LockLostError, new_lock_identity, workflow_lock
 from edda.pydantic_utils import (
     enum_value_to_enum,
     extract_enum_from_annotation,
@@ -199,7 +199,8 @@ class ReplayEngine:
         )
 
         # Execute the workflow with distributed lock
-        async with workflow_lock(self.storage, instance_id, self.worker_id):
+        lock_id = new_lock_identity(self.worker_id)
+        async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
             # Create context for new execution
             ctx = WorkflowContext(
                 instance_id=instance_id,
@@ -208,6 +209,7 @@ class ReplayEngine:
                 worker_id=self.worker_id,
                 is_replaying=False,
                 hooks=self.hooks,
+                lock_id=lock_id,
             )
             # Set default retry policy for activity resolution
             ctx._app_retry_policy = self.default_retry_policy
@@ -262,7 +264,7 @@ class ReplayEngine:
                 # This ensures deterministic replay: the timer expiration time never changes
                 await self.storage.register_timer_subscription_and_release_lock(
                     instance_id=instance_id,
-                    worker_id=self.worker_id,
+                    worker_id=lock_id,
                     timer_id=exc.timer_id,
                     expires_at=exc.expires_at,
                     activity_id=exc.activity_id,
@@ -288,7 +290,7 @@ class ReplayEngine:
                 # so ANY worker can resume the workflow when the message arrives
                 await self.storage.register_channel_receive_and_release_lock(
                     instance_id=instance_id,
-                    worker_id=self.worker_id,
+                    worker_id=lock_id,
                     channel=exc.channel,
                     activity_id=exc.activity_id,
                     timeout_seconds=exc.timeout_seconds,
@@ -375,6 +377,7 @@ class ReplayEngine:
                 }
 
                 await self.storage.append_history(
+                    lock_id=lock_id,
                     instance_id=instance_id,
                     activity_id="workflow_failed",
                     event_type="WorkflowFailed",
@@ -396,6 +399,7 @@ class ReplayEngine:
         workflow_func: Callable[..., Any],
         _event: Any = None,
         already_locked: bool = False,
+        lock_id: str | None = None,
     ) -> None:
         """
         Resume a workflow instance (with replay).
@@ -428,18 +432,34 @@ class ReplayEngine:
 
         # Execute the workflow logic with or without lock acquisition
         if already_locked:
-            # Lock already held by caller (distributed coroutine pattern)
-            await self._execute_workflow_logic(instance, instance_id, workflow_func)
+            # Lock already held by caller (distributed coroutine pattern).
+            # lock_id must be the identity used for that claim so fenced
+            # writes match.
+            try:
+                await self._execute_workflow_logic(
+                    instance, instance_id, workflow_func, lock_id=lock_id
+                )
+            except LockLostError:
+                logger.warning("Lock lost during resume of %s; new owner continues", instance_id)
         else:
-            # Acquire lock for this workflow
-            async with workflow_lock(self.storage, instance_id, self.worker_id):
-                await self._execute_workflow_logic(instance, instance_id, workflow_func)
+            # Acquire lock for this workflow under a fresh epoch identity
+            lock_id = new_lock_identity(self.worker_id)
+            async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
+                try:
+                    await self._execute_workflow_logic(
+                        instance, instance_id, workflow_func, lock_id=lock_id
+                    )
+                except LockLostError:
+                    logger.warning(
+                        "Lock lost during resume of %s; new owner continues", instance_id
+                    )
 
     async def _execute_workflow_logic(
         self,
         instance: dict[str, Any],
         instance_id: str,
         workflow_func: Callable[..., Any],
+        lock_id: str | None = None,
     ) -> None:
         """
         Execute workflow logic (factored out to support both locked and unlocked execution).
@@ -449,6 +469,9 @@ class ReplayEngine:
             instance_id: Workflow instance ID
             workflow_func: The workflow function to execute
         """
+        # Default to process worker_id for legacy claim paths that locked
+        # under the plain worker id (e.g. storage-level deliver).
+        lock_id = lock_id or self.worker_id
         # Create context for replay
         workflow_name = instance["workflow_name"]
         ctx = WorkflowContext(
@@ -458,6 +481,7 @@ class ReplayEngine:
             worker_id=self.worker_id,
             is_replaying=True,
             hooks=self.hooks,
+            lock_id=lock_id,
         )
         # Set default retry policy for activity resolution
         ctx._app_retry_policy = self.default_retry_policy
@@ -498,7 +522,7 @@ class ReplayEngine:
             # This ensures deterministic replay: the timer expiration time never changes
             await self.storage.register_timer_subscription_and_release_lock(
                 instance_id=instance_id,
-                worker_id=self.worker_id,
+                worker_id=lock_id,
                 timer_id=exc.timer_id,
                 expires_at=exc.expires_at,
                 activity_id=exc.activity_id,
@@ -512,7 +536,7 @@ class ReplayEngine:
             # Atomically register channel receive and release lock (distributed coroutines)
             await self.storage.register_channel_receive_and_release_lock(
                 instance_id=instance_id,
-                worker_id=self.worker_id,
+                worker_id=lock_id,
                 channel=exc.channel,
                 activity_id=exc.activity_id,
                 timeout_seconds=exc.timeout_seconds,
@@ -599,6 +623,7 @@ class ReplayEngine:
             }
 
             await self.storage.append_history(
+                lock_id=lock_id,
                 instance_id=instance_id,
                 activity_id="workflow_failed",
                 event_type="WorkflowFailed",
@@ -614,7 +639,11 @@ class ReplayEngine:
             raise
 
     async def resume_by_name(
-        self, instance_id: str, workflow_name: str, already_locked: bool = False
+        self,
+        instance_id: str,
+        workflow_name: str,
+        already_locked: bool = False,
+        lock_id: str | None = None,
     ) -> None:
         """
         Resume a workflow by its name (convenience method for auto-recovery).
@@ -647,7 +676,10 @@ class ReplayEngine:
 
         # Resume using the workflow function from the workflow
         await self.resume_workflow(
-            instance_id=instance_id, workflow_func=workflow_obj.func, already_locked=already_locked
+            instance_id=instance_id,
+            workflow_func=workflow_obj.func,
+            already_locked=already_locked,
+            lock_id=lock_id,
         )
 
     async def _start_recurred_workflow(
@@ -709,7 +741,8 @@ class ReplayEngine:
         )
 
         # Execute the new workflow with distributed lock
-        async with workflow_lock(self.storage, new_instance_id, self.worker_id):
+        lock_id = new_lock_identity(self.worker_id)
+        async with workflow_lock(self.storage, new_instance_id, lock_id, refresh_interval=60):
             # Create context for new execution
             ctx = WorkflowContext(
                 instance_id=new_instance_id,
@@ -718,6 +751,7 @@ class ReplayEngine:
                 worker_id=self.worker_id,
                 is_replaying=False,
                 hooks=self.hooks,
+                lock_id=lock_id,
             )
             # Set default retry policy for activity resolution
             ctx._app_retry_policy = self.default_retry_policy
@@ -808,6 +842,7 @@ class ReplayEngine:
                 }
 
                 await self.storage.append_history(
+                    lock_id=lock_id,
                     instance_id=new_instance_id,
                     activity_id="workflow_failed",
                     event_type="WorkflowFailed",
@@ -846,7 +881,8 @@ class ReplayEngine:
             raise ValueError(f"Workflow instance {instance_id} not found")
 
         # Acquire lock
-        async with workflow_lock(self.storage, instance_id, self.worker_id):
+        lock_id = new_lock_identity(self.worker_id)
+        async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
             # Create context
             ctx = WorkflowContext(
                 instance_id=instance_id,
@@ -912,9 +948,10 @@ class ReplayEngine:
         # Try to acquire lock with short timeout (5 seconds)
         # If the workflow is actively executing, we may not be able to get the lock
         try:
+            lock_id = new_lock_identity(self.worker_id)
             lock_acquired = await self.storage.try_acquire_lock(
                 instance_id=instance_id,
-                worker_id=self.worker_id,
+                worker_id=lock_id,
                 timeout_seconds=5,
             )
 
@@ -939,6 +976,7 @@ class ReplayEngine:
                     worker_id=self.worker_id,
                     is_replaying=False,
                     hooks=self.hooks,
+                    lock_id=lock_id,
                 )
                 # Set default retry policy for activity resolution
                 ctx._app_retry_policy = self.default_retry_policy
@@ -954,7 +992,7 @@ class ReplayEngine:
 
             finally:
                 # Always release the lock
-                await self.storage.release_lock(instance_id, self.worker_id)
+                await self.storage.release_lock(instance_id, lock_id)
 
         except Exception as error:
             # Log error but don't propagate
@@ -979,9 +1017,10 @@ class ReplayEngine:
 
         try:
             # Acquire lock
+            lock_id = new_lock_identity(self.worker_id)
             locked = await self.storage.try_acquire_lock(
                 instance_id=instance_id,
-                worker_id=self.worker_id,
+                worker_id=lock_id,
                 timeout_seconds=300,
             )
 
@@ -1025,6 +1064,7 @@ class ReplayEngine:
                     worker_id=self.worker_id,
                     is_replaying=False,
                     hooks=self.hooks,
+                    lock_id=lock_id,
                 )
                 # Set default retry policy for activity resolution
                 ctx._app_retry_policy = self.default_retry_policy
@@ -1048,7 +1088,7 @@ class ReplayEngine:
 
             finally:
                 # Always release the lock
-                await self.storage.release_lock(instance_id, self.worker_id)
+                await self.storage.release_lock(instance_id, lock_id)
 
         except Exception as error:
             # Log error but don't propagate

@@ -19,6 +19,24 @@ from edda.storage.protocol import StorageProtocol
 logger = logging.getLogger(__name__)
 
 
+def new_lock_identity(worker_id: str) -> str:
+    """
+    Generate an epoch-bearing lock-holder identity.
+
+    Every lock acquisition epoch gets a fresh identity ``worker_id#<random>``,
+    so a lease lost and re-acquired by the *same* worker is a different
+    holder. All lock writes compare ``locked_by`` for exact equality, which
+    makes them fenced writes with no schema change.
+
+    Args:
+        worker_id: Process-level worker identifier
+
+    Returns:
+        Epoch-scoped lock identity (``worker_id#<hex>``)
+    """
+    return f"{worker_id}#{uuid.uuid4().hex[:16]}"
+
+
 def generate_worker_id(service_name: str) -> str:
     """
     Generate a unique worker ID for this process.
@@ -138,12 +156,17 @@ async def workflow_lock(
         raise RuntimeError(f"Failed to acquire lock for instance {instance_id}")
 
     refresh_task: asyncio.Task[Any] | None = None
+    owner_task = asyncio.current_task()
 
     try:
-        # Start lock refresh task if requested
+        # Start lock refresh task if requested. If the lock is lost the
+        # heartbeat task cancels the workflow execution task so a stale
+        # runner cannot keep working without the lease.
         if refresh_interval is not None:
             refresh_task = asyncio.create_task(
-                _refresh_lock_periodically(storage, instance_id, worker_id, refresh_interval)
+                _refresh_lock_periodically(
+                    storage, instance_id, worker_id, refresh_interval, owner_task
+                )
             )
 
         yield
@@ -164,17 +187,20 @@ async def _refresh_lock_periodically(
     instance_id: str,
     worker_id: str,
     interval: float,
+    owner_task: asyncio.Task[Any] | None = None,
 ) -> None:
     """
     Periodically refresh a lock to prevent timeout.
 
     This is a background task that runs while a workflow is executing.
+    On lock loss it cancels owner_task (the workflow run) when provided.
 
     Args:
         storage: Storage backend
         instance_id: Workflow instance
         worker_id: Unique worker identifier
         interval: Refresh interval in seconds
+        owner_task: Task to cancel if the lock is lost
     """
     with suppress(asyncio.CancelledError):
         while True:
@@ -183,7 +209,10 @@ async def _refresh_lock_periodically(
             # Refresh the lock
             success = await storage.refresh_lock(instance_id, worker_id)
             if not success:
-                # Lock was lost - this shouldn't happen in normal operation
+                # Lock was lost - cancel the workflow run so a stale runner
+                # cannot keep executing without the lease.
+                if owner_task is not None:
+                    owner_task.cancel()
                 raise RuntimeError(
                     f"Lost lock for instance {instance_id} during refresh. "
                     "Workflow execution may be compromised."
@@ -264,6 +293,16 @@ async def auto_resume_stale_workflows_periodically(
             await asyncio.sleep(interval + jitter)
 
             try:
+                # Backstop: requeue channel waits stranded by the residual
+                # missed-wakeup race (publisher scan ran before the wait
+                # registration committed).
+                try:
+                    requeued = await storage.requeue_channel_waits_with_pending()
+                    if requeued:
+                        logger.info("Requeued %d channel wait(s) with pending messages", requeued)
+                except Exception as e:
+                    logger.error("Failed to requeue channel waits: %s", e, exc_info=True)
+
                 # Clean up stale locks and get workflows to resume
                 workflows_to_resume = await storage.cleanup_stale_locks()
 
