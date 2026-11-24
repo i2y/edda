@@ -18,7 +18,7 @@ activity body runs via ``anyio.to_thread`` — call these via
 ``anyio.from_thread.run`` or prefer async activity functions.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from edda.actors import check_capability
 from edda.exceptions import FSForbiddenError, FSOutsideActivityError
@@ -80,6 +80,23 @@ async def fs_write(
     _check_activity(ctx)
     await _authorize(ctx, path, capability_token)
     await ctx.storage.fs_put(path, data, ctx.instance_id, expected_version)
+
+
+async def fs_list(ctx: "WorkflowContext", prefix: str) -> list[dict[str, Any]]:
+    """
+    List FS objects whose path starts with prefix, ordered by path.
+    Metadata-only (path/owner/version — no data). Permission rules follow
+    fs_read: an actor may only list its own /actor/{id}/ space; /shared/
+    is open.
+    """
+    _check_activity(ctx)
+    if prefix.startswith("/actor/"):
+        owner = prefix[len("/actor/") :].split("/", 1)[0]
+        if owner != ctx.instance_id:
+            raise FSForbiddenError("cannot list another actor's private space")
+    elif not prefix.startswith("/shared"):
+        raise FSForbiddenError("prefix must be under /actor/{id}/ or /shared/")
+    return await ctx.storage.fs_list(prefix)
 
 
 async def fs_delete(

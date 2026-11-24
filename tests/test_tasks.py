@@ -90,3 +90,38 @@ async def test_task_event_stream_and_get_task(sqlite_storage, create_test_instan
         "task_id": "t1",
         "state": "done",
     }
+
+
+@pytest.mark.asyncio
+async def test_reclaim_stale_tasks(sqlite_storage, create_test_instance):
+    await create_test_instance("wf-r1", "wf", {})
+    await create_test_instance("wf-r2", "wf", {})
+
+    await sqlite_storage.post_task("tr1", "tasks:r", '{}')
+    await sqlite_storage.post_task("tr2", "tasks:r", '{}')
+    assert (await sqlite_storage.claim_task("tasks:r", "wf-r1"))["id"] == "tr1"
+    assert (await sqlite_storage.claim_task("tasks:r", "wf-r2"))["id"] == "tr2"
+
+    # attempts incremented on claim
+    assert (await sqlite_storage.get_task("tr1"))["attempts"] == 1
+
+    # fresh claims are not stale
+    assert await sqlite_storage.reclaim_stale_tasks(3600) == 0
+
+    # backdate tr1's claimed_at to simulate an orphaned claim
+    from sqlalchemy import text
+
+    session = sqlite_storage._get_session_for_operation()
+    async with sqlite_storage._session_scope(session) as session:
+        await session.execute(
+            text("UPDATE actor_tasks SET claimed_at = :c WHERE id = 'tr1'"),
+            {"c": "2000-01-01 00:00:00"},
+        )
+        await session.commit()
+
+    assert await sqlite_storage.reclaim_stale_tasks(3600) == 1
+    t = await sqlite_storage.get_task("tr1")
+    assert t["state"] == "open" and t["claimed_by"] is None
+    # fresh claim untouched
+    t2 = await sqlite_storage.get_task("tr2")
+    assert t2["state"] == "claimed" and t2["claimed_by"] == "wf-r2"

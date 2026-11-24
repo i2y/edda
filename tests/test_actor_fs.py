@@ -70,3 +70,24 @@ async def test_fs_permissions(sqlite_storage):
     # bad path rejected
     with pytest.raises(FSForbiddenError):
         await fs.fs_write(me, "/etc/passwd", b"x", 0)
+
+
+@pytest.mark.asyncio
+async def test_fs_list(sqlite_storage):
+    await sqlite_storage.fs_put("/actor/wf-1/a.txt", b"x", "wf-1", 0)
+    await sqlite_storage.fs_put("/actor/wf-1/b.txt", b"x", "wf-1", 0)
+    await sqlite_storage.fs_put("/actor/wf-2/c.txt", b"x", "wf-2", 0)
+    await sqlite_storage.fs_put("/shared/pub/x.txt", b"x", "wf-1", 0)
+
+    lst = await sqlite_storage.fs_list("/actor/wf-1/")
+    assert [o["path"] for o in lst] == ["/actor/wf-1/a.txt", "/actor/wf-1/b.txt"]
+    assert lst[0]["version"] == 1 and lst[0]["owner"] == "wf-1"
+    assert "data" not in lst[0]
+
+    assert len(await sqlite_storage.fs_list("/shared/")) == 1
+    assert await sqlite_storage.fs_list("/actor/nope/") == []
+
+    # LIKE metachars in prefix are matched literally
+    await sqlite_storage.fs_put("/shared/100%/real", b"x", "wf-1", 0)
+    lst = await sqlite_storage.fs_list("/shared/100%/")
+    assert [o["path"] for o in lst] == ["/shared/100%/real"]

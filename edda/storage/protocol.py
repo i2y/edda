@@ -962,12 +962,20 @@ class StorageProtocol(Protocol):
         """Delete path (expected 0 = unconditional, >0 = version-checked)."""
         ...
 
+    async def fs_list(self, prefix: str) -> list[dict[str, Any]]:
+        """Return FS objects (path/owner/version — no data) under prefix."""
+        ...
+
     async def post_task(self, task_id: str, channel: str, data: str) -> None:
         """Insert a new open task on a channel."""
         ...
 
     async def get_task(self, task_id: str) -> dict[str, Any] | None:
         """Return the task by ID, or None."""
+        ...
+
+    async def reclaim_stale_tasks(self, max_age_seconds: int) -> int:
+        """Return 'claimed' tasks older than max_age_seconds to 'open'."""
         ...
 
     async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:

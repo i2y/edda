@@ -52,6 +52,15 @@ CHANNEL_CLAIM_STALE_SECONDS = 300
 # reclaim it. Aligned with the workflow lock lease (300s).
 OUTBOX_CLAIM_STALE_SECONDS = 300
 
+# How old an actor_tasks 'claimed' row must be before the leader sweep
+# returns it to 'open' (orphaned by a crashed claimant).
+TASK_CLAIM_STALE_SECONDS = 300
+
+
+def _like_escape(s: str) -> str:
+    """Escape LIKE wildcards (and the escape char itself) for ESCAPE '\\'."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 # Declarative base for ORM models
 class Base(DeclarativeBase):
@@ -2500,7 +2509,7 @@ class SQLAlchemyStorage:
                 )
             )
             await self._commit_if_not_in_transaction(session)
-            return int(getattr(result, "rowcount", 0) or 0)  # type: ignore[attr-defined]
+            return int(getattr(result, "rowcount", 0) or 0)
 
     # -------------------------------------------------------------------------
     # Workflow Cancellation Methods
@@ -3369,6 +3378,21 @@ class SQLAlchemyStorage:
             if expected_version > 0 and getattr(result, "rowcount", 0) == 0:
                 raise FSConflictError(f"actor_fs version conflict: {path}")
             await self._commit_if_not_in_transaction(session)
+
+    async def fs_list(self, prefix: str) -> list[dict[str, Any]]:
+        """Return FS objects (path/owner/version — no data) under prefix."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT path, owner, version FROM actor_fs "
+                        "WHERE path LIKE :p ESCAPE '\\' ORDER BY path"
+                    ),
+                    {"p": _like_escape(prefix) + "%"},
+                )
+            ).all()
+            return [{"path": r[0], "owner": r[1], "version": r[2]} for r in rows]
 
     async def get_blob_info(self, hash: str) -> dict[str, Any] | None:
         """Return blob metadata (size_bytes/created_by/created_at), or None."""
@@ -4345,7 +4369,7 @@ class SQLAlchemyStorage:
             row = (
                 await session.execute(
                     text(
-                        "SELECT id, channel, data, state, claimed_by, result "
+                        "SELECT id, channel, data, state, claimed_by, result, attempts "
                         "FROM actor_tasks WHERE id = :i"
                     ),
                     {"i": task_id},
@@ -4360,7 +4384,29 @@ class SQLAlchemyStorage:
                 "state": row[3],
                 "claimed_by": row[4],
                 "result": row[5],
+                "attempts": row[6],
             }
+
+    async def reclaim_stale_tasks(self, max_age_seconds: int) -> int:
+        """Return 'claimed' tasks older than max_age_seconds to 'open'.
+
+        Orphan reclaim: a claimant that crashed mid-task leaves the row in
+        'claimed' forever; the leader sweep calls this so the task becomes
+        claimable again.
+        """
+        cutoff = datetime.now(UTC) - timedelta(seconds=max_age_seconds)
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            res = await session.execute(
+                text(
+                    "UPDATE actor_tasks SET state = 'open', claimed_by = NULL, "
+                    "claimed_at = NULL, updated_at = :u "
+                    "WHERE state = 'claimed' AND claimed_at < :c"
+                ),
+                {"u": datetime.now(UTC), "c": cutoff},
+            )
+            await self._commit_if_not_in_transaction(session)
+            return res.rowcount or 0  # type: ignore[attr-defined]
 
     async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:
         """Atomically claim the oldest open task on channel for claimant."""
@@ -4370,7 +4416,7 @@ class SQLAlchemyStorage:
                 result = await session.execute(
                     text(
                         "UPDATE actor_tasks SET state = 'claimed', claimed_by = :w, "
-                        "updated_at = :u "
+                        "claimed_at = :u, attempts = attempts + 1, updated_at = :u "
                         "WHERE id = ("
                         "  SELECT id FROM ("
                         "    SELECT id FROM actor_tasks "
@@ -4457,7 +4503,7 @@ class SQLAlchemyStorage:
     async def list_tasks(self, channel: str, state: str | None = None) -> list[dict[str, Any]]:
         """Return tasks on channel filtered by state (None = all)."""
         query = (
-            "SELECT id, channel, data, state, claimed_by, result "
+            "SELECT id, channel, data, state, claimed_by, result, attempts "
             "FROM actor_tasks WHERE channel = :c"
         )
         params: dict[str, Any] = {"c": channel}
@@ -4476,6 +4522,7 @@ class SQLAlchemyStorage:
                     "state": r[3],
                     "claimed_by": r[4],
                     "result": r[5],
+                    "attempts": r[6],
                 }
                 for r in rows
             ]

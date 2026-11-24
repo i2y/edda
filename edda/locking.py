@@ -315,6 +315,15 @@ async def auto_resume_stale_workflows_periodically(
                 except Exception as e:
                     logger.error("Failed to emit actor DOWN notifications: %s", e, exc_info=True)
 
+                # Orphan-task reclaim: 'claimed' rows older than the lock
+                # lease were abandoned by a crashed claimant — reopen them.
+                try:
+                    reclaimed = await storage.reclaim_stale_tasks(300)
+                    if reclaimed:
+                        logger.info("Reclaimed %d stale task(s)", reclaimed)
+                except Exception as e:
+                    logger.error("Failed to reclaim stale tasks: %s", e, exc_info=True)
+
                 # Clean up stale locks and get workflows to resume
                 workflows_to_resume = await storage.cleanup_stale_locks()
 
