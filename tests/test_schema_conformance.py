@@ -37,6 +37,7 @@ SHARED_TABLES = [
     "actor_capabilities",
     "payload_blobs",
     "actor_fs",
+    "actor_tasks",
 ]
 
 
