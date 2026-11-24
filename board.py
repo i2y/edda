@@ -39,6 +39,7 @@ td{vertical-align:top;padding:4px 8px;border-top:1px solid #21262d}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 #f8514966}50%{box-shadow:0 0 0 4px #f8514900}}
 @keyframes flash{0%{background:#1f6feb55}100%{background:#161b22}}
 .card.flash{animation:flash 1.2s ease-out}
+.att{color:#d29922;font-weight:600}
 .age{border-radius:8px;padding:0 6px;font-size:10px;margin-left:4px}
 .age.ok{background:#30363d;color:#8b949e}.age.warn{background:#d2992233;color:#d29922}
 .age.stale{background:#f8514933;color:#f85149;font-weight:bold}
@@ -61,10 +62,10 @@ const ageCls=m=>m<5?'ok':m<15?'warn':'stale';
 const card=t=>{
  const hot=changed.has(t.id)?' flash':'';
  let badge='';
- if(t.state==='claimed'){const a=ageMin(t.updated_at);
+ if(t.state==='claimed'){const a=ageMin(t.claimed_at||t.updated_at);
   if(a!==null)badge=` <span class="age ${ageCls(a)}">${fmtAge(a)}</span>`;}
  return `<div class="card ${t.state}${hot}"><span class="id">${esc(t.id)}</span>${badge}
- <span class="meta">${esc(t.claimed_by||'')}</span>
+ <span class="meta">${esc(t.claimed_by||'')}${t.attempts>1?` <span class="att">×${t.attempts}</span>`:''}</span>
  <div class="data">${esc((t.data||'').slice(0,200))}${t.result?' ⇒ '+esc(String(t.result).slice(0,100)):''}</div>
  <div class="ts">${esc(t.updated_at||t.created_at||'')}</div></div>`};
 const evLine=m=>{
@@ -139,7 +140,8 @@ class Handler(BaseHTTPRequestHandler):
 
             tasks = rows(
                 "SELECT id, channel, data, state, claimed_by, result, "
-                "created_at, updated_at FROM actor_tasks ORDER BY created_at"
+                "attempts, claimed_at, created_at, updated_at "
+                "FROM actor_tasks ORDER BY created_at"
             )
             channels = {}
             for t in tasks:

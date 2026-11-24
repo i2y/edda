@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mermaid 11 hexagon parens probe</title>
+  <style>
+    body { font-family: ui-sans-serif, sans-serif; margin: 24px; max-width: 960px; }
+    section { border: 1px solid #ddd; padding: 12px; margin: 12px 0; border-radius: 6px; }
+    h2 { margin: 0 0 8px 0; font-size: 14px; }
+    pre { background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Mermaid 11 hexagon syntax probe</h1>
+  <p>
+    Verifies whether mermaid 11.12.0 accepts <code>(</code>/<code>)</code>
+    inside an unquoted hexagon node label, and whether the quoted form
+    <code>id{{"label"}}</code> renders the same label cleanly.
+  </p>
+
+  <section>
+    <h2>A. Unquoted hexagon, no parens (baseline — should render)</h2>
+    <pre>flowchart TD
+    A{{wait_event:&lt;br/&gt;payment.completed&lt;br/&gt;timeout: 300s}}</pre>
+    <div class="mermaid">
+flowchart TD
+    A{{wait_event:&lt;br/&gt;payment.completed&lt;br/&gt;timeout: 300s}}
+    </div>
+  </section>
+
+  <section>
+    <h2>B. Unquoted hexagon WITH parens (current bug repro)</h2>
+    <pre>flowchart TD
+    B{{wait_event:&lt;br/&gt;fworkflow.continue:(user_id)&lt;br/&gt;timeout: 600s}}</pre>
+    <div class="mermaid">
+flowchart TD
+    B{{wait_event:&lt;br/&gt;fworkflow.continue:(user_id)&lt;br/&gt;timeout: 600s}}
+    </div>
+  </section>
+
+  <section>
+    <h2>C. Quoted hexagon WITH parens (proposed fix)</h2>
+    <pre>flowchart TD
+    C{{"wait_event:&lt;br/&gt;fworkflow.continue:(user_id)&lt;br/&gt;timeout: 600s"}}</pre>
+    <div class="mermaid">
+flowchart TD
+    C{{"wait_event:&lt;br/&gt;fworkflow.continue:(user_id)&lt;br/&gt;timeout: 600s"}}
+    </div>
+  </section>
+
+  <section>
+    <h2>D. Quoted hexagon keeping original braces (alt fix)</h2>
+    <pre>flowchart TD
+    D{{"wait_event:&lt;br/&gt;f'workflow.continue:{user_id}'&lt;br/&gt;timeout: 600s"}}</pre>
+    <div class="mermaid">
+flowchart TD
+    D{{"wait_event:&lt;br/&gt;f'workflow.continue:{user_id}'&lt;br/&gt;timeout: 600s"}}
+    </div>
+  </section>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, securityLevel: "loose" });
+  </script>
+</body>
+</html>
