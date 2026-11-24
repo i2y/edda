@@ -23,7 +23,7 @@ PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>actor board</title>
 <style>
 body{font:13px -apple-system,monospace;background:#0d1117;color:#c9d1d9;margin:0;padding:16px}
-h1{font-size:15px;margin:0 0 12px}h2{font-size:12px;color:#8b949e;margin:18px 0 6px}
+h1{font-size:15px;margin:0 0 8px}h2{font-size:12px;color:#8b949e;margin:18px 0 6px}
 table{border-collapse:collapse;width:100%}
 th{color:#8b949e;text-align:left;padding:4px 8px;font-weight:normal}
 td{vertical-align:top;padding:4px 8px;border-top:1px solid #21262d}
@@ -33,20 +33,64 @@ td{vertical-align:top;padding:4px 8px;border-top:1px solid #21262d}
 .open{border-left:3px solid #8b949e}.claimed{border-left:3px solid #d29922}
 .done{border-left:3px solid #3fb950}.failed{border-left:3px solid #f85149}
 .chan{color:#f0883e}.empty{color:#484f58}.ts{color:#8b949e;font-size:11px}
+.pill{display:inline-block;border:1px solid #30363d;border-radius:10px;padding:1px 10px;margin-right:8px;font-size:12px}
+.pill.open{color:#8b949e}.pill.claimed{color:#d29922}.pill.done{color:#3fb950}.pill.failed{color:#f85149}
+.pill.failed.hot{border-color:#f85149;background:#f8514922;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 #f8514966}50%{box-shadow:0 0 0 4px #f8514900}}
+@keyframes flash{0%{background:#1f6feb55}100%{background:#161b22}}
+.card.flash{animation:flash 1.2s ease-out}
+.age{border-radius:8px;padding:0 6px;font-size:10px;margin-left:4px}
+.age.ok{background:#30363d;color:#8b949e}.age.warn{background:#d2992233;color:#d29922}
+.age.stale{background:#f8514933;color:#f85149;font-weight:bold}
+.ev{padding:2px 0;font-size:12px}.ev .icon{display:inline-block;width:16px;text-align:center}
+.ev.posted .icon{color:#8b949e}.ev.claimed .icon{color:#d29922}.ev.done .icon{color:#3fb950}
+.ev.failed .icon{color:#f85149}.ev.other .icon{color:#484f58}
 </style></head><body>
 <h1>actor board <span class="ts" id="stamp"></span></h1>
+<div id="summary"></div>
 <div id="actors"></div>
 <div id="board"></div>
 <div id="msgs"></div>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const card=t=>`<div class="card ${t.state}"><span class="id">${esc(t.id)}</span>
+const prev=new Map();   // task id -> serialized task (diff detection)
+const changed=new Set();
+const ageMin=u=>{const t=new Date((u||'').replace(' ','T')+'Z');return isNaN(t)?null:(Date.now()-t)/6e4};
+const fmtAge=m=>m<1?'now':m<60?Math.floor(m)+'m':Math.floor(m/60)+'h'+Math.floor(m%60)+'m';
+const ageCls=m=>m<5?'ok':m<15?'warn':'stale';
+const card=t=>{
+ const hot=changed.has(t.id)?' flash':'';
+ let badge='';
+ if(t.state==='claimed'){const a=ageMin(t.updated_at);
+  if(a!==null)badge=` <span class="age ${ageCls(a)}">${fmtAge(a)}</span>`;}
+ return `<div class="card ${t.state}${hot}"><span class="id">${esc(t.id)}</span>${badge}
  <span class="meta">${esc(t.claimed_by||'')}</span>
  <div class="data">${esc((t.data||'').slice(0,200))}${t.result?' ⇒ '+esc(String(t.result).slice(0,100)):''}</div>
- <div class="ts">${esc(t.updated_at||t.created_at||'')}</div></div>`;
+ <div class="ts">${esc(t.updated_at||t.created_at||'')}</div></div>`};
+const evLine=m=>{
+ const time=(m.published_at||'').slice(11,19);
+ let d={};try{d=JSON.parse(m.data||'{}')}catch(e){}
+ let icon='·',cls='other',txt='';
+ if(d.type==='task_posted'){icon='+';cls='posted';txt=`${esc(d.task_id)} posted to ${esc(d.channel||'')}`}
+ else if(d.type==='task_claimed'){icon='→';cls='claimed';txt=`${esc(d.task_id)} claimed by ${esc(d.claimed_by||'')}`}
+ else if(d.type==='task_state'){const ok=d.state==='done';icon=ok?'✓':'✗';cls=d.state||'failed';
+  txt=`${esc(d.task_id)} ${esc(d.state||'')}`}
+ else{txt=`<span class="chan">${esc(m.channel)}</span> ${esc((m.data||'').slice(0,120))}`}
+ return `<div class="ev ${cls}"><span class="ts">${esc(time)}</span>
+  <span class="icon">${icon}</span> ${txt}</div>`};
 async function tick(){
  const b=await (await fetch('/api/board')).json();
  document.getElementById('stamp').textContent=new Date().toLocaleTimeString();
+ // diff detection: mark tasks that are new or changed since last poll
+ changed.clear();
+ for(const ch of Object.values(b.channels))for(const t of ch){
+  const s=JSON.stringify(t);
+  if(prev.get(t.id)!==s){if(prev.size)changed.add(t.id);prev.set(t.id,s)}
+ }
+ const counts={open:0,claimed:0,done:0,failed:0};
+ for(const ts of Object.values(b.channels))for(const t of ts)counts[t.state]=(counts[t.state]||0)+1;
+ document.getElementById('summary').innerHTML=Object.entries(counts)
+  .map(([s,n])=>`<span class="pill ${s}${s==='failed'&&n>0?' hot':''}">${s} ${n}</span>`).join('');
  document.getElementById('actors').innerHTML=b.actors.length?
   '<h2>actors</h2>'+b.actors.map(a=>`<div>${esc(a.name)} → ${esc(a.instance_id)}</div>`).join(''):'';
  let h='';
@@ -61,9 +105,7 @@ async function tick(){
  }
  document.getElementById('board').innerHTML=h||'<div class="empty">no tasks</div>';
  document.getElementById('msgs').innerHTML=b.messages.length?
-  '<h2>recent channel messages</h2>'+b.messages.map(m=>
-   `<div><span class="ts">${esc(m.published_at)}</span> <span class="chan">${esc(m.channel)}</span>
-    <span class="data">${esc((m.data||'').slice(0,160))}</span></div>`).join(''):'';
+  '<h2>event stream</h2>'+b.messages.map(evLine).join(''):'';
 }
 tick();setInterval(tick,2000);
 </script></body></html>"""
