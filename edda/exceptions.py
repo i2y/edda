@@ -74,3 +74,7 @@ class FSForbiddenError(Exception):
 
 class FSOutsideActivityError(Exception):
     """FS operation attempted outside an activity body or during replay."""
+
+
+class TaskConflictError(Exception):
+    """Task state transition lost the race (already claimed/completed)."""

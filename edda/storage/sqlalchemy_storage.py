@@ -4298,3 +4298,142 @@ class SQLAlchemyStorage:
             # MySQL doesn't support DELETE ... RETURNING, so use rowcount.
             # rowcount is reliable across PostgreSQL/MySQL/SQLite for plain DELETE.
             return result.rowcount or 0  # type: ignore[attr-defined]
+
+    async def post_task(self, task_id: str, channel: str, data: str) -> None:
+        """Insert a new open task on a channel."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO actor_tasks (id, channel, data, state) "
+                    "VALUES (:i, :c, :d, 'open')"
+                ),
+                {"i": task_id, "c": channel, "d": data},
+            )
+            await self._commit_if_not_in_transaction(session)
+
+    async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:
+        """Atomically claim the oldest open task on channel for claimant."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            for _ in range(3):
+                result = await session.execute(
+                    text(
+                        "UPDATE actor_tasks SET state = 'claimed', claimed_by = :w, "
+                        "updated_at = :u "
+                        "WHERE id = ("
+                        "  SELECT id FROM ("
+                        "    SELECT id FROM actor_tasks "
+                        "    WHERE channel = :c AND state = 'open' ORDER BY created_at LIMIT 1"
+                        "  ) _t"
+                        ") AND state = 'open'"
+                    ),
+                    {"w": claimant, "u": datetime.now(UTC), "c": channel},
+                )
+                if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                    break
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT id, channel, data, claimed_by "
+                            "FROM actor_tasks "
+                            "WHERE channel = :c AND claimed_by = :w AND state = 'claimed' "
+                            "ORDER BY updated_at DESC LIMIT 1"
+                        ),
+                        {"c": channel, "w": claimant},
+                    )
+                ).first()
+                if row is None:
+                    continue
+                await self._commit_if_not_in_transaction(session)
+                return {
+                    "id": row[0],
+                    "channel": row[1],
+                    "data": row[2],
+                    "state": "claimed",
+                    "claimed_by": row[3],
+                }
+            await self._commit_if_not_in_transaction(session)
+            return None
+
+    async def complete_task(
+        self, task_id: str, claimant: str, result: str | None, failed: bool
+    ) -> None:
+        """Mark a claimed task done/failed; TaskConflictError if not claimant."""
+        from edda.exceptions import TaskConflictError
+
+        state = "failed" if failed else "done"
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            res = await session.execute(
+                text(
+                    "UPDATE actor_tasks SET state = :s, result = :r, updated_at = :u "
+                    "WHERE id = :i AND claimed_by = :w AND state = 'claimed'"
+                ),
+                {
+                    "s": state,
+                    "r": result,
+                    "u": datetime.now(UTC),
+                    "i": task_id,
+                    "w": claimant,
+                },
+            )
+            if (res.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                raise TaskConflictError(f"actor_tasks conflict: {task_id}")
+            await self._commit_if_not_in_transaction(session)
+
+    async def list_tasks(self, channel: str, state: str | None = None) -> list[dict[str, Any]]:
+        """Return tasks on channel filtered by state (None = all)."""
+        query = (
+            "SELECT id, channel, data, state, claimed_by, result "
+            "FROM actor_tasks WHERE channel = :c"
+        )
+        params: dict[str, Any] = {"c": channel}
+        if state:
+            query += " AND state = :s"
+            params["s"] = state
+        query += " ORDER BY created_at"
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            rows = (await session.execute(text(query), params)).all()
+            return [
+                {
+                    "id": r[0],
+                    "channel": r[1],
+                    "data": r[2],
+                    "state": r[3],
+                    "claimed_by": r[4],
+                    "result": r[5],
+                }
+                for r in rows
+            ]
+
+    async def channel_messages_since(
+        self, channel: str, message_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Return messages on channel after message_id cursor (None = all)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT message_id, channel, data_type, data, data_binary, "
+                        "metadata, published_at FROM channel_messages "
+                        "WHERE channel = :c AND id > COALESCE(("
+                        "  SELECT id FROM channel_messages WHERE message_id = :m"
+                        "), 0) ORDER BY id"
+                    ),
+                    {"c": channel, "m": message_id or ""},
+                )
+            ).all()
+            return [
+                {
+                    "message_id": r[0],
+                    "channel": r[1],
+                    "data_type": r[2],
+                    "data": r[3] if r[2] == "json" else r[4],
+                    "metadata": json.loads(r[5]) if r[5] else {},
+                    "published_at": r[6],
+                }
+                for r in rows
+            ]

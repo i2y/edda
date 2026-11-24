@@ -962,6 +962,30 @@ class StorageProtocol(Protocol):
         """Delete path (expected 0 = unconditional, >0 = version-checked)."""
         ...
 
+    async def post_task(self, task_id: str, channel: str, data: str) -> None:
+        """Insert a new open task on a channel."""
+        ...
+
+    async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:
+        """Atomically claim the oldest open task on channel; None if empty."""
+        ...
+
+    async def complete_task(
+        self, task_id: str, claimant: str, result: str | None, failed: bool
+    ) -> None:
+        """Mark a claimed task done/failed; TaskConflictError if not claimant."""
+        ...
+
+    async def list_tasks(self, channel: str, state: str | None = None) -> list[dict[str, Any]]:
+        """Return tasks on channel filtered by state (None = all)."""
+        ...
+
+    async def channel_messages_since(
+        self, channel: str, message_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Return messages on channel published after message_id cursor."""
+        ...
+
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Find workflows that are ready to be resumed.
