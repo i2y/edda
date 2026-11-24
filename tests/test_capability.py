@@ -45,7 +45,8 @@ async def test_issue_and_check_token(sqlite_storage):
         worker_id="w1",
     )
     workflow_context = ctx
-    token = await actors.issue_capability(workflow_context, "channel_pub", "orders")
+    token, cap_id = await actors.issue_capability(workflow_context, "channel_pub", "orders")
+    assert cap_id.startswith("cap-")
     kind, target, secret = token.split(":")[1], token.split(":")[2], token.split(":")[3]
     assert kind == "channel_pub" and target == "orders"
     assert await actors.check_capability(workflow_context, "channel_pub", "orders", token)

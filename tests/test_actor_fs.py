@@ -62,7 +62,7 @@ async def test_fs_permissions(sqlite_storage):
     # shared write requires capability
     with pytest.raises(FSForbiddenError):
         await fs.fs_write(me, "/shared/doc", b"s", 0)
-    token = await actors.issue_capability(me, "fs_write", "/shared/")
+    token, _cap_id = await actors.issue_capability(me, "fs_write", "/shared/")
     await fs.fs_write(me, "/shared/doc", b"s", 0, capability_token=token)
     data, _ = await fs.fs_read(other, "/shared/doc")  # shared read open
     assert data == b"s"

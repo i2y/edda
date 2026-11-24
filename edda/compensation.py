@@ -253,7 +253,11 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
 
             # Execute the compensation function directly
             # Compensation functions should NOT have @activity decorator
-            await compensation_func(ctx, *comp_args, **comp_kwargs)
+            ctx._activity_depth += 1
+            try:
+                await compensation_func(ctx, *comp_args, **comp_kwargs)
+            finally:
+                ctx._activity_depth -= 1
 
             # Record compensation execution in history (with idempotency)
             try:

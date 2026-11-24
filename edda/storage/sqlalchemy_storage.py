@@ -9,6 +9,7 @@ and transactional outbox pattern.
 import json
 import logging
 import re
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -37,6 +38,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -2691,7 +2693,6 @@ class SQLAlchemyStorage:
         Returns:
             Dict with delivery info if successful, None otherwise
         """
-        import uuid
 
         # Step 1: Check if subscription exists (without lock)
         session = self._get_session_for_operation()
@@ -3162,7 +3163,6 @@ class SQLAlchemyStorage:
                 )
             )
             monitors = result.all()
-            import uuid as _uuid
 
             if not monitors:
                 await session.commit()
@@ -3176,7 +3176,7 @@ class SQLAlchemyStorage:
                         "INSERT INTO channel_messages (channel, message_id, data_type, data, published_at) "
                         "VALUES (:c, :m, 'json', :d, :p)"
                     ),
-                    {"c": channel, "m": str(_uuid.uuid4()), "d": payload, "p": now},
+                    {"c": channel, "m": str(uuid.uuid4()), "d": payload, "p": now},
                 )
                 await session.execute(text("DELETE FROM actor_monitors WHERE id = :i"), {"i": m_id})
             for target_id in {m[1] for m in monitors}:
@@ -3308,22 +3308,31 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             if expected_version == 0:
-                result = await session.execute(
-                    text(
-                        "INSERT INTO actor_fs (path, owner, data, version) "
-                        "SELECT :p, :o, :d, 1 "
-                        "WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = :p2)"
-                    ),
-                    {"p": path, "o": owner, "d": data, "p2": path},
-                )
+                try:
+                    result = await session.execute(
+                        text(
+                            "INSERT INTO actor_fs (path, owner, data, version) "
+                            "SELECT :p, :o, :d, 1 "
+                            "WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = :p2)"
+                        ),
+                        {"p": path, "o": owner, "d": data, "p2": path},
+                    )
+                except IntegrityError as exc:
+                    raise FSConflictError(f"actor_fs version conflict: {path}") from exc
             else:
                 result = await session.execute(
                     text(
                         "UPDATE actor_fs SET data = :d, owner = :o, "
-                        "version = version + 1 "
+                        "version = version + 1, updated_at = :u "
                         "WHERE path = :p AND version = :v"
                     ),
-                    {"d": data, "o": owner, "p": path, "v": expected_version},
+                    {
+                        "d": data,
+                        "o": owner,
+                        "p": path,
+                        "v": expected_version,
+                        "u": datetime.now(UTC),
+                    },
                 )
             if result.rowcount == 0:
                 raise FSConflictError(f"actor_fs version conflict: {path}")
@@ -3406,7 +3415,6 @@ class SQLAlchemyStorage:
         Returns:
             Generated message_id (UUID)
         """
-        import uuid
 
         message_id = str(uuid.uuid4())
 

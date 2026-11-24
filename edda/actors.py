@@ -79,24 +79,26 @@ def _hash_secret(secret: str) -> str:
 
 async def issue_capability(
     ctx: "WorkflowContext", kind: str, target: str, expires_at: str | None = None
-) -> str:
+) -> tuple[str, str]:
     """
-    Mint a capability for (kind, target) and return the bearer token
-    ``cap:{kind}:{target}:{secret}``. Only the hash of the secret is stored;
+    Mint a capability for (kind, target). Returns ``(token, capability_id)``
+    — the bearer token ``cap:{kind}:{target}:{secret}`` and the grant ID
+    needed by ``revoke_capability``. Only the hash of the secret is stored;
     the plaintext is returned exactly once here.
     """
     if kind not in _CAP_KINDS:
         raise ValueError(f"unknown capability kind: {kind}")
     secret = secrets.token_hex(24)
+    cap_id = f"cap-{uuid.uuid4()}"
     await ctx.storage.grant_capability(
-        capability_id=f"cap-{uuid.uuid4()}",
+        capability_id=cap_id,
         kind=kind,
         target=target,
         secret_hash=_hash_secret(secret),
         granted_by=ctx.instance_id,
         expires_at=expires_at,
     )
-    return f"cap:{kind}:{target}:{secret}"
+    return f"cap:{kind}:{target}:{secret}", cap_id
 
 
 async def check_capability(ctx: "WorkflowContext", kind: str, target: str, token: str) -> bool:
