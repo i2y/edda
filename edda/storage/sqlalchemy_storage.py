@@ -4299,8 +4299,28 @@ class SQLAlchemyStorage:
             # rowcount is reliable across PostgreSQL/MySQL/SQLite for plain DELETE.
             return result.rowcount or 0  # type: ignore[attr-defined]
 
+    def _task_notice(self, session: Any, channel: str, data: dict[str, Any]) -> str:
+        """Append an event to {channel}:tasks on the caller's session —
+        joins an enclosing transaction when present. Returns message_id;
+        the NOTIFY must be sent after commit."""
+        msg = ChannelMessage(
+            channel=f"{channel}:tasks",
+            message_id=str(uuid.uuid4()),
+            data_type="json",
+            data=json.dumps(data),
+        )
+        session.add(msg)
+        return msg.message_id
+
+    async def _notify_task(self, channel: str, message_id: str) -> None:
+        """Post-commit NOTIFY for a task event."""
+        await self._send_notify(
+            "workflow_channel_message",
+            {"ch": f"{channel}:tasks", "msg_id": message_id},
+        )
+
     async def post_task(self, task_id: str, channel: str, data: str) -> None:
-        """Insert a new open task on a channel."""
+        """Insert a new open task on a channel + "task_posted" notice."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             await session.execute(
@@ -4310,7 +4330,37 @@ class SQLAlchemyStorage:
                 ),
                 {"i": task_id, "c": channel, "d": data},
             )
+            notice_id = self._task_notice(
+                session,
+                channel,
+                {"type": "task_posted", "task_id": task_id, "channel": channel},
+            )
             await self._commit_if_not_in_transaction(session)
+        await self._notify_task(channel, notice_id)
+
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return the task by ID, or None."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT id, channel, data, state, claimed_by, result "
+                        "FROM actor_tasks WHERE id = :i"
+                    ),
+                    {"i": task_id},
+                )
+            ).first()
+            if row is None:
+                return None
+            return {
+                "id": row[0],
+                "channel": row[1],
+                "data": row[2],
+                "state": row[3],
+                "claimed_by": row[4],
+                "result": row[5],
+            }
 
     async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:
         """Atomically claim the oldest open task on channel for claimant."""
@@ -4345,7 +4395,17 @@ class SQLAlchemyStorage:
                 ).first()
                 if row is None:
                     continue
+                notice_id = self._task_notice(
+                    session,
+                    channel,
+                    {
+                        "type": "task_claimed",
+                        "task_id": row[0],
+                        "claimed_by": claimant,
+                    },
+                )
                 await self._commit_if_not_in_transaction(session)
+                await self._notify_task(channel, notice_id)
                 return {
                     "id": row[0],
                     "channel": row[1],
@@ -4380,7 +4440,19 @@ class SQLAlchemyStorage:
             )
             if (res.rowcount or 0) == 0:  # type: ignore[attr-defined]
                 raise TaskConflictError(f"actor_tasks conflict: {task_id}")
+            channel = (
+                await session.execute(
+                    text("SELECT channel FROM actor_tasks WHERE id = :i"),
+                    {"i": task_id},
+                )
+            ).scalar_one()
+            notice_id = self._task_notice(
+                session,
+                channel,
+                {"type": "task_state", "task_id": task_id, "state": state},
+            )
             await self._commit_if_not_in_transaction(session)
+        await self._notify_task(channel, notice_id)
 
     async def list_tasks(self, channel: str, state: str | None = None) -> list[dict[str, Any]]:
         """Return tasks on channel filtered by state (None = all)."""

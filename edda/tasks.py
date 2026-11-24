@@ -13,26 +13,31 @@ Typical worker loop::
         await complete_task(ctx, task["id"], result)
 """
 
-import contextlib
 import json
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
+
+from edda.channels import receive, subscribe
+from edda.exceptions import TaskNotFoundError
 
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
 
 
-async def post_task(ctx: "WorkflowContext", channel: str, data: dict[str, Any] | str) -> str:
-    """Create a task on channel and publish a best-effort wake notice.
+def tasks_channel(channel: str) -> str:
+    """Task-event stream name: all lifecycle notices (posted/claimed/
+    done/failed) are published on this broadcast channel — workers and
+    waiters subscribe here."""
+    return f"{channel}:tasks"
 
-    Returns the task ID. The task row is the source of truth; the notice
-    only wakes competing subscribers so they can claim promptly.
-    """
+
+async def post_task(ctx: "WorkflowContext", channel: str, data: dict[str, Any] | str) -> str:
+    """Create a task on channel and publish a "task_posted" notice on
+    tasks_channel(channel). Returns the task ID."""
     task_id = f"task-{uuid.uuid4()}"
     payload = data if isinstance(data, str) else json.dumps(data)
     await ctx.storage.post_task(task_id, channel, payload)
-    with contextlib.suppress(Exception):
-        await ctx.storage.publish_to_channel(channel, {"type": "task_posted", "task_id": task_id})
     return task_id
 
 
@@ -76,3 +81,82 @@ async def read_channel_since(
     (None reads all, oldest first). Use the last message's ``message_id``
     as the next cursor for incremental polling."""
     return await ctx.storage.channel_messages_since(channel, message_id)
+
+
+async def wait_task(
+    ctx: "WorkflowContext", task_id: str, timeout_seconds: float | None = None
+) -> dict[str, Any]:
+    """Block until the task reaches a terminal state (done or failed).
+
+    Subscribes broadcast to the channel's task-event stream and re-checks
+    the task row on every wake — the workflow durably suspends (lock
+    released) between notices.
+
+    Raises TaskNotFoundError for unknown IDs, TimeoutError on expiry.
+    """
+    task = await ctx.storage.get_task(task_id)
+    if task is None:
+        raise TaskNotFoundError(task_id)
+    notify_ch = tasks_channel(task["channel"])
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    while task["state"] not in ("done", "failed"):
+        await subscribe(ctx, notify_ch, mode="broadcast")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(f"timeout waiting for task {task_id}")
+        try:
+            await receive(
+                ctx,
+                notify_ch,
+                timeout_seconds=None if remaining is None else int(remaining) + 1,
+            )
+        except TimeoutError:
+            if deadline is None or time.monotonic() < deadline:
+                continue
+            task = await ctx.storage.get_task(task_id)
+            if task is not None and task["state"] in ("done", "failed"):
+                return task
+            raise
+        got = await ctx.storage.get_task(task_id)
+        if got is None:
+            raise TaskNotFoundError(task_id)
+        task = got
+    return task
+
+
+async def wait_any_task(
+    ctx: "WorkflowContext", channel: str, timeout_seconds: float | None = None
+) -> dict[str, Any]:
+    """Block until any task on channel reaches a terminal state (earliest
+    done, else earliest failed). TimeoutError on expiry."""
+    notify_ch = tasks_channel(channel)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    async def _terminal() -> dict[str, Any] | None:
+        for state in ("done", "failed"):
+            tasks = await ctx.storage.list_tasks(channel, state)
+            if tasks:
+                return tasks[0]
+        return None
+
+    while True:
+        task = await _terminal()
+        if task is not None:
+            return task
+        await subscribe(ctx, notify_ch, mode="broadcast")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(f"timeout waiting for task on {channel}")
+        try:
+            await receive(
+                ctx,
+                notify_ch,
+                timeout_seconds=None if remaining is None else int(remaining) + 1,
+            )
+        except TimeoutError:
+            if deadline is None or time.monotonic() < deadline:
+                continue
+            task = await _terminal()
+            if task is not None:
+                return task
+            raise

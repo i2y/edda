@@ -966,6 +966,10 @@ class StorageProtocol(Protocol):
         """Insert a new open task on a channel."""
         ...
 
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return the task by ID, or None."""
+        ...
+
     async def claim_task(self, channel: str, claimant: str) -> dict[str, Any] | None:
         """Atomically claim the oldest open task on channel; None if empty."""
         ...

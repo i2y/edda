@@ -57,3 +57,36 @@ async def test_channel_messages_since(sqlite_storage, create_test_instance):
     # unknown cursor behaves like empty (reads all)
     unk = await sqlite_storage.channel_messages_since("cur", "no-such-id")
     assert len(unk) == 3
+
+
+@pytest.mark.asyncio
+async def test_task_event_stream_and_get_task(sqlite_storage, create_test_instance):
+    w1 = await create_test_instance("wf-w1", "wf", {})
+
+    await sqlite_storage.post_task("t1", "tasks:x", '{"n":1}')
+    msgs = await sqlite_storage.channel_messages_since("tasks:x:tasks", None)
+    assert len(msgs) == 1
+    import json as _json
+
+    assert _json.loads(msgs[0]["data"]) == {
+        "type": "task_posted",
+        "task_id": "t1",
+        "channel": "tasks:x",
+    }
+
+    got = await sqlite_storage.get_task("t1")
+    assert got is not None and got["state"] == "open"
+    assert await sqlite_storage.get_task("nope") is None
+
+    task = await sqlite_storage.claim_task("tasks:x", w1)
+    assert task["id"] == "t1"
+    await sqlite_storage.complete_task("t1", w1, '{"ok":true}', failed=False)
+
+    msgs = await sqlite_storage.channel_messages_since("tasks:x:tasks", msgs[0]["message_id"])
+    assert len(msgs) == 2
+    assert _json.loads(msgs[0]["data"])["type"] == "task_claimed"
+    assert _json.loads(msgs[1]["data"]) == {
+        "type": "task_state",
+        "task_id": "t1",
+        "state": "done",
+    }

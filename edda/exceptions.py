@@ -78,3 +78,7 @@ class FSOutsideActivityError(Exception):
 
 class TaskConflictError(Exception):
     """Task state transition lost the race (already claimed/completed)."""
+
+
+class TaskNotFoundError(Exception):
+    """Task ID does not exist."""
