@@ -942,6 +942,14 @@ class StorageProtocol(Protocol):
         """Return the blob for hash, or None if absent."""
         ...
 
+    async def get_blob_info(self, hash: str) -> dict[str, Any] | None:
+        """Return blob metadata (size_bytes/created_by/created_at), or None."""
+        ...
+
+    async def delete_expired_capabilities(self) -> int:
+        """Remove expired capability grants (leader sweep)."""
+        ...
+
     async def fs_get(self, path: str) -> dict[str, Any] | None:
         """Return FS object at path (data/version/owner), or None."""
         ...

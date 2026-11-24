@@ -12,6 +12,10 @@ Permission model:
 
 FS operations are non-deterministic I/O and MUST run inside an activity;
 calls outside an activity (or during replay) raise FSOutsideActivityError.
+
+NOTE for synchronous activities: ``fs_*`` functions are async. A sync
+activity body runs via ``anyio.to_thread`` — call these via
+``anyio.from_thread.run`` or prefer async activity functions.
 """
 
 from typing import TYPE_CHECKING

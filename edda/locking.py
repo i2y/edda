@@ -306,6 +306,9 @@ async def auto_resume_stale_workflows_periodically(
                 # Deliver DOWN notifications for terminated actors and free
                 # their registered names.
                 try:
+                    expired = await storage.delete_expired_capabilities()
+                    if expired:
+                        logger.debug("deleted %d expired capabilities", expired)
                     downs = await storage.emit_actor_down_for_terminated()
                     if downs:
                         logger.info("Emitted %d actor DOWN notification(s)", downs)

@@ -3,10 +3,14 @@
 Large payloads are stored once by content hash and referenced as
 ``"blob:sha256:<hex>"`` inside channel messages, event data, etc. Writes
 are idempotent — identical payloads share a single blob.
+
+NOTE: blobs are readable by anyone who knows the content hash — the store
+is content-addressed, not permissioned. Do not store secrets in plaintext;
+encrypt sensitive payloads before ``store_payload``.
 """
 
 import hashlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
@@ -37,3 +41,9 @@ async def load_payload(ctx: "WorkflowContext", ref: str) -> bytes:
     if data is None:
         raise KeyError(f"blob not found: {ref}")
     return data
+
+
+async def stat_payload(ctx: "WorkflowContext", ref: str) -> dict[str, Any] | None:
+    """Return blob metadata (size_bytes/created_by/created_at), or None."""
+    h = ref.removeprefix(BLOB_REF_PREFIX)
+    return await ctx.storage.get_blob_info(h)

@@ -63,6 +63,21 @@ class Base(DeclarativeBase):
 # ============================================================================
 
 
+def _canonical_ts(dt: datetime) -> str:
+    """Fixed-width UTC timestamp, lexically comparable across dialects."""
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_expiry(expires_at: str | None) -> str | None:
+    """Normalize a caller-supplied expiry to the canonical UTC form."""
+    if expires_at is None:
+        return None
+    dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return _canonical_ts(dt)
+
+
 class SchemaVersion(Base):
     """Schema version tracking."""
 
@@ -2485,7 +2500,7 @@ class SQLAlchemyStorage:
                 )
             )
             await self._commit_if_not_in_transaction(session)
-            return result.rowcount or 0  # type: ignore[attr-defined]
+            return int(getattr(result, "rowcount", 0) or 0)  # type: ignore[attr-defined]
 
     # -------------------------------------------------------------------------
     # Workflow Cancellation Methods
@@ -3214,7 +3229,7 @@ class SQLAlchemyStorage:
                     "t": target,
                     "h": secret_hash,
                     "g": granted_by,
-                    "e": expires_at,
+                    "e": _normalize_expiry(expires_at),
                 },
             )
             await self._commit_if_not_in_transaction(session)
@@ -3245,11 +3260,9 @@ class SQLAlchemyStorage:
             expires_at = row[0]
             if expires_at is None:
                 return True
-            if isinstance(expires_at, str):
-                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-            return bool(expires_at > datetime.now(UTC))
+            if isinstance(expires_at, datetime):
+                expires_at = _canonical_ts(expires_at)
+            return bool(str(expires_at) > _canonical_ts(datetime.now(UTC)))
 
     async def put_blob(self, hash: str, data: bytes, created_by: str | None = None) -> None:
         """Store data under its content hash (idempotent CAS write)."""
@@ -3334,7 +3347,7 @@ class SQLAlchemyStorage:
                         "u": datetime.now(UTC),
                     },
                 )
-            if result.rowcount == 0:
+            if getattr(result, "rowcount", 0) == 0:
                 raise FSConflictError(f"actor_fs version conflict: {path}")
             await self._commit_if_not_in_transaction(session)
 
@@ -3353,9 +3366,43 @@ class SQLAlchemyStorage:
                     text("DELETE FROM actor_fs WHERE path = :p AND version = :v"),
                     {"p": path, "v": expected_version},
                 )
-            if expected_version > 0 and result.rowcount == 0:
+            if expected_version > 0 and getattr(result, "rowcount", 0) == 0:
                 raise FSConflictError(f"actor_fs version conflict: {path}")
             await self._commit_if_not_in_transaction(session)
+
+    async def get_blob_info(self, hash: str) -> dict[str, Any] | None:
+        """Return blob metadata (size_bytes/created_by/created_at), or None."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text(
+                    "SELECT size_bytes, created_by, created_at "
+                    "FROM payload_blobs WHERE hash = :h"
+                ),
+                {"h": hash},
+            )
+            row = result.first()
+            if not row:
+                return None
+            return {
+                "size_bytes": row[0],
+                "created_by": row[1],
+                "created_at": row[2],
+            }
+
+    async def delete_expired_capabilities(self) -> int:
+        """Remove capability grants whose expires_at is in the past."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM actor_capabilities "
+                    "WHERE expires_at IS NOT NULL AND expires_at <= :now"
+                ),
+                {"now": _canonical_ts(datetime.now(UTC))},
+            )
+            await self._commit_if_not_in_transaction(session)
+            return int(getattr(result, "rowcount", 0) or 0)
 
     # -------------------------------------------------------------------------
     # Subscription Cleanup Methods (for recur())
