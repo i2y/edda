@@ -68,6 +68,10 @@ class FSConflictError(Exception):
     """Optimistic-concurrency conflict on the shared actor filesystem."""
 
 
+class ChannelPermissionError(Exception):
+    """A sealed channel operation lacked a valid capability token."""
+
+
 class FSForbiddenError(Exception):
     """Permission denied on the shared actor filesystem."""
 

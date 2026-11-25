@@ -3252,6 +3252,18 @@ class SQLAlchemyStorage:
             )
             await self._commit_if_not_in_transaction(session)
 
+    async def has_capability_grants(self, kind: str, target: str) -> bool:
+        """Return True if any grant exists for (kind, target)."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM actor_capabilities WHERE kind = :k AND target = :t"
+                ),
+                {"k": kind, "t": target},
+            )
+            return bool(result.scalar_one() > 0)
+
     async def check_capability(self, kind: str, target: str, secret_hash: str) -> bool:
         """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
         session = self._get_session_for_operation()

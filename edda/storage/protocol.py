@@ -930,6 +930,9 @@ class StorageProtocol(Protocol):
         """Remove a capability grant by ID (idempotent)."""
         ...
 
+    async def has_capability_grants(self, kind: str, target: str) -> bool:
+        """Whether ANY grant exists for (kind, target) — sealed-channel check."""
+        ...
     async def check_capability(self, kind: str, target: str, secret_hash: str) -> bool:
         """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
         ...

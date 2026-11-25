@@ -152,6 +152,24 @@ class ChannelModeConflictError(Exception):
 # =============================================================================
 
 
+async def _enforce_channel_capability(
+    storage: "StorageProtocol", kind: str, channel: str, token: str | None
+) -> None:
+    """Sealed-channel semantics: while no grants of kind exist for the
+    channel it is open to everyone; once the first grant is issued the
+    operation requires a valid capability token."""
+    from edda.actors import _hash_secret
+    from edda.exceptions import ChannelPermissionError
+
+    if not await storage.has_capability_grants(kind, channel):
+        return
+    if not token:
+        raise ChannelPermissionError(f"channel {channel!r} is sealed for {kind}")
+    secret = token.rsplit(":", 1)[-1] if token.startswith("cap:") else token
+    if not await storage.check_capability(kind, channel, _hash_secret(secret)):
+        raise ChannelPermissionError(f"invalid capability for channel {channel!r}")
+
+
 async def subscribe(
     ctx: WorkflowContext,
     channel: str,
@@ -267,6 +285,7 @@ async def receive(
     channel: str,
     timeout_seconds: int | None = None,
     message_id: str | None = None,
+    capability_token: str | None = None,
 ) -> ChannelMessage:
     """
     Receive a message from a channel.
@@ -345,6 +364,11 @@ async def receive(
                     published_at=published_at,
                 )
             raise RuntimeError(f"Unexpected cached result type: {type(cached_result)}")
+
+    # Sealed-channel enforcement comes after the replay cache lookup:
+    # replays of a completed receive never re-check, keeping replay
+    # deterministic even if the capability is later revoked.
+    await _enforce_channel_capability(ctx.storage, "channel_sub", channel, capability_token)
 
     # Check for pending messages in the queue
     msg_dict = None
@@ -467,6 +491,7 @@ async def publish(
     *,
     target_instance_id: str | None = None,
     worker_id: str | None = None,
+    capability_token: str | None = None,
 ) -> str:
     """
     Publish a message to a channel.
@@ -522,6 +547,9 @@ async def publish(
         full_metadata = metadata.copy() if metadata else {}
         full_metadata.setdefault("published_at", datetime.now(UTC).isoformat())
         effective_worker_id = worker_id or f"publisher-{uuid.uuid4()}"
+
+    # Sealed-channel enforcement (no-op while the channel has no grants)
+    await _enforce_channel_capability(storage, "channel_pub", channel, capability_token)
 
     # Publish to channel
     message_id = await storage.publish_to_channel(channel, data, full_metadata)
@@ -644,6 +672,7 @@ async def send_to(
     data: dict[str, Any] | bytes,
     channel: str = "__direct__",
     metadata: dict[str, Any] | None = None,
+    capability_token: str | None = None,
 ) -> bool:
     """
     Send a message directly to a specific workflow instance.
@@ -673,6 +702,8 @@ async def send_to(
 
     # Publish to a direct channel for the target instance
     direct_channel = f"{channel}:{instance_id}"
+    await _enforce_channel_capability(ctx.storage, "channel_pub", channel, capability_token)
+
     message_id = await ctx.storage.publish_to_channel(direct_channel, data, full_metadata)
 
     # Try to deliver
