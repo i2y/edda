@@ -7,6 +7,7 @@ managing state, history, and replay during workflow execution.
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 from edda.channels import ChannelMessage, ReceivedEvent
@@ -14,6 +15,13 @@ from edda.storage.protocol import StorageProtocol
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+# Currently executing workflow context, tracked with a ContextVar so nested
+# workflow starts can attribute their spawn parent safely across asyncio tasks.
+_current_workflow_context: ContextVar[Any] = ContextVar(
+    "edda_current_workflow_context", default=None
+)
 
 
 class WorkflowContext:

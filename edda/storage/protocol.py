@@ -194,6 +194,8 @@ class StorageProtocol(Protocol):
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
         continued_from: str | None = None,
+        sandboxed: bool = False,
+        parent_instance_id: str | None = None,
     ) -> None:
         """
         Create a new workflow instance.
@@ -206,6 +208,8 @@ class StorageProtocol(Protocol):
             input_data: Input parameters for the workflow (serializable dict)
             lock_timeout_seconds: Lock timeout for this workflow (None = use global default 300s)
             continued_from: Optional instance ID this workflow continues from (for recur pattern)
+            sandboxed: Whether to start as a sandboxed actor
+            parent_instance_id: Optional spawn parent used for sandbox inheritance
         """
         ...
 
@@ -933,6 +937,7 @@ class StorageProtocol(Protocol):
     async def has_capability_grants(self, kind: str, target: str) -> bool:
         """Whether ANY grant exists for (kind, target) — sealed-channel check."""
         ...
+
     async def check_capability(self, kind: str, target: str, secret_hash: str) -> bool:
         """Return True if a non-expired grant exists for (kind, target, secret_hash)."""
         ...

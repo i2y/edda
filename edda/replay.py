@@ -15,7 +15,7 @@ from typing import Any
 
 from edda.channels import WaitForChannelMessageException, WaitForTimerException
 from edda.compensation import execute_compensations
-from edda.context import WorkflowContext
+from edda.context import WorkflowContext, _current_workflow_context
 from edda.locking import LockLostError, new_lock_identity, workflow_lock
 from edda.pydantic_utils import (
     enum_value_to_enum,
@@ -61,6 +61,19 @@ class ReplayEngine:
         self.worker_id = worker_id
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
+
+    async def _invoke_workflow(
+        self,
+        ctx: WorkflowContext,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+    ) -> Any:
+        """Invoke a workflow with its context visible for spawn attribution."""
+        token = _current_workflow_context.set(ctx)
+        try:
+            return await workflow_func(ctx, **input_data)
+        finally:
+            _current_workflow_context.reset(token)
 
     def _prepare_workflow_input(
         self,
@@ -151,6 +164,8 @@ class ReplayEngine:
         workflow_func: Callable[..., Any],
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
+        sandboxed: bool = False,
+        parent_instance_id: str | None = None,
     ) -> str:
         """
         Start a new workflow instance.
@@ -196,6 +211,8 @@ class ReplayEngine:
             owner_service=self.service_name,
             input_data=input_data,
             lock_timeout_seconds=lock_timeout_seconds,
+            sandboxed=sandboxed,
+            parent_instance_id=parent_instance_id,
         )
 
         # Execute the workflow with distributed lock
@@ -223,7 +240,7 @@ class ReplayEngine:
                 processed_input = self._prepare_workflow_input(workflow_func, input_data)
 
                 # Execute workflow function
-                result = await workflow_func(ctx, **processed_input)
+                result = await self._invoke_workflow(ctx, workflow_func, processed_input)
 
                 # Before marking as completed, check if workflow was cancelled
                 instance = await ctx.storage.get_instance(instance_id)
@@ -496,7 +513,7 @@ class ReplayEngine:
             # Prepare input: convert JSON dicts to Pydantic models based on type hints
             processed_input = self._prepare_workflow_input(workflow_func, input_data)
 
-            result = await workflow_func(ctx, **processed_input)
+            result = await self._invoke_workflow(ctx, workflow_func, processed_input)
 
             # Before marking as completed, check if workflow was cancelled
             instance_check = await ctx.storage.get_instance(instance_id)
@@ -765,7 +782,7 @@ class ReplayEngine:
                 processed_input = self._prepare_workflow_input(workflow_func, input_data)
 
                 # Execute workflow function
-                result = await workflow_func(ctx, **processed_input)
+                result = await self._invoke_workflow(ctx, workflow_func, processed_input)
 
                 # Convert Pydantic model result to JSON dict for storage
                 result_dict = to_json_dict(result)
@@ -901,7 +918,7 @@ class ReplayEngine:
 
             # Execute workflow
             input_data = instance["input_data"]
-            return await workflow_func(ctx, **input_data)
+            return await self._invoke_workflow(ctx, workflow_func, input_data)
 
     async def cancel_workflow(self, instance_id: str, cancelled_by: str = "user") -> bool:
         """

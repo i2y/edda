@@ -51,9 +51,7 @@ async def test_stale_epoch_cannot_append_history(sqlite_storage, create_test_ins
         await sqlite_storage.append_history(
             iid, "a:1", "ActivityCompleted", {"r": 1}, lock_id=epoch_a
         )
-    await sqlite_storage.append_history(
-        iid, "a:1", "ActivityCompleted", {"r": 1}, lock_id=epoch_b
-    )
+    await sqlite_storage.append_history(iid, "a:1", "ActivityCompleted", {"r": 1}, lock_id=epoch_b)
 
 
 @pytest.mark.asyncio

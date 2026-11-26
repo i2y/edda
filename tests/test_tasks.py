@@ -97,8 +97,8 @@ async def test_reclaim_stale_tasks(sqlite_storage, create_test_instance):
     await create_test_instance("wf-r1", "wf", {})
     await create_test_instance("wf-r2", "wf", {})
 
-    await sqlite_storage.post_task("tr1", "tasks:r", '{}')
-    await sqlite_storage.post_task("tr2", "tasks:r", '{}')
+    await sqlite_storage.post_task("tr1", "tasks:r", "{}")
+    await sqlite_storage.post_task("tr2", "tasks:r", "{}")
     assert (await sqlite_storage.claim_task("tasks:r", "wf-r1"))["id"] == "tr1"
     assert (await sqlite_storage.claim_task("tasks:r", "wf-r2"))["id"] == "tr2"
 

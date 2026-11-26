@@ -15,6 +15,8 @@ import secrets
 import uuid
 from typing import TYPE_CHECKING
 
+from edda.exceptions import SandboxedError
+
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
 
@@ -88,6 +90,11 @@ async def issue_capability(
     """
     if kind not in _CAP_KINDS:
         raise ValueError(f"unknown capability kind: {kind}")
+    instance = await ctx.storage.get_instance(ctx.instance_id)
+    if instance is None:
+        raise ValueError(f"workflow instance {ctx.instance_id} not found")
+    if instance.get("sandboxed"):
+        raise SandboxedError(f"sandboxed workflow {ctx.instance_id} cannot issue capabilities")
     secret = secrets.token_hex(24)
     cap_id = f"cap-{uuid.uuid4()}"
     await ctx.storage.grant_capability(

@@ -153,7 +153,7 @@ class ChannelModeConflictError(Exception):
 
 
 async def _enforce_channel_capability(
-    storage: "StorageProtocol", kind: str, channel: str, token: str | None
+    storage: StorageProtocol, kind: str, channel: str, token: str | None
 ) -> None:
     """Sealed-channel semantics: while no grants of kind exist for the
     channel it is open to everyone; once the first grant is issued the

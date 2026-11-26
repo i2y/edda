@@ -193,6 +193,7 @@ class OpenTelemetryHooks(HooksBase):
             reader = PeriodicExportingMetricReader(exporter, export_interval_millis=10000)
             resource = Resource.create({"service.name": service_name})
             provider = MeterProvider(resource=resource, metric_readers=[reader])
+            self._meter_provider = provider
             metrics.set_meter_provider(provider)
 
             meter = metrics.get_meter("edda.opentelemetry", "1.0.0")

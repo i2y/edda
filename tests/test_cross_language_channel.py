@@ -375,6 +375,60 @@ async def wait_for_workflow(
     return None
 
 
+async def wait_for_instance_waiting(
+    storage: SQLAlchemyStorage,
+    instance_id: str,
+    timeout: float = 10.0,
+) -> None:
+    """Wait until an in-process Python subscriber has registered its channel wait."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        instance = await storage.get_instance(instance_id)
+        if instance and instance.get("status") == "waiting_for_message":
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"Instance {instance_id} did not enter waiting_for_message")
+
+
+async def wait_for_crosstest_subscriber(
+    storage: SQLAlchemyStorage,
+    framework: str,
+    channel: str,
+    timeout: float = 10.0,
+) -> str:
+    """Wait for an external crosstest subscriber to register its channel wait."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    query = text(
+        """
+        SELECT wi.instance_id
+        FROM workflow_instances wi
+        JOIN channel_subscriptions cs ON cs.instance_id = wi.instance_id
+        WHERE wi.workflow_name = 'crosstest_subscriber'
+          AND wi.status = 'waiting_for_message'
+          AND wi.framework = :framework
+          AND cs.activity_id IS NOT NULL
+          AND (cs.channel = :channel OR cs.channel LIKE :direct_channel)
+        ORDER BY wi.started_at DESC
+        LIMIT 1
+        """
+    )
+    while asyncio.get_event_loop().time() < deadline:
+        async with storage.engine.begin() as conn:
+            result = await conn.execute(
+                query,
+                {
+                    "framework": framework,
+                    "channel": channel,
+                    "direct_channel": f"{channel}:%",
+                },
+            )
+            row = result.fetchone()
+        if row is not None:
+            return row[0]
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"No {framework} subscriber entered waiting_for_message on {channel}")
+
+
 # ============================================================================
 # Go → Python Tests (WORKING)
 # ============================================================================
@@ -970,7 +1024,7 @@ class TestRubyToPython:
         )
 
         # Wait for subscriber to be waiting
-        await asyncio.sleep(2)
+        await wait_for_instance_waiting(storage, sub_instance_id)
 
         # Ruby publishes a message
         ruby_result = run_ruby_crosstest(
@@ -1019,7 +1073,8 @@ class TestRubyToPython:
         )
 
         # Wait for subscribers to be ready
-        await asyncio.sleep(2)
+        await wait_for_instance_waiting(storage, py_instance_id)
+        await wait_for_instance_waiting(storage, py_instance_id_2)
 
         # Ruby publishes a single message
         ruby_result = run_ruby_crosstest(
@@ -1058,7 +1113,7 @@ class TestRubyToPython:
         )
 
         # Wait for subscriber to be waiting
-        await asyncio.sleep(2)
+        await wait_for_instance_waiting(storage, sub_instance_id)
 
         # Ruby sends a direct message to the Python subscriber
         ruby_result = run_ruby_crosstest(
@@ -1268,7 +1323,7 @@ class TestRubyToGo:
         )
 
         try:
-            await asyncio.sleep(2)
+            await wait_for_crosstest_subscriber(storage, "go", channel)
 
             # Ruby publishes
             ruby_result = run_ruby_crosstest(
@@ -1319,25 +1374,7 @@ class TestRubyToGo:
         )
 
         try:
-            await asyncio.sleep(2)
-
-            # Find Go subscriber's instance ID
-            async with storage.engine.begin() as conn:
-                result = await conn.execute(
-                    text(
-                        """
-                    SELECT instance_id FROM workflow_instances
-                    WHERE workflow_name = 'crosstest_subscriber'
-                    AND status = 'waiting_for_message'
-                    AND framework = 'go'
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                """
-                    )
-                )
-                row = result.fetchone()
-            assert row is not None, "No Go subscriber instance found"
-            go_instance_id = row[0]
+            go_instance_id = await wait_for_crosstest_subscriber(storage, "go", channel)
 
             # Ruby sends direct message
             ruby_result = run_ruby_crosstest(

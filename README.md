@@ -713,6 +713,22 @@ await send_to(ctx, instance_id="workflow-123", channel="approval", data={"approv
 - **Database-backed**: All messages are persisted for durability
 - **Lock-first delivery**: Safe for multi-worker environments
 
+### Sandboxed Actors
+
+Workflows can be started as sandboxed actors when they should receive only explicitly delegated capabilities:
+
+```python
+child_id = await untrusted_workflow.start(sandboxed=True, input=value)
+```
+
+Sandboxing enforces three rules:
+
+- A sandboxed workflow cannot mint new capabilities with `issue_capability`.
+- Children started by a sandboxed workflow inherit the sandbox flag, as do `recur()` continuations.
+- Only an unsandboxed parent (or an external caller) may use `sandboxed=True` for a child.
+
+Delegation itself uses the existing capability tokens: pass tokens the child needs in its input. Phase B enforcement is application-layer enforcement inside edda. Code running in the worker process can still bypass it by using storage directly; database-enforced isolation such as PostgreSQL row-level security is Phase C scope.
+
 ### Workflow Recurrence
 
 Long-running workflows can use `ctx.recur()` to restart with fresh history while maintaining the same instance ID. This is essential for workflows that run indefinitely (job workers, notification handlers, etc.):

@@ -77,14 +77,15 @@ async def wait_status(app, instance_id, want, timeout=60.0):
     return None
 
 
-
 async def wait_supervisor_status(app, wf_name, want, timeout=60.0):
     """edda recur continues on NEW instances (continued_from chain) — watch
     the latest instance of the supervisor workflow instead of the start id."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         rows = await app.storage.list_instances(workflow_name_filter=wf_name)
-        insts = rows if isinstance(rows, list) else (rows.get("instances") or rows.get("items") or [])
+        insts = (
+            rows if isinstance(rows, list) else (rows.get("instances") or rows.get("items") or [])
+        )
         mine = [i for i in insts if i.get("workflow_name") == wf_name]
         if mine:
             latest = max(mine, key=lambda i: str(i.get("started_at")))
@@ -93,12 +94,15 @@ async def wait_supervisor_status(app, wf_name, want, timeout=60.0):
         await asyncio.sleep(0.2)
     return None
 
+
 async def find_child(app, wf_name, child_name, gen):
     rows = await app.storage.list_instances()
     insts = rows if isinstance(rows, list) else (rows.get("instances") or rows.get("items") or [])
     suffix = f":{child_name}:g{gen}"
     for i in insts:
-        if i.get("instance_id", "").endswith(suffix) and wf_name.split("-")[0] in i.get("instance_id", ""):
+        if i.get("instance_id", "").endswith(suffix) and wf_name.split("-")[0] in i.get(
+            "instance_id", ""
+        ):
             return i
     for i in insts:
         if i.get("instance_id", "").endswith(suffix):
@@ -115,7 +119,9 @@ async def test_supervisor_transient_restart(sup_app):
         within_seconds=60,
         poll_seconds=1,
         children=[
-            ChildSpec(name="a", workflow="sup_child_genaware", input={}, restart=RestartMode.TRANSIENT),
+            ChildSpec(
+                name="a", workflow="sup_child_genaware", input={}, restart=RestartMode.TRANSIENT
+            ),
         ],
     )
     await sup.start()
@@ -136,7 +142,9 @@ async def test_supervisor_permanent_intensity(sup_app):
         within_seconds=60,
         poll_seconds=1,
         children=[
-            ChildSpec(name="a", workflow="sup_child_quick", input={}, restart=RestartMode.PERMANENT),
+            ChildSpec(
+                name="a", workflow="sup_child_quick", input={}, restart=RestartMode.PERMANENT
+            ),
         ],
     )
     await sup.start()
@@ -156,7 +164,9 @@ async def test_supervisor_temporary_no_restart(sup_app):
         within_seconds=60,
         poll_seconds=1,
         children=[
-            ChildSpec(name="a", workflow="sup_child_always_fails", input={}, restart=RestartMode.TEMPORARY),
+            ChildSpec(
+                name="a", workflow="sup_child_always_fails", input={}, restart=RestartMode.TEMPORARY
+            ),
         ],
     )
     await sup.start()

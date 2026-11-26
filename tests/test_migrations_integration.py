@@ -97,9 +97,16 @@ class TestMigrationsPostgreSQL:
             run_migration(),
         )
 
-        # Exactly one worker should have applied the migration
+        # Exactly one worker should apply all pending migrations.
+        migration_count = len(list((SCHEMA_DIR / "postgresql").glob("*.sql")))
         total_applied = sum(len(r) for r in results)
-        assert total_applied == 1, f"Expected 1 migration applied, got {total_applied}"
+        workers_that_applied = sum(bool(r) for r in results)
+        assert (
+            workers_that_applied == 1
+        ), f"Expected 1 worker to apply migrations, got {workers_that_applied}"
+        assert (
+            total_applied == migration_count
+        ), f"Expected {migration_count} migrations applied, got {total_applied}"
 
         # Verify only one record in schema_migrations
         engine = create_async_engine(db_url, echo=False)
@@ -194,9 +201,16 @@ class TestMigrationsMySQL:
             run_migration(),
         )
 
-        # Exactly one worker should have applied the migration
+        # Exactly one worker should apply all pending migrations.
+        migration_count = len(list((SCHEMA_DIR / "mysql").glob("*.sql")))
         total_applied = sum(len(r) for r in results)
-        assert total_applied == 1, f"Expected 1 migration applied, got {total_applied}"
+        workers_that_applied = sum(bool(r) for r in results)
+        assert (
+            workers_that_applied == 1
+        ), f"Expected 1 worker to apply migrations, got {workers_that_applied}"
+        assert (
+            total_applied == migration_count
+        ), f"Expected {migration_count} migrations applied, got {total_applied}"
 
         # Verify only one record in schema_migrations
         engine = create_async_engine(db_url, echo=False)

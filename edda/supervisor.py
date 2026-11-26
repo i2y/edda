@@ -103,7 +103,7 @@ def define_supervisor(
 ):
     """Build a supervisor workflow over children. Start with no arguments::
 
-        instance_id = await sup.start()
+    instance_id = await sup.start()
     """
 
     @activity
@@ -186,6 +186,7 @@ def define_supervisor(
                 source_hash=source_hash,
                 owner_service="supervisor",
                 input_data=c["spec"]["input"],
+                parent_instance_id=ctx.instance_id,
             )
             if c.get("instance_id"):
                 restarted += 1  # replacement of a spawned child counts
@@ -205,9 +206,16 @@ def define_supervisor(
         if state is None or not state.get("children"):
             state = {
                 "children": [
-                    {"spec": {"name": c.name, "workflow": c.workflow,
-                              "input": c.input, "restart": int(c.restart)},
-                     "instance_id": "", "generation": 0}
+                    {
+                        "spec": {
+                            "name": c.name,
+                            "workflow": c.workflow,
+                            "input": c.input,
+                            "restart": int(c.restart),
+                        },
+                        "instance_id": "",
+                        "generation": 0,
+                    }
                     for c in children
                 ],
                 "restarts": [],

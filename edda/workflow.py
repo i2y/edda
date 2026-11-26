@@ -10,6 +10,8 @@ import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
+from edda.context import _current_workflow_context
+from edda.exceptions import SandboxedError
 from edda.pydantic_utils import to_json_dict
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -117,7 +119,12 @@ class Workflow:
         # Register in global workflow registry for auto-discovery
         _workflow_registry[self.name] = self
 
-    async def start(self, lock_timeout_seconds: int | None = None, **kwargs: Any) -> str:
+    async def start(
+        self,
+        lock_timeout_seconds: int | None = None,
+        sandboxed: bool = False,
+        **kwargs: Any,
+    ) -> str:
         """
         Start a new workflow instance.
 
@@ -128,6 +135,8 @@ class Workflow:
         Args:
             lock_timeout_seconds: Override lock timeout for this specific execution
                                 (None = use decorator default or global default 300s)
+            sandboxed: Start as a sandboxed actor (capability minting forbidden;
+                                children inherit the flag)
             **kwargs: Input parameters for the workflow (can include Pydantic models)
 
         Returns:
@@ -148,11 +157,20 @@ class Workflow:
         # Determine actual lock timeout (priority: runtime > decorator > global default)
         actual_timeout = lock_timeout_seconds or self.lock_timeout_seconds
 
+        parent_ctx = _current_workflow_context.get()
+        parent_instance_id = parent_ctx.instance_id if parent_ctx is not None else None
+        if sandboxed and parent_instance_id is not None:
+            parent = await _replay_engine.storage.get_instance(parent_instance_id)
+            if parent is not None and parent.get("sandboxed"):
+                raise SandboxedError("sandboxed workflows cannot use the sandboxed spawn option")
+
         instance_id: str = await _replay_engine.start_workflow(
             workflow_name=self.name,
             workflow_func=self.func,
             input_data=processed_kwargs,
             lock_timeout_seconds=actual_timeout,
+            sandboxed=sandboxed,
+            parent_instance_id=parent_instance_id,
         )
         return instance_id
 

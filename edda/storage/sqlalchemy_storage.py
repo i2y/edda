@@ -128,6 +128,7 @@ class WorkflowInstance(Base):
     continued_from: Mapped[str | None] = mapped_column(
         String(255), ForeignKey("workflow_instances.instance_id"), nullable=True
     )
+    sandboxed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -1260,10 +1261,30 @@ class SQLAlchemyStorage:
         input_data: dict[str, Any],
         lock_timeout_seconds: int | None = None,
         continued_from: str | None = None,
+        sandboxed: bool = False,
+        parent_instance_id: str | None = None,
     ) -> None:
         """Create a new workflow instance."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
+            if not sandboxed:
+                seen: set[str] = set()
+                for parent_id in (parent_instance_id, continued_from):
+                    if not parent_id or parent_id in seen:
+                        continue
+                    seen.add(parent_id)
+                    result = await session.execute(
+                        select(WorkflowInstance.sandboxed).where(
+                            WorkflowInstance.instance_id == parent_id
+                        )
+                    )
+                    parent_sandboxed = result.scalar_one_or_none()
+                    if parent_sandboxed is None:
+                        raise ValueError(f"parent instance {parent_id} not found")
+                    if parent_sandboxed != 0:
+                        sandboxed = True
+                        break
+
             instance = WorkflowInstance(
                 instance_id=instance_id,
                 workflow_name=workflow_name,
@@ -1273,6 +1294,7 @@ class SQLAlchemyStorage:
                 input_data=json.dumps(input_data),
                 lock_timeout_seconds=lock_timeout_seconds,
                 continued_from=continued_from,
+                sandboxed=1 if sandboxed else 0,
             )
             session.add(instance)
 
@@ -1314,6 +1336,7 @@ class SQLAlchemyStorage:
                 "locked_by": instance.locked_by,
                 "locked_at": instance.locked_at.isoformat() if instance.locked_at else None,
                 "lock_timeout_seconds": instance.lock_timeout_seconds,
+                "sandboxed": bool(instance.sandboxed),
             }
 
     async def update_instance_status(
@@ -3257,9 +3280,7 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             result = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM actor_capabilities WHERE kind = :k AND target = :t"
-                ),
+                text("SELECT COUNT(*) FROM actor_capabilities WHERE kind = :k AND target = :t"),
                 {"k": kind, "t": target},
             )
             return bool(result.scalar_one() > 0)

@@ -34,7 +34,9 @@ def hooks_with_metrics():
         otlp_endpoint=None,
         enable_metrics=True,
     )
-    return hooks
+    yield hooks
+    if meter_provider := getattr(hooks, "_meter_provider", None):
+        meter_provider.shutdown()
 
 
 class TestBasicFunctionality:

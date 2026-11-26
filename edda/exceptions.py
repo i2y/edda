@@ -72,6 +72,10 @@ class ChannelPermissionError(Exception):
     """A sealed channel operation lacked a valid capability token."""
 
 
+class SandboxedError(Exception):
+    """An operation forbidden to a sandboxed workflow was attempted."""
+
+
 class FSForbiddenError(Exception):
     """Permission denied on the shared actor filesystem."""
 

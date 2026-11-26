@@ -34,7 +34,12 @@ async def test_sealed_publish_requires_token(sqlite_storage):
         await publish(sqlite_storage, "sealed-pub", {"n": 1})
 
     with pytest.raises(ChannelPermissionError):
-        await publish(sqlite_storage, "sealed-pub", {"n": 1}, capability_token="cap:channel_pub:sealed-pub:wrong")
+        await publish(
+            sqlite_storage,
+            "sealed-pub",
+            {"n": 1},
+            capability_token="cap:channel_pub:sealed-pub:wrong",
+        )
 
     msg_id = await publish(sqlite_storage, "sealed-pub", {"n": 1}, capability_token=token)
     assert msg_id
