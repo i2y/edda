@@ -5,6 +5,7 @@ This module provides the WorkflowContext class for workflow execution,
 managing state, history, and replay during workflow execution.
 """
 
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -24,6 +25,8 @@ from edda.storage.protocol import StorageProtocol
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -125,6 +128,10 @@ class WorkflowContext:
 
         # Activity ID tracking for deterministic replay
         self.executed_activity_ids: set[str] = set()
+
+        # The activity IDs workflow code has used in this run (unlike
+        # executed_activity_ids, not filled from history)
+        self._ids_used_this_run: set[str] = set()
 
         # History cache for replay (activity_id -> result)
         self._history_cache: dict[str, Any] = {}
@@ -375,6 +382,31 @@ class WorkflowContext:
             activity_id: The activity ID to record
         """
         self.executed_activity_ids.add(activity_id)
+        self._note_id_use(activity_id)
+
+    def _note_id_use(self, activity_id: str) -> None:
+        """
+        Warn when workflow code uses one activity ID twice in a run (internal use only).
+
+        Calls that share an ID share one history record: the later call's
+        result cannot be recorded, so its run is aborted, and the replay gives
+        it the earlier call's result without running it. That is a bug in the
+        workflow (a manual ID that a generated one also takes, such as
+        "fetch:1", or one manual ID given twice). Calls inside an activity
+        body are not tracked: the activity is the recorded unit.
+        """
+        if self._activity_depth > 0:
+            return
+        if activity_id in self._ids_used_this_run:
+            logger.warning(
+                "activity ID %r used twice in one run of %s (%s): each call needs "
+                "its own ID; the later call gets the earlier call's result",
+                activity_id,
+                self.workflow_name,
+                self.instance_id,
+            )
+            return
+        self._ids_used_this_run.add(activity_id)
 
     def _record_direct_subscription(self, channel: str) -> None:
         """

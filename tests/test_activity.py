@@ -9,12 +9,14 @@ Tests cover:
 - Error handling and recording
 """
 
+import logging
+
 import pytest
 import pytest_asyncio
 
 from edda.activity import Activity, activity
 from edda.context import WorkflowContext
-from edda.exceptions import TerminalError
+from edda.exceptions import RunAbortedError, TerminalError
 
 
 @pytest.mark.asyncio
@@ -154,6 +156,38 @@ class TestActivityExecution:
         assert "activity1:1" in context.executed_activity_ids
         assert "activity2:1" in context.executed_activity_ids
 
+    async def test_activity_id_used_twice_in_a_run_is_logged(self, context, caplog):
+        """A manual ID that a generated one also takes is logged. The later
+        call cannot be recorded, so its run is aborted."""
+        caplog.set_level(logging.WARNING, logger="edda.context")
+        bodies = []
+
+        @activity
+        async def dup_step(ctx: WorkflowContext, value: str) -> dict:
+            bodies.append(value)
+            return {"value": value}
+
+        first = await dup_step(context, "manual", activity_id="dup_step:1")
+        with pytest.raises(RunAbortedError):
+            await dup_step(context, "generated")  # generated: dup_step:1
+
+        assert first == {"value": "manual"}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("'dup_step:1' used twice in one run" in m for m in warnings), warnings
+
+    async def test_distinct_activity_ids_are_not_logged(self, context, caplog):
+        """Manual IDs no generated ID can take log nothing."""
+        caplog.set_level(logging.WARNING, logger="edda.context")
+
+        @activity
+        async def dup_step(ctx: WorkflowContext, value: str) -> dict:
+            return {"value": value}
+
+        await dup_step(context, "manual", activity_id="dup_step:item-1")
+        await dup_step(context, "generated")
+
+        assert not [r for r in caplog.records if "used twice" in r.getMessage()]
+
     async def test_activity_with_multiple_arguments(self, context):
         """Test activity with multiple arguments."""
 
@@ -259,6 +293,23 @@ class TestActivityReplay:
 
         assert result1 == {"value": 100}
         assert result2 == {"value": 200}
+
+    async def test_replay_is_not_logged_as_reuse(self, replay_context, caplog):
+        """A replay uses each recorded ID again, once per run: no warning."""
+        caplog.set_level(logging.WARNING, logger="edda.context")
+
+        @activity
+        async def activity1(ctx: WorkflowContext) -> dict:
+            return {}
+
+        @activity
+        async def activity2(ctx: WorkflowContext) -> dict:
+            return {}
+
+        await activity1(replay_context)
+        await activity2(replay_context)
+
+        assert not [r for r in caplog.records if "used twice" in r.getMessage()]
 
     async def test_activity_replay_does_not_record_history(
         self, replay_context, sqlite_storage, workflow_instance_with_history
