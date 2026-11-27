@@ -748,10 +748,10 @@ class StorageProtocol(Protocol):
         """
         Cancel a workflow instance.
 
-        Only running or waiting_for_event workflows can be cancelled
+        Only running, waiting_for_* and recurred workflows can be cancelled
         (compensating instances are never cancellable).
         This method will:
-        1. Check current status (only cancel if running/waiting_for_event)
+        1. Check current status (only cancel if cancellable)
         2. Update status to 'cancelled'
         3. Clear locks so other workers are not blocked
         4. Remove event subscriptions (if waiting for event)

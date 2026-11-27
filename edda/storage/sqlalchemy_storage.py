@@ -2896,8 +2896,8 @@ class SQLAlchemyStorage:
         """
         Cancel a workflow instance.
 
-        Only running or waiting_for_event workflows can be cancelled
-        (and compensating ones unless allow_compensating is False).
+        Only running, waiting_for_* and recurred workflows can be cancelled;
+        compensating ones never are (their compensations run to the end).
         This method atomically:
         1. Checks current status
         2. Updates status to 'cancelled' if allowed (with atomic status check)
