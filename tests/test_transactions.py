@@ -435,3 +435,45 @@ async def test_sqlite_read_then_write_survives_a_concurrent_commit(tmp_path):
             writer.cancel()
         await other.dispose()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_savepoint_first_write_rolls_back_with_the_enclosing_transaction(db_storage):
+    """A savepoint that holds the transaction's first write is part of the
+    enclosing transaction. The sqlite3 driver sends BEGIN only before the
+    first INSERT, UPDATE or DELETE: a SAVEPOINT sent before that began a
+    transaction of its own, and releasing the savepoint committed its write."""
+    storage = db_storage
+    await storage.begin_transaction()
+    await storage.get_instance("sp-outer")  # the enclosing transaction only read so far
+    await storage.begin_transaction()  # savepoint
+    await storage.create_instance(
+        instance_id="sp-inner",
+        workflow_name="test_workflow",
+        source_hash="abc123def456",
+        owner_service="s",
+        input_data={},
+    )
+    await storage.commit_transaction()  # release the savepoint
+    await storage.rollback_transaction()  # roll back the enclosing transaction
+
+    assert await storage.get_instance("sp-inner") is None
+
+
+@pytest.mark.asyncio
+async def test_ctx_transaction_first_in_an_activity_rolls_back_with_it(context):
+    """ctx.transaction() inside an activity is a savepoint of the activity's
+    transaction, also when it holds the activity's first write."""
+
+    @activity
+    async def failing_activity(ctx: WorkflowContext) -> None:
+        async with ctx.transaction():
+            await send_event_transactional(
+                ctx, event_type="sp.event", event_source="test", event_data={}
+            )
+        raise TerminalError("the activity fails after the savepoint")
+
+    with pytest.raises(TerminalError):
+        await failing_activity(context)
+
+    assert await context.storage.get_pending_outbox_events() == []

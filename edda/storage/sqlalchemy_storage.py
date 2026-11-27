@@ -1223,9 +1223,29 @@ class SQLAlchemyStorage:
             await ctx.session.begin()  # type: ignore[union-attr]
         else:
             # Nested transaction - use SQLAlchemy's begin_nested() (creates SAVEPOINT)
+            await self._begin_sqlite_transaction_before_savepoint(ctx.session)  # type: ignore[arg-type]
             nested_tx = await ctx.session.begin_nested()  # type: ignore[union-attr]
             ctx.savepoint_stack.append(nested_tx)
             logger.debug(f"Created nested transaction (savepoint) at depth={ctx.depth}")
+
+    async def _begin_sqlite_transaction_before_savepoint(self, session: AsyncSession) -> None:
+        """
+        Make SQLite begin the enclosing transaction before a SAVEPOINT.
+
+        The sqlite3 driver (aiosqlite too) sends BEGIN only before the first
+        INSERT, UPDATE or DELETE, so a transaction that only read so far has
+        not begun in SQLite. A SAVEPOINT sent then begins a transaction of its
+        own, and releasing it commits: the enclosing transaction's rollback
+        would not undo what the savepoint wrote. Begin it here instead. This
+        pins nothing earlier than the SAVEPOINT itself would.
+        """
+        if self.engine.dialect.name != "sqlite":
+            return
+        connection = await session.connection()
+        raw = await connection.get_raw_connection()
+        driver = raw.driver_connection
+        if driver is not None and not driver.in_transaction:
+            await connection.exec_driver_sql("BEGIN")
 
     async def commit_transaction(self) -> None:
         """
