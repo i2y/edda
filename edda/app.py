@@ -11,13 +11,11 @@ import logging
 import math
 import os
 import random
-import sys
 import time
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
-import uvloop
 from cloudevents.exceptions import GenericException as CloudEventsException
 from cloudevents.http import from_http
 from sqlalchemy.engine import make_url
@@ -419,12 +417,9 @@ class EddaApp:
         if self._initialized:
             return
 
-        # Install uvloop for better performance
-        # Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
-        if sys.version_info >= (3, 12):
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        else:
-            uvloop.install()
+        # The server chooses the event loop (uvicorn and tsuno use uvloop).
+        # An event loop policy set here could not change the running loop, and
+        # the policy API is deprecated since Python 3.14.
 
         # Initialize storage
         await self.storage.initialize()

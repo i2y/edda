@@ -2,16 +2,7 @@
 Edda Framework - CloudEvents-native Durable Execution framework.
 
 Example:
-    >>> import asyncio
-    >>> import sys
-    >>> import uvloop
     >>> from edda import EddaApp, workflow, activity, wait_event, sleep
-    >>>
-    >>> # Python 3.12+ uses asyncio.set_event_loop_policy()
-    >>> if sys.version_info >= (3, 12):
-    ...     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    ... else:
-    ...     uvloop.install()
     >>>
     >>> app = EddaApp(
     ...     service_name="order-service",

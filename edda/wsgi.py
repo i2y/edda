@@ -7,8 +7,10 @@ WSGI servers like gunicorn or uWSGI.
 The adapter uses a2wsgi to convert the ASGI interface to WSGI.
 """
 
+import threading
 from typing import Any
 
+import uvloop
 from a2wsgi import ASGIMiddleware
 
 from edda.app import EddaApp
@@ -57,8 +59,9 @@ def create_wsgi_app(edda_app: EddaApp) -> Any:
 
             $ uwsgi --http :8000 --wsgi-file demo_app.py --callable wsgi_application
 
-    Background tasks (auto-resume, timer checks, etc.) will run in each
-    worker process.
+    The application and its background tasks (auto-resume, timer checks,
+    etc.) run on a uvloop event loop, in a background thread of each worker
+    process.
 
     For production deployments, ASGI servers (uvicorn, hypercorn) are
     recommended for better performance with Edda's async architecture.
@@ -69,9 +72,15 @@ def create_wsgi_app(edda_app: EddaApp) -> Any:
         - :class:`edda.app.EddaApp`: The main ASGI application class
         - :func:`edda.activity.activity`: Decorator supporting sync activities
     """
+    # a2wsgi runs the ASGI app on an event loop in a daemon thread. Left to
+    # itself it makes that loop with asyncio.new_event_loop(), which gives
+    # uvloop only if the process set uvloop's event loop policy (an API
+    # deprecated since Python 3.14). Give it a uvloop loop, started the same way.
+    loop = uvloop.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
     # Type ignore due to a2wsgi's strict ASGI type checking
     # EddaApp implements ASGI 3.0 interface correctly
-    return ASGIMiddleware(edda_app)  # type: ignore[arg-type]
+    return ASGIMiddleware(edda_app, loop=loop)  # type: ignore[arg-type]
 
 
 __all__ = ["create_wsgi_app"]
