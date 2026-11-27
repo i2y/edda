@@ -61,21 +61,24 @@ def find_migrations_dir() -> Path | None:
     Auto-detect migrations directory.
 
     Searches in the following order:
-    1. Package-bundled migrations (edda/migrations/)
-    2. Development environment (schema/db/migrations/)
+    1. Package-bundled migrations (edda/migrations/, in built wheels)
+    2. The source checkout this package was imported from
+       (<repository>/schema/db/migrations/, the schema submodule)
+
+    The current directory is never searched: run from another project's
+    directory, it would apply that project's copy of the schema.
 
     Returns:
         Path to migrations directory or None if not found
     """
-    # 1. Package-bundled migrations
-    pkg_dir = Path(__file__).parent.parent / "migrations"
-    if pkg_dir.exists():
-        return pkg_dir
-
-    # 2. Development environment (schema submodule)
-    schema_dir = Path.cwd() / "schema" / "db" / "migrations"
-    if schema_dir.exists():
-        return schema_dir
+    package_dir = Path(__file__).resolve().parent.parent
+    for candidate in (
+        package_dir / "migrations",
+        package_dir.parent / "schema" / "db" / "migrations",
+    ):
+        if candidate.is_dir():
+            logger.info("Using migrations from %s", candidate)
+            return candidate
 
     return None
 

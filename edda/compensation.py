@@ -9,6 +9,8 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from edda.locking import LockLostError
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -252,11 +254,18 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                 continue
 
             # Execute the compensation function directly
-            # Compensation functions should NOT have @activity decorator
+            # Compensation functions should NOT have @activity decorator.
+            # It runs as an activity body of this instance: FS calls work,
+            # and a workflow it starts gets this instance as spawn parent
+            # (so a sandboxed instance cannot spawn an unsandboxed child).
+            from edda.context import _current_workflow_context
+
             ctx._activity_depth += 1
+            context_token = _current_workflow_context.set(ctx)
             try:
                 await compensation_func(ctx, *comp_args, **comp_kwargs)
             finally:
+                _current_workflow_context.reset(context_token)
                 ctx._activity_depth -= 1
 
             # Record compensation execution in history (with idempotency)
@@ -274,6 +283,8 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                         "kwargs": comp_kwargs,
                     },
                 )
+            except LockLostError:
+                raise
             except Exception as record_error:
                 # UNIQUE constraint error means another process already recorded this compensation
                 # This is expected in concurrent cancellation scenarios - silently ignore
@@ -288,6 +299,11 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                     logger.warning("Failed to record %s execution: %s", activity_name, record_error)
 
             logger.info("Successfully executed compensation: %s", activity_name)
+
+        except LockLostError:
+            # Another worker owns the instance now and takes over the
+            # rollback; this run must stop compensating.
+            raise
 
         except Exception as error:
             # Log but don't fail the rollback
@@ -310,6 +326,8 @@ async def execute_compensations(ctx: "WorkflowContext") -> None:
                         "error_message": str(error),
                     },
                 )
+            except LockLostError:
+                raise
             except Exception as record_error:
                 # UNIQUE constraint error means another process already recorded this failure
                 error_msg = str(record_error)

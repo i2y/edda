@@ -147,11 +147,10 @@ class TestReceiveTimeoutReplay:
 
         ctx._activity_call_counters.clear()
 
-        # Should raise generic Exception for non-TimeoutError
-        with pytest.raises(Exception) as exc_info:
+        # Replay restores the recorded error class and message.
+        with pytest.raises(ValueError) as exc_info:
             await receive(ctx, channel="data", message_id="receive_data:1")
 
-        assert "ValueError" in str(exc_info.value)
         assert "Invalid message format" in str(exc_info.value)
 
 

@@ -372,3 +372,66 @@ async def test_atomic_rollback(context):
 
     # Outbox should be empty (rolled back with transaction)
     assert len(outbox) == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlite_read_then_write_survives_a_concurrent_commit(tmp_path):
+    """A transaction that reads first must still be able to write after
+    another connection wrote in between. One whose BEGIN pins a read snapshot
+    cannot (SQLITE_BUSY_SNAPSHOT under WAL; in rollback-journal mode its lock
+    upgrade is refused). edda's pysqlite engine begins the SQLite transaction
+    only at the first write, so a read pins nothing. The other writer may
+    instead wait for the transaction to commit (BEGIN IMMEDIATE): both
+    outcomes are fine, as long as both writes commit."""
+    import asyncio
+
+    from sqlalchemy import text
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/read-then-write.db"
+    storage = SQLAlchemyStorage(create_async_engine(url))
+    other = create_async_engine(url)  # another connection, outside edda's transaction
+
+    async def concurrent_write() -> None:
+        async with other.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE workflow_instances SET status = 'completed' "
+                    "WHERE instance_id = 'wf-theirs'"
+                )
+            )
+
+    writer: asyncio.Task[None] | None = None
+    try:
+        await storage.initialize()
+        await storage.upsert_workflow_definition(
+            workflow_name="wf", source_hash="h", source_code="pass"
+        )
+        for instance_id in ("wf-mine", "wf-theirs"):
+            await storage.create_instance(
+                instance_id=instance_id,
+                workflow_name="wf",
+                source_hash="h",
+                owner_service="t",
+                input_data={},
+            )
+
+        await storage.begin_transaction()
+        try:
+            assert (await storage.get_instance("wf-mine"))["status"] == "running"  # read first
+            writer = asyncio.create_task(concurrent_write())
+            await asyncio.wait({writer}, timeout=0.3)  # commits now, or waits for us
+            await storage.update_instance_status("wf-mine", "completed")
+            await storage.commit_transaction()
+        except BaseException:
+            if storage.in_transaction():
+                await storage.rollback_transaction()
+            raise
+        await writer
+
+        assert (await storage.get_instance("wf-mine"))["status"] == "completed"
+        assert (await storage.get_instance("wf-theirs"))["status"] == "completed"
+    finally:
+        if writer is not None and not writer.done():
+            writer.cancel()
+        await other.dispose()
+        await storage.close()

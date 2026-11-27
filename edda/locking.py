@@ -10,13 +10,15 @@ import logging
 import os
 import random
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from typing import Any
+from typing import Any, TypeVar
 
 from edda.storage.protocol import StorageProtocol
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def new_lock_identity(worker_id: str) -> str:
@@ -156,7 +158,12 @@ async def workflow_lock(
         raise RuntimeError(f"Failed to acquire lock for instance {instance_id}")
 
     refresh_task: asyncio.Task[Any] | None = None
+    stop_refresh = asyncio.Event()
     owner_task = asyncio.current_task()
+    # Cancellation requests the task already carries; the heartbeat's own
+    # request comes on top of them (see below).
+    cancelling = owner_task.cancelling() if owner_task is not None else 0
+    lost = asyncio.Event()
 
     try:
         # Start lock refresh task if requested. If the lock is lost the
@@ -165,21 +172,110 @@ async def workflow_lock(
         if refresh_interval is not None:
             refresh_task = asyncio.create_task(
                 _refresh_lock_periodically(
-                    storage, instance_id, worker_id, refresh_interval, owner_task
+                    storage,
+                    instance_id,
+                    worker_id,
+                    refresh_interval,
+                    owner_task,
+                    lost,
+                    stop_refresh,
                 )
             )
 
-        yield
+        try:
+            yield
+        except asyncio.CancelledError:
+            # The heartbeat's cancellation ends this block only, as
+            # LockLostError (the way asyncio.timeout ends its block with
+            # TimeoutError). The task running the block may be a caller's --
+            # a parent's activity starting a child inline, a loop resuming
+            # workflows -- and must not stay cancelled. A cancellation
+            # requested on top of the heartbeat's still propagates.
+            if lost.is_set() and owner_task is not None and owner_task.uncancel() <= cancelling:
+                raise LockLostError(f"Lock lost for instance {instance_id}") from None
+            raise
+        if lost.is_set():
+            # The block swallowed the heartbeat's cancellation; the run still
+            # lost its lease.
+            if owner_task is not None:
+                owner_task.uncancel()
+            raise LockLostError(f"Lock lost for instance {instance_id}")
 
     finally:
-        # Cancel refresh task
+        # Stop the refresh task (one that saw the lock lost ended with an error)
         if refresh_task is not None:
-            refresh_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await refresh_task
+            await _stop_heartbeat(refresh_task, stop_refresh)
 
         # Release lock
         await storage.release_lock(instance_id, worker_id)
+
+
+async def run_with_lock_heartbeat(
+    storage: StorageProtocol,
+    instance_id: str,
+    lock_id: str,
+    run: Callable[[], Awaitable[T]],
+    refresh_interval: float = 60.0,
+) -> T:
+    """
+    Run ``run()`` under a lock the caller already holds, keeping the lease alive.
+
+    The lease is refreshed once up front, so a claim that already lapsed (and
+    may belong to another worker now) raises LockLostError before anything
+    runs, and then every refresh_interval seconds. On lock loss only the
+    run's own task is cancelled -- never the caller's -- and LockLostError is
+    raised here.
+
+    Args:
+        storage: Storage backend
+        instance_id: Workflow instance whose lock is held
+        lock_id: Epoch lock identity the caller holds
+        run: Zero-argument coroutine function to execute
+        refresh_interval: Heartbeat interval in seconds
+
+    Raises:
+        LockLostError: If the lock is not (or no longer) held by lock_id
+    """
+    if not await storage.refresh_lock(instance_id, lock_id):
+        raise LockLostError(f"Lock lost for instance {instance_id}")
+    task = asyncio.ensure_future(run())
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _refresh_lock_periodically(storage, instance_id, lock_id, refresh_interval, task, stop=stop)
+    )
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if task.cancelled() and (current is None or current.cancelling() == 0):
+            # Cancelled by the heartbeat, not by our caller.
+            raise LockLostError(f"Lock lost for instance {instance_id}") from None
+        raise
+    finally:
+        await _stop_heartbeat(heartbeat, stop)
+
+
+# How long stopping a heartbeat waits for a refresh it is running.
+_HEARTBEAT_STOP_GRACE = 5.0
+
+
+async def _stop_heartbeat(heartbeat: asyncio.Task[Any], stop: asyncio.Event) -> None:
+    """Stop a heartbeat without cutting off a refresh it is running.
+
+    Cancelling a refresh mid-statement makes SQLAlchemy invalidate the
+    connection (with an in-memory SQLite database on a StaticPool, the whole
+    database goes with it). The heartbeat stops at its next wait instead; one
+    still running after the grace period is cancelled.
+    """
+    stop.set()
+    try:
+        if not heartbeat.done():
+            await asyncio.wait({heartbeat}, timeout=_HEARTBEAT_STOP_GRACE)
+    finally:
+        if not heartbeat.done():
+            heartbeat.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await heartbeat
 
 
 async def _refresh_lock_periodically(
@@ -188,6 +284,8 @@ async def _refresh_lock_periodically(
     worker_id: str,
     interval: float,
     owner_task: asyncio.Task[Any] | None = None,
+    lost: asyncio.Event | None = None,
+    stop: asyncio.Event | None = None,
 ) -> None:
     """
     Periodically refresh a lock to prevent timeout.
@@ -201,16 +299,27 @@ async def _refresh_lock_periodically(
         worker_id: Unique worker identifier
         interval: Refresh interval in seconds
         owner_task: Task to cancel if the lock is lost
+        lost: Set before owner_task is cancelled, so that the owner can tell
+            this cancellation from others
+        stop: Once set, the task ends at its next wait (see _stop_heartbeat)
     """
     with suppress(asyncio.CancelledError):
         while True:
-            await asyncio.sleep(interval)
+            if stop is None:
+                await asyncio.sleep(interval)
+            else:
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                if stop.is_set():
+                    return
 
             # Refresh the lock
             success = await storage.refresh_lock(instance_id, worker_id)
             if not success:
                 # Lock was lost - cancel the workflow run so a stale runner
                 # cannot keep executing without the lease.
+                if lost is not None:
+                    lost.set()
                 if owner_task is not None:
                     owner_task.cancel()
                 raise RuntimeError(
@@ -418,3 +527,13 @@ class LockLostError(Exception):
     """Raised when a lock is unexpectedly lost during execution."""
 
     pass
+
+
+class InstanceTerminatedError(LockLostError):
+    """Raised by a fenced write when the instance already reached a terminal
+    status (completed, failed, cancelled).
+
+    Terminal statuses are absorbing: a cancel that landed while a run held
+    the lock must not be overwritten. It is a LockLostError, so every path
+    that tears a run down on lock loss stops this run the same way.
+    """

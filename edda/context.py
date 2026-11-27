@@ -8,13 +8,24 @@ managing state, history, and replay during workflow execution.
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from edda.channels import ChannelMessage, ReceivedEvent
+from edda.exceptions import (
+    RetryExhaustedError,
+    RunAbortedError,
+    TerminalError,
+    WorkflowCancelledException,
+    kernel_error_class,
+    kernel_error_code,
+)
+from edda.locking import LockLostError
 from edda.storage.protocol import StorageProtocol
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+T = TypeVar("T")
 
 
 # Currently executing workflow context, tracked with a ContextVar so nested
@@ -22,6 +33,49 @@ if TYPE_CHECKING:
 _current_workflow_context: ContextVar[Any] = ContextVar(
     "edda_current_workflow_context", default=None
 )
+
+
+# Contexts whose activity body the current asyncio task is running (one entry
+# per nesting level). A ContextVar rather than a counter on the context, so a
+# primitive another task runs next to a running activity (asyncio.gather) is
+# still a recorded step: each task copies the value when it is created.
+_activity_bodies: ContextVar[tuple[int, ...]] = ContextVar("edda_activity_bodies", default=())
+
+
+def _restore_step_error(record: dict[str, Any]) -> Exception:
+    """Rebuild the error a recorded step or activity raised.
+
+    The stable kernel ``code`` wins when present (it is the cross-port
+    contract); otherwise the recorded class name is used. Retry exhaustion
+    and terminal activity failures keep their framework meaning. Old rows
+    without these fields fall back to a generic Exception carrying the old
+    ``Type: message`` text.
+    """
+    import builtins
+
+    from edda import exceptions
+
+    error_type = str(record.get("error_type") or "Exception")
+    message = str(record.get("error_message") or "")
+    cls = kernel_error_class(record.get("code"))
+    if cls is None and record.get("terminal"):
+        cls = TerminalError
+    if cls is None:
+        cls = getattr(exceptions, error_type, None) or getattr(builtins, error_type, None)
+    restored: Exception | None = None
+    if isinstance(cls, type) and issubclass(cls, Exception):
+        try:
+            restored = cls(message)
+        except Exception:
+            restored = None
+    if restored is None:
+        restored = Exception(f"{error_type}: {message}")
+    attempts = record.get("attempts")
+    if attempts:
+        exhausted = RetryExhaustedError(f"Activity failed after {attempts} attempts: {message}")
+        exhausted.__cause__ = restored
+        return exhausted
+    return restored
 
 
 class WorkflowContext:
@@ -67,7 +121,6 @@ class WorkflowContext:
         # no lock).
         self.lock_id = lock_id
         self.is_replaying = is_replaying
-        self._activity_depth = 0
         self.hooks = hooks
 
         # Activity ID tracking for deterministic replay
@@ -85,8 +138,37 @@ class WorkflowContext:
         # Default retry policy from EddaApp (set by ReplayEngine)
         self._app_retry_policy: Any = None
 
+        # Capability key from EddaApp (set by ReplayEngine); None = random secrets
+        self._capability_key: bytes | None = None
+
         # Direct subscriptions: channel names subscribed with mode="direct"
         self._direct_subscriptions: set[str] = set()
+
+        # One unexpected primitive/storage failure poisons the whole run; the
+        # same object is re-raised so the engine can tell abortion apart from
+        # an ordinary workflow failure.
+        self._run_abort_error: RunAbortedError | None = None
+
+    @property
+    def _activity_depth(self) -> int:
+        """How many activity bodies of this context the current asyncio task is in."""
+        return _activity_bodies.get().count(id(self))
+
+    @_activity_depth.setter
+    def _activity_depth(self, depth: int) -> None:
+        others = tuple(i for i in _activity_bodies.get() if i != id(self))
+        _activity_bodies.set(others + (id(self),) * depth)
+
+    def _poison_run(self, error: Exception) -> RunAbortedError:
+        """Poison this run with one stable abort error (internal use only)."""
+        if self._run_abort_error is None:
+            self._run_abort_error = RunAbortedError(error)
+        return self._run_abort_error
+
+    def _raise_if_run_aborted(self) -> None:
+        """Raise the run's abort error when an earlier primitive poisoned it."""
+        if self._run_abort_error is not None:
+            raise self._run_abort_error
 
     @property
     def storage(self) -> StorageProtocol:
@@ -181,6 +263,9 @@ class WorkflowContext:
                     "_error": True,
                     "error_type": event_data.get("error_type"),
                     "error_message": event_data.get("error_message"),
+                    "code": event_data.get("code"),
+                    "terminal": event_data.get("terminal"),
+                    "attempts": event_data.get("attempts"),
                 }
             elif event_type == "EventReceived":
                 # Cache the event data and metadata for wait_event replay
@@ -214,10 +299,11 @@ class WorkflowContext:
                 # Cache the message data for receive() replay
                 from datetime import UTC, datetime
 
-                raw_data = event_data.get("data", event_data.get("payload", {}))
-                data: dict[str, Any] | bytes = (
-                    raw_data if isinstance(raw_data, (dict, bytes)) else {}
-                )
+                from edda.channels import _message_data_from_history
+
+                data = _message_data_from_history(event_data)
+                if not isinstance(event_data, dict):
+                    event_data = {}  # a raw binary payload (written before 0.17)
                 # Parse published_at if available, otherwise use current time
                 published_at_str = event_data.get("published_at")
                 if published_at_str:
@@ -344,6 +430,7 @@ class WorkflowContext:
             activity_id=activity_id,
             event_type="ActivityCompleted",
             event_data=event_data,
+            lock_id=self.lock_id,
         )
 
         # Update current activity ID
@@ -381,17 +468,121 @@ class WorkflowContext:
             "stack_trace": stack_trace,
             "input": input_data or {},
         }
+        code = kernel_error_code(error)
+        if code is not None:
+            event_data["code"] = code
+        if isinstance(error, TerminalError):
+            event_data["terminal"] = True
 
         # Include retry metadata if provided
         if retry_metadata is not None:
             event_data["retry_metadata"] = retry_metadata.to_dict()
+            if getattr(retry_metadata, "exhausted", False):
+                event_data["attempts"] = retry_metadata.total_attempts
 
         await self.storage.append_history(
             self.instance_id,
             activity_id=activity_id,
             event_type="ActivityFailed",
             event_data=event_data,
+            lock_id=self.lock_id,
         )
+
+    @asynccontextmanager
+    async def _fenced_transaction(self) -> AsyncIterator[None]:
+        """
+        Run the block in a storage transaction that first proves this run
+        still holds the instance lock, committing only if the block succeeds
+        (internal use only).
+
+        What the block writes lands together, and never for a run that lost
+        its lease. Inside an enclosing transaction the block joins it; a
+        context built outside a run (no lock_id) has no lock to prove.
+        """
+        if self.storage.in_transaction():
+            yield
+            return
+        await self.storage.begin_transaction()
+        try:
+            if self.lock_id is not None:
+                await self.storage.prove_lock(self.instance_id, self.lock_id)
+            yield
+        except BaseException:
+            await self.storage.rollback_transaction()
+            raise
+        await self.storage.commit_transaction()
+
+    async def _run_step(
+        self, name: str, fn: Callable[[], Awaitable[T]], *, effect: bool = False
+    ) -> T:
+        """
+        Run a kernel primitive as a recorded workflow step (internal use only).
+
+        A value or a kernel-defined error is the step's outcome and is recorded.
+        Any other exception is not an outcome: the run is poisoned and ends so a
+        later run re-executes the primitive. A primitive reports a bad argument
+        or payload it detects itself as InvalidArgumentError; a TypeError or
+        ValueError from anywhere else (a driver's "Connection closed", say) is
+        not an outcome. Inside an activity body fn runs directly; the activity
+        is the recorded unit.
+        """
+        self._raise_if_run_aborted()
+        if self._activity_depth > 0:
+            return await fn()
+        activity_id = self._generate_activity_id(name)
+        self._record_activity_id(activity_id)
+        found, cached = self._get_cached_result(activity_id)
+        if found:
+            if isinstance(cached, dict) and cached.get("_error"):
+                raise _restore_step_error(cached)
+            return cast(T, cached)
+
+        async def record_kernel_failure(error: Exception) -> None:
+            try:
+                await self._record_activity_failed(activity_id, name, error)
+            except (LockLostError, WorkflowCancelledException):
+                raise
+            except Exception as record_error:
+                raise self._poison_run(record_error) from record_error
+
+        if not effect:
+            try:
+                result = await fn()
+            except (LockLostError, WorkflowCancelledException):
+                raise
+            except Exception as error:
+                if kernel_error_code(error) is not None:
+                    await record_kernel_failure(error)
+                    raise error
+                raise self._poison_run(error) from error
+            try:
+                await self._record_activity_completed(activity_id, name, result)
+            except (LockLostError, WorkflowCancelledException):
+                raise
+            except Exception as error:
+                raise self._poison_run(error) from error
+            return result
+
+        fn_error: Exception | None = None
+        try:
+            async with self._fenced_transaction():
+                try:
+                    result = await fn()
+                except Exception as error:
+                    fn_error = error
+                    raise
+                await self._record_activity_completed(activity_id, name, result)
+        except (LockLostError, WorkflowCancelledException):
+            raise
+        except Exception as error:
+            if fn_error is not None:
+                if kernel_error_code(fn_error) is not None:
+                    await record_kernel_failure(fn_error)
+                    raise fn_error from error
+                raise self._poison_run(fn_error) from fn_error
+            # Recording or committing failed: storage errors are not outcomes.
+            raise self._poison_run(error) from error
+        return result
 
     async def _get_instance(self) -> dict[str, Any] | None:
         """
@@ -480,7 +671,7 @@ class WorkflowContext:
         try:
             yield
             await self.storage.commit_transaction()
-        except Exception:
+        except BaseException:
             await self.storage.rollback_transaction()
             raise
 
@@ -534,11 +725,11 @@ class WorkflowContext:
         """
         Restart the workflow with fresh history (Erlang-style tail recursion).
 
-        This method prevents unbounded history growth in long-running loops by:
-        1. Completing the current workflow instance (marking as "recurred")
-        2. Archiving the current history (not deleted)
-        3. Starting a new workflow instance with the provided arguments
-        4. Linking the new instance to the old one via `continued_from`
+        This method prevents unbounded history growth in long-running loops by
+        ending the current iteration and continuing the SAME workflow instance
+        with the provided arguments. The current history is archived and the
+        instance briefly enters the live ``recurred`` state before the next
+        iteration runs.
 
         This is similar to Erlang's tail recursion pattern where calling the same
         function at the end of a loop prevents stack growth. In Edda, `recur()`
@@ -571,8 +762,9 @@ class WorkflowContext:
         Note:
             - Group memberships are NOT automatically transferred. You must re-join
               groups in the new iteration if needed.
-            - The old workflow's history is archived, not deleted.
-            - The new instance has a `continued_from` field pointing to the old instance.
+            - The workflow's history is archived, not deleted.
+            - The instance id, actor names, monitors, capabilities, tasks, FS
+              ownership and sandbox flag survive the iteration.
             - During replay, if recur() was already called, this raises immediately
               without re-executing previous activities.
         """

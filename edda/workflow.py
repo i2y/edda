@@ -21,12 +21,12 @@ class RecurException(Exception):
     """
     Exception raised to signal that a workflow should recur (restart with fresh history).
 
-    This is similar to Erlang's tail recursion pattern - it prevents unbounded history
-    growth in long-running loops by completing the current workflow instance and
-    starting a new one with the provided arguments.
+    This is similar to Erlang's tail recursion pattern - it prevents unbounded
+    history growth in long-running loops by ending the current iteration and
+    continuing the SAME workflow instance with the provided arguments.
 
-    The workflow's history is archived (not deleted) and a new instance is created
-    with a reference to the previous instance (continued_from).
+    The workflow's history is archived (not deleted). The instance id and all
+    instance-scoped actor state survive the iteration boundary.
 
     Note:
         This exception should not be caught by user code. It is handled internally

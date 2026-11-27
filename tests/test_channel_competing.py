@@ -12,10 +12,12 @@ Tests cover:
 - Multiple workers competing for messages
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
 from edda.channels import (
     ChannelMessage,
@@ -24,6 +26,9 @@ from edda.channels import (
     subscribe,
 )
 from edda.context import WorkflowContext
+from edda.locking import new_lock_identity
+
+pytestmark = pytest.mark.multidb
 
 
 @pytest.mark.asyncio
@@ -543,3 +548,124 @@ class TestCompetingClaimTakeover:
         inst = await sqlite_storage.get_instance(iid)
         assert inst["status"] == "running"  # stays resumable
         assert inst["locked_by"] is None
+
+
+@pytest.mark.asyncio
+async def test_delivery_skips_a_subscriber_that_is_not_waiting(
+    sqlite_storage, create_test_instance
+):
+    """A message is delivered only into a registered wait. A subscriber whose
+    wait registration outlived its wait (the instance is running again) keeps
+    the message pending for its next receive: nothing recorded, nothing
+    deleted."""
+    iid = await create_test_instance("wf-not-waiting", "wf", {})
+    await sqlite_storage.update_instance_status(iid, "running")
+    await sqlite_storage.subscribe_to_channel(iid, "jobs", "competing")
+    async with sqlite_storage.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE channel_subscriptions SET activity_id = 'receive_jobs:1' "
+                "WHERE instance_id = :i"
+            ),
+            {"i": iid},
+        )
+    msg_id = await sqlite_storage.publish_to_channel("jobs", {"n": 1})
+
+    delivered = await sqlite_storage.deliver_channel_message(
+        instance_id=iid,
+        channel="jobs",
+        message_id=msg_id,
+        data={"n": 1},
+        metadata={},
+        worker_id=new_lock_identity("worker-A"),
+    )
+
+    assert delivered is None
+    assert await sqlite_storage.get_history(iid) == []
+    pending = await sqlite_storage.get_pending_channel_messages(iid, "jobs")
+    assert [m["message_id"] for m in pending] == [msg_id]
+    inst = await sqlite_storage.get_instance(iid)
+    assert (inst["status"], inst["locked_by"]) == ("running", None)
+
+
+@pytest.mark.asyncio
+async def test_losing_claimer_in_a_transaction_finds_the_message_gone(
+    sqlite_storage, create_test_instance
+):
+    """The claim locks the message row first: a losing claimer waits for the
+    winner's transaction and then finds the message consumed -- instead of
+    failing the FK check of its own claim, which aborts its transaction
+    (PostgreSQL) or deadlocks (MySQL)."""
+    if sqlite_storage.engine.dialect.name == "sqlite":
+        pytest.skip("one shared in-memory connection; SQLite serializes writers anyway")
+    winner_id = await create_test_instance("wf-claim-winner", "wf", {})
+    loser_id = await create_test_instance("wf-claim-loser", "wf", {})
+    msg_id = await sqlite_storage.publish_to_channel("jobs", {"n": 1})
+    claimed_by_winner = asyncio.Event()
+
+    async def winner():
+        await sqlite_storage.begin_transaction()
+        try:
+            assert await sqlite_storage.claim_channel_message(msg_id, winner_id)
+            claimed_by_winner.set()
+            await asyncio.sleep(0.5)  # the loser is now waiting on the winner
+            await sqlite_storage.delete_channel_message(msg_id)
+            await sqlite_storage.commit_transaction()
+        except BaseException:
+            if sqlite_storage.in_transaction():
+                await sqlite_storage.rollback_transaction()
+            raise
+
+    async def loser():
+        await claimed_by_winner.wait()
+        await sqlite_storage.begin_transaction()
+        try:
+            await sqlite_storage.append_history(
+                loser_id, "before:1", "ActivityCompleted", {"result": 1}
+            )
+            claimed = await sqlite_storage.claim_channel_message(msg_id, loser_id)
+            await sqlite_storage.append_history(
+                loser_id, "after:1", "ActivityCompleted", {"result": 2}
+            )
+            await sqlite_storage.commit_transaction()
+        except BaseException:
+            if sqlite_storage.in_transaction():
+                await sqlite_storage.rollback_transaction()
+            raise
+        return claimed
+
+    winner_task = asyncio.create_task(winner())
+    loser_task = asyncio.create_task(loser())
+    claimed = await asyncio.wait_for(loser_task, timeout=20)
+    await asyncio.wait_for(winner_task, timeout=20)
+
+    assert claimed is False
+    history = await sqlite_storage.get_history(loser_id)
+    assert sorted(h["activity_id"] for h in history) == ["after:1", "before:1"]
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_race_keeps_caller_transaction(sqlite_storage, create_test_instance):
+    """A claim that loses to a live claim answers False without failing on
+    the unique key: inside a transaction (PostgreSQL would abort it) the
+    caller's earlier writes still commit."""
+    a = await create_test_instance("wf-claim-a", "wf", {})
+    b = await create_test_instance("wf-claim-b", "wf", {})
+    for iid in (a, b):
+        await sqlite_storage.update_instance_status(iid, "running")
+        await sqlite_storage.subscribe_to_channel(iid, "jobs", "competing")
+    msg_id = await sqlite_storage.publish_to_channel("jobs", {"n": 1})
+    assert await sqlite_storage.claim_channel_message(msg_id, a)
+
+    await sqlite_storage.begin_transaction()
+    try:
+        await sqlite_storage.append_history(
+            b, activity_id="before:1", event_type="ActivityCompleted", event_data={"result": 1}
+        )
+        assert not await sqlite_storage.claim_channel_message(msg_id, b)
+        await sqlite_storage.commit_transaction()
+    except BaseException:
+        if sqlite_storage.in_transaction():
+            await sqlite_storage.rollback_transaction()
+        raise
+    assert [h["activity_id"] for h in await sqlite_storage.get_history(b)] == ["before:1"]

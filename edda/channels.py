@@ -26,7 +26,7 @@ Example:
     ...         # Receive messages (blocks until message available)
     ...         msg = await receive(ctx, "tasks")
     ...         await process(ctx, msg.data, activity_id=f"process:{msg.id}")
-    ...         await ctx.recur()
+    ...         await ctx.recur(id=id)
     >>>
     >>> @workflow
     ... async def producer(ctx: WorkflowContext, task_data: dict):
@@ -35,6 +35,7 @@ Example:
 
 from __future__ import annotations
 
+import base64
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -58,16 +59,40 @@ class ChannelMessage:
     Attributes:
         id: Unique message identifier
         channel: Channel name this message was received on
-        data: Message payload (dict or bytes)
+        data: Message payload as published: any JSON value, or bytes
         metadata: Optional metadata (source, timestamp, etc.)
         published_at: When the message was published
     """
 
     id: str
     channel: str
-    data: dict[str, Any] | bytes
+    data: Any
     metadata: dict[str, Any] = field(default_factory=dict)
     published_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+def _message_history_fields(data: Any) -> dict[str, Any]:
+    """Payload fields of a ChannelMessageReceived history entry. History is
+    JSON, so bytes are stored base64-encoded and marked as binary."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return {"data": base64.b64encode(bytes(data)).decode("ascii"), "data_type": "binary"}
+    return {"data": data, "data_type": "json"}
+
+
+def _message_data_from_history(event_data: Any) -> Any:
+    """The payload a ChannelMessageReceived entry recorded (the inverse of
+    _message_history_fields)."""
+    if isinstance(event_data, (bytes, bytearray, memoryview)):
+        # Before 0.17 a binary message was stored as the raw history payload.
+        return bytes(event_data)
+    raw = event_data["data"] if "data" in event_data else event_data.get("payload", {})
+    data_type = event_data.get("data_type")
+    if data_type == "binary":
+        return base64.b64decode(raw)
+    if data_type is None:
+        # Entries written before 0.17 kept only dicts: replay what they replayed.
+        return raw if isinstance(raw, dict) else {}
+    return raw
 
 
 # =============================================================================
@@ -90,7 +115,7 @@ class WaitForChannelMessageException(Exception):
     def __init__(
         self,
         channel: str,
-        timeout_seconds: int | None,
+        timeout_seconds: float | None,
         activity_id: str,
     ) -> None:
         self.channel = channel
@@ -117,7 +142,7 @@ class WaitForTimerException(Exception):
 
     def __init__(
         self,
-        duration_seconds: int,
+        duration_seconds: float,
         expires_at: datetime,
         timer_id: str,
         activity_id: str,
@@ -152,22 +177,63 @@ class ChannelModeConflictError(Exception):
 # =============================================================================
 
 
+def _channel_seal_scopes(channel: str) -> list[str]:
+    """channel, then each of its prefixes that ends before a ':' -- the
+    channels whose seal applies to it (a seal on L covers the physical
+    direct names "L:{instance_id}")."""
+    return [channel] + [channel[:i] for i in range(len(channel) - 1, 0, -1) if channel[i] == ":"]
+
+
+def _check_json_payload(data: Any, metadata: dict[str, Any] | None) -> None:
+    """Raise InvalidArgumentError when a message cannot be stored: data
+    other than bytes, and metadata, must be JSON-serializable. Checked in
+    the publish step itself, so the refusal is recorded like the kernel's
+    other argument errors instead of surfacing from storage."""
+    import json
+
+    from edda.exceptions import InvalidArgumentError
+
+    try:
+        if not isinstance(data, bytes):
+            json.dumps(data)
+        if metadata:
+            json.dumps(metadata)
+    except (TypeError, ValueError) as error:
+        raise InvalidArgumentError(f"message is not JSON-serializable: {error}") from error
+
+
 async def _enforce_channel_capability(
     storage: StorageProtocol, kind: str, channel: str, token: str | None
 ) -> None:
     """Sealed-channel semantics: while no grants of kind exist for the
     channel it is open to everyone; once the first grant is issued the
-    operation requires a valid capability token."""
+    operation requires a valid capability token. A seal on a channel also
+    covers every name under it ("L:..."), so each sealed scope is checked."""
     from edda.actors import _hash_secret
     from edda.exceptions import ChannelPermissionError
 
-    if not await storage.has_capability_grants(kind, channel):
-        return
-    if not token:
-        raise ChannelPermissionError(f"channel {channel!r} is sealed for {kind}")
-    secret = token.rsplit(":", 1)[-1] if token.startswith("cap:") else token
-    if not await storage.check_capability(kind, channel, _hash_secret(secret)):
-        raise ChannelPermissionError(f"invalid capability for channel {channel!r}")
+    for scope in _channel_seal_scopes(channel):
+        if not await storage.has_capability_grants(kind, scope):
+            continue
+        if not token:
+            raise ChannelPermissionError(f"channel {scope!r} is sealed for {kind}")
+        secret = token.rsplit(":", 1)[-1] if token.startswith("cap:") else token
+        if not await storage.check_capability(kind, scope, _hash_secret(secret)):
+            raise ChannelPermissionError(f"invalid capability for channel {scope!r}")
+
+
+async def _enforce_direct_privacy(ctx: WorkflowContext, channel: str) -> None:
+    """A direct channel "L:X", X an existing instance other than the caller, is
+    private to X whatever the seal state. Instance IDs may contain ':', so every
+    split point is checked. Sending to such a channel stays allowed."""
+    from edda.exceptions import ChannelPermissionError
+
+    for i, char in enumerate(channel):
+        if char != ":":
+            continue
+        owner = channel[i + 1 :]
+        if owner and owner != ctx.instance_id and await ctx.storage.get_instance(owner):
+            raise ChannelPermissionError(f"channel {channel!r} is private to instance {owner!r}")
 
 
 async def subscribe(
@@ -211,7 +277,7 @@ async def subscribe(
         ...     while True:
         ...         event = await receive(ctx, "order.events")
         ...         await handle_event(ctx, event.data, activity_id=f"handle:{event.id}")
-        ...         await ctx.recur()
+        ...         await ctx.recur(id=id)
 
         >>> @workflow
         ... async def job_worker(ctx: WorkflowContext, worker_id: str):
@@ -221,7 +287,7 @@ async def subscribe(
         ...     while True:
         ...         job = await receive(ctx, "jobs")
         ...         await execute_job(ctx, job.data, activity_id=f"job:{job.id}")
-        ...         await ctx.recur()
+        ...         await ctx.recur(worker_id=worker_id)
 
         >>> @workflow
         ... async def direct_receiver(ctx: WorkflowContext, id: str):
@@ -243,6 +309,14 @@ async def subscribe(
         raise ValueError(
             f"Invalid subscription mode: {mode}. Must be 'broadcast', 'competing', or 'direct'"
         )
+    elif ":" in channel:
+        # Another instance's direct channel is private (a direct subscription
+        # is to this instance's own channel by construction). subscribe is no
+        # step of its own, so the check is one: a refusal replays as recorded.
+        async def _check_privacy() -> None:
+            await _enforce_direct_privacy(ctx, channel)
+
+        await ctx._run_step(f"edda.subscribe_{channel}", _check_privacy)
 
     # Check for mode conflict
     existing_mode = await ctx.storage.get_channel_mode(actual_channel)
@@ -283,7 +357,7 @@ async def unsubscribe(
 async def receive(
     ctx: WorkflowContext,
     channel: str,
-    timeout_seconds: int | None = None,
+    timeout_seconds: float | None = None,
     message_id: str | None = None,
     capability_token: str | None = None,
 ) -> ChannelMessage:
@@ -315,8 +389,20 @@ async def receive(
         ...     while True:
         ...         msg = await receive(ctx, "tasks")
         ...         await process(ctx, msg.data, activity_id=f"process:{msg.id}")
-        ...         await ctx.recur()
+        ...         await ctx.recur(id=id)
     """
+    ctx._raise_if_run_aborted()
+    if ctx._activity_depth > 0:
+        from edda.exceptions import TerminalError
+
+        # The activity is the recorded unit and a replay does not run its body,
+        # so a receive here could neither be recorded nor suspend. Refused
+        # (not run directly): a blocking receive has no meaning in a body.
+        raise TerminalError(
+            "receive() cannot be called inside an activity body; "
+            "receive in the workflow and pass the message to the activity"
+        )
+
     # Transform channel for direct subscriptions
     actual_channel = channel
     if ctx._is_direct_subscription(channel):
@@ -336,20 +422,15 @@ async def receive(
         if found:
             # Check for cached error
             if isinstance(cached_result, dict) and cached_result.get("_error"):
-                error_type = cached_result.get("error_type", "Exception")
-                error_message = cached_result.get("error_message", "Unknown error")
-                if error_type == "TimeoutError":
-                    raise TimeoutError(error_message)
-                raise Exception(f"{error_type}: {error_message}")
+                from edda.context import _restore_step_error
+
+                raise _restore_step_error(cached_result)
             # Return cached ChannelMessage
             if isinstance(cached_result, ChannelMessage):
                 return cached_result
             # Convert dict to ChannelMessage (from history)
             if isinstance(cached_result, dict):
-                raw_data = cached_result.get("data", cached_result.get("payload", {}))
-                data: dict[str, Any] | bytes = (
-                    raw_data if isinstance(raw_data, (dict, bytes)) else {}
-                )
+                data = _message_data_from_history(cached_result)
                 published_at_str = cached_result.get("published_at")
                 published_at = (
                     datetime.fromisoformat(published_at_str)
@@ -365,81 +446,94 @@ async def receive(
                 )
             raise RuntimeError(f"Unexpected cached result type: {type(cached_result)}")
 
-    # Sealed-channel enforcement comes after the replay cache lookup:
-    # replays of a completed receive never re-check, keeping replay
-    # deterministic even if the capability is later revoked.
-    await _enforce_channel_capability(ctx.storage, "channel_sub", channel, capability_token)
+    try:
+        # Sealed-channel enforcement comes after the replay cache lookup:
+        # replays of a completed receive never re-check, keeping replay
+        # deterministic even if the capability is later revoked.
+        if not ctx._is_direct_subscription(channel):
+            await _enforce_direct_privacy(ctx, channel)
+        await _enforce_channel_capability(ctx.storage, "channel_sub", channel, capability_token)
 
-    # Check for pending messages in the queue
-    msg_dict = None
-    msg_id = ""
-    competing = False
-    pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, actual_channel)
-    if pending:
-        subscription = await _get_subscription(ctx, actual_channel)
-        competing = bool(subscription and subscription.get("mode") == "competing")
+        # Consume a pending message. The claim (competing) or the cursor advance
+        # (broadcast), the history record and the competing delete commit in one
+        # transaction that first proves this run still holds the lock: a run
+        # that lost its lease consumes nothing (no stale claim hides the message,
+        # no cursor skips it), and two consumers never record the same message.
+        pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, actual_channel)
+        if pending:
+            subscription = await _get_subscription(ctx, actual_channel)
+            competing = bool(subscription and subscription.get("mode") == "competing")
 
-        if competing:
-            # Claim the first claimable message; a fresh claim by another
-            # live instance just skips it rather than retrying the whole
-            # pending scan.
-            for candidate in pending:
-                claimed = await ctx.storage.claim_channel_message(
-                    candidate["message_id"], ctx.instance_id
-                )
-                if claimed:
-                    msg_dict = candidate
-                    msg_id = candidate["message_id"]
-                    break
-        else:
-            msg_dict = pending[0]
-            msg_id = msg_dict["message_id"]
+            # Competing: a message claimed by another live instance is skipped
+            # rather than retrying the whole pending scan.
+            for msg_dict in pending if competing else pending[:1]:
+                msg_id = msg_dict["message_id"]
+                async with ctx._fenced_transaction():
+                    if competing:
+                        if not await ctx.storage.claim_channel_message(msg_id, ctx.instance_id):
+                            continue
+                    else:
+                        await ctx.storage.update_delivery_cursor(
+                            actual_channel, ctx.instance_id, msg_dict["id"]
+                        )
 
-    if msg_dict is not None:
-        if not competing:
-            # Broadcast mode - update cursor
-            await ctx.storage.update_delivery_cursor(
-                actual_channel, ctx.instance_id, msg_dict["id"]
-            )
+                    # Build the message (the payload exactly as published)
+                    data = msg_dict.get("data")
+                    published_at_str = msg_dict.get("published_at")
+                    published_at = (
+                        datetime.fromisoformat(published_at_str)
+                        if isinstance(published_at_str, str)
+                        else (
+                            published_at_str
+                            if isinstance(published_at_str, datetime)
+                            else datetime.now(UTC)
+                        )
+                    )
 
-        # Build the message
-        raw_data = msg_dict.get("data")
-        data = raw_data if isinstance(raw_data, (dict, bytes)) else {}
-        published_at_str = msg_dict.get("published_at")
-        published_at = (
-            datetime.fromisoformat(published_at_str)
-            if isinstance(published_at_str, str)
-            else (published_at_str if isinstance(published_at_str, datetime) else datetime.now(UTC))
-        )
+                    message = ChannelMessage(
+                        id=msg_id,
+                        channel=channel,
+                        data=data,
+                        metadata=msg_dict.get("metadata") or {},
+                        published_at=published_at,
+                    )
 
-        message = ChannelMessage(
-            id=msg_id,
-            channel=channel,
-            data=data,
-            metadata=msg_dict.get("metadata") or {},
-            published_at=published_at,
-        )
+                    # Record in history for replay (fenced as well)
+                    await ctx.storage.append_history(
+                        ctx.instance_id,
+                        activity_id,
+                        "ChannelMessageReceived",
+                        {
+                            "id": message.id,
+                            "channel": message.channel,
+                            **_message_history_fields(message.data),
+                            "metadata": message.metadata,
+                            "published_at": message.published_at.isoformat(),
+                        },
+                        lock_id=ctx.lock_id,
+                    )
 
-        # Record in history for replay
-        await ctx.storage.append_history(
-            ctx.instance_id,
-            activity_id,
-            "ChannelMessageReceived",
-            {
-                "id": message.id,
-                "channel": message.channel,
-                "data": message.data,
-                "metadata": message.metadata,
-                "published_at": message.published_at.isoformat(),
-            },
-        )
+                    # Competing mode consumes the message: delete it (with the
+                    # claim) so it cannot be delivered again.
+                    if competing:
+                        await ctx.storage.delete_channel_message(msg_id)
+                return message
 
-        # Competing mode consumes the message: delete it (with the claim)
-        # once history is durable so it cannot be delivered again.
-        if competing:
-            await ctx.storage.delete_channel_message(msg_id)
+    except Exception as error:
+        from edda.exceptions import ChannelPermissionError, WorkflowCancelledException
+        from edda.locking import LockLostError
 
-        return message
+        if isinstance(error, ChannelPermissionError):
+            try:
+                await ctx._record_activity_failed(activity_id, f"receive_{channel}", error)
+            except (LockLostError, WorkflowCancelledException):
+                raise
+            except Exception as record_error:
+                raise ctx._poison_run(record_error) from record_error
+            raise
+        if isinstance(error, (LockLostError, WorkflowCancelledException)):
+            raise
+        raise ctx._poison_run(error) from error
 
     # No pending messages, raise exception to pause workflow
     raise WaitForChannelMessageException(
@@ -463,11 +557,12 @@ async def _get_subscription(ctx: WorkflowContext, channel: str) -> dict[str, Any
 async def publish(
     ctx_or_storage: WorkflowContext,
     channel: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     metadata: dict[str, Any] | None = None,
     *,
     target_instance_id: str | None = None,
     worker_id: str | None = None,
+    capability_token: str | None = None,
 ) -> str: ...
 
 
@@ -475,18 +570,19 @@ async def publish(
 async def publish(
     ctx_or_storage: StorageProtocol,
     channel: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     metadata: dict[str, Any] | None = None,
     *,
     target_instance_id: str | None = None,
     worker_id: str | None = None,
+    capability_token: str | None = None,
 ) -> str: ...
 
 
 async def publish(
     ctx_or_storage: WorkflowContext | StorageProtocol,
     channel: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     metadata: dict[str, Any] | None = None,
     *,
     target_instance_id: str | None = None,
@@ -502,7 +598,7 @@ async def publish(
     Args:
         ctx_or_storage: Workflow context or storage backend
         channel: Channel name to publish to
-        data: Message payload (dict or bytes)
+        data: Message payload: any JSON-serializable value, or bytes
         metadata: Optional metadata
         target_instance_id: If provided, only deliver to this specific instance
                            (Point-to-Point delivery). If None, deliver to all
@@ -536,17 +632,56 @@ async def publish(
     from edda.context import WorkflowContext as WfCtx
 
     if isinstance(ctx_or_storage, WfCtx):
-        storage = ctx_or_storage.storage
+        ctx = ctx_or_storage
         # Add source metadata
         full_metadata = metadata.copy() if metadata else {}
-        full_metadata.setdefault("source_instance_id", ctx_or_storage.instance_id)
+        full_metadata.setdefault("source_instance_id", ctx.instance_id)
         full_metadata.setdefault("published_at", datetime.now(UTC).isoformat())
-        effective_worker_id = worker_id or ctx_or_storage.worker_id
-    else:
-        storage = ctx_or_storage
-        full_metadata = metadata.copy() if metadata else {}
-        full_metadata.setdefault("published_at", datetime.now(UTC).isoformat())
-        effective_worker_id = worker_id or f"publisher-{uuid.uuid4()}"
+        effective_worker_id = worker_id or ctx.worker_id
+
+        async def _publish() -> str:
+            _check_json_payload(data, full_metadata)
+            return await _publish_and_wake(
+                ctx.storage,
+                channel,
+                data,
+                full_metadata,
+                target_instance_id=target_instance_id,
+                worker_id=effective_worker_id,
+                capability_token=capability_token,
+            )
+
+        # From workflow code a publish is a recorded step: the message and its
+        # record commit together under the run's lock, and a replay returns
+        # the recorded message id instead of publishing again.
+        return await ctx._run_step("edda.publish", _publish, effect=True)
+
+    full_metadata = metadata.copy() if metadata else {}
+    full_metadata.setdefault("published_at", datetime.now(UTC).isoformat())
+    return await _publish_and_wake(
+        ctx_or_storage,
+        channel,
+        data,
+        full_metadata,
+        target_instance_id=target_instance_id,
+        worker_id=worker_id or f"publisher-{uuid.uuid4()}",
+        capability_token=capability_token,
+    )
+
+
+async def _publish_and_wake(
+    storage: StorageProtocol,
+    channel: str,
+    data: Any,
+    full_metadata: dict[str, Any],
+    *,
+    target_instance_id: str | None,
+    worker_id: str,
+    capability_token: str | None,
+) -> str:
+    """Publish a message and wake its waiting subscribers (after commit
+    when called inside a transaction). Returns the message ID."""
+    effective_worker_id = worker_id
 
     # Sealed-channel enforcement (no-op while the channel has no grants)
     await _enforce_channel_capability(storage, "channel_pub", channel, capability_token)
@@ -597,7 +732,7 @@ async def _wake_waiting_subscribers(
     storage: StorageProtocol,
     channel: str,
     message_id: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     metadata: dict[str, Any],
     *,
     target_instance_id: str | None = None,
@@ -669,7 +804,7 @@ async def _wake_waiting_subscribers(
 async def send_to(
     ctx: WorkflowContext,
     instance_id: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     channel: str = "__direct__",
     metadata: dict[str, Any] | None = None,
     capability_token: str | None = None,
@@ -688,7 +823,10 @@ async def send_to(
         metadata: Optional metadata
 
     Returns:
-        True if delivered, False if no workflow waiting
+        True if delivered, False if no workflow waiting. Sent inside a
+        transaction (as every send from workflow code is: the message
+        commits together with the step record), delivery runs after commit
+        and True means the target was waiting for the message.
 
     Example:
         >>> @workflow
@@ -700,23 +838,42 @@ async def send_to(
     full_metadata.setdefault("source_instance_id", ctx.instance_id)
     full_metadata.setdefault("sent_at", datetime.now(UTC).isoformat())
 
-    # Publish to a direct channel for the target instance
-    direct_channel = f"{channel}:{instance_id}"
-    await _enforce_channel_capability(ctx.storage, "channel_pub", channel, capability_token)
+    async def _send() -> bool:
+        _check_json_payload(data, full_metadata)
+        # Publish to a direct channel for the target instance
+        direct_channel = f"{channel}:{instance_id}"
+        await _enforce_channel_capability(ctx.storage, "channel_pub", channel, capability_token)
 
-    message_id = await ctx.storage.publish_to_channel(direct_channel, data, full_metadata)
+        message_id = await ctx.storage.publish_to_channel(direct_channel, data, full_metadata)
 
-    # Try to deliver
-    result = await ctx.storage.deliver_channel_message(
-        instance_id=instance_id,
-        channel=direct_channel,
-        message_id=message_id,
-        data=data,
-        metadata=full_metadata,
-        worker_id=ctx.worker_id,
-    )
+        async def deliver() -> bool:
+            result = await ctx.storage.deliver_channel_message(
+                instance_id=instance_id,
+                channel=direct_channel,
+                message_id=message_id,
+                data=data,
+                metadata=full_metadata,
+                worker_id=ctx.worker_id,
+            )
+            return result is not None
 
-    return result is not None
+        if not ctx.storage.in_transaction():
+            return await deliver()
+
+        # Inside a transaction the delivery cannot see the message yet: it
+        # runs after commit, and the answer is whether the target waits for
+        # the message now (it is woken then).
+        async def deliver_after_commit() -> None:
+            await deliver()
+
+        waiting = await ctx.storage.get_channel_subscribers_waiting(direct_channel)
+        ctx.storage.register_post_commit_callback(deliver_after_commit)
+        return any(w["instance_id"] == instance_id for w in waiting)
+
+    # From workflow code a send is a recorded step: the message and its
+    # record commit together under the run's lock, and a replay returns the
+    # recorded outcome instead of sending again.
+    return await ctx._run_step("edda.send_to", _send, effect=True)
 
 
 # =============================================================================
@@ -724,9 +881,22 @@ async def send_to(
 # =============================================================================
 
 
+def _round_up_deadline(deadline: datetime) -> datetime:
+    """Round a timer deadline up to a whole second (UTC).
+
+    The timer sweep fires on ``expires_at <= now``, but the databases keep
+    timestamps to the second (SQLite truncates, MySQL rounds), so a deadline
+    with a fraction would fire up to a second early.
+    """
+    deadline = deadline.astimezone(UTC)
+    if deadline.microsecond:
+        deadline = deadline.replace(microsecond=0) + timedelta(seconds=1)
+    return deadline
+
+
 async def sleep(
     ctx: WorkflowContext,
-    seconds: int,
+    seconds: float,
     timer_id: str | None = None,
 ) -> None:
     """
@@ -747,6 +917,8 @@ async def sleep(
         ...     await sleep(ctx, 60)  # Wait 60 seconds for payment
         ...     await check_payment(ctx, order_id, activity_id="check:1")
     """
+    ctx._raise_if_run_aborted()
+
     # Generate activity ID
     if timer_id is None:
         activity_id = ctx._generate_activity_id("sleep")
@@ -764,6 +936,8 @@ async def sleep(
 
     # Calculate expiry time (deterministic - calculated once)
     expires_at = datetime.now(UTC) + timedelta(seconds=seconds)
+    if seconds > 0:
+        expires_at = _round_up_deadline(expires_at)
 
     # Raise exception to pause workflow
     raise WaitForTimerException(
@@ -801,6 +975,8 @@ async def sleep_until(
         ...     await sleep_until(ctx, tomorrow_9am)
         ...     await generate_report(ctx, report_id, activity_id="generate:1")
     """
+    ctx._raise_if_run_aborted()
+
     if target_time.tzinfo is None:
         raise ValueError("target_time must be timezone-aware")
 
@@ -823,6 +999,8 @@ async def sleep_until(
     now = datetime.now(UTC)
     delta = target_time - now
     seconds = max(0, int(delta.total_seconds()))
+    if delta.total_seconds() > 0:
+        target_time = _round_up_deadline(target_time)
 
     # Raise exception to pause workflow
     raise WaitForTimerException(
@@ -1008,6 +1186,8 @@ async def wait_event(
         ...     # Type-safe access with IDE completion
         ...     amount = payment_event.data.amount
     """
+    ctx._raise_if_run_aborted()
+
     # Auto-subscribe to the event_type channel if not already subscribed
     subscription = await _get_subscription(ctx, event_type)
     if subscription is None:

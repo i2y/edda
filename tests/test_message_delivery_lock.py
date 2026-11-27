@@ -255,10 +255,14 @@ class TestDeliverMessageLockFirst:
 
         assert result is not None
 
-        # Verify binary data in history
+        # History is JSON: the bytes are recorded base64-encoded, marked binary
+        from edda.channels import _message_data_from_history
+
         history = await sqlite_storage.get_history(instance_id)
         assert len(history) == 1
-        assert history[0]["event_data"] == binary_data
+        assert history[0]["event_data"]["data_type"] == "binary"
+        assert history[0]["event_data"]["channel"] == "binary_channel"
+        assert _message_data_from_history(history[0]["event_data"]) == binary_data
 
     async def test_deliver_message_preserves_metadata(self, sqlite_storage, workflow_instance):
         """Test that metadata is preserved in the delivered message."""

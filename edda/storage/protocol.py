@@ -5,7 +5,7 @@ This module defines the StorageProtocol using Python's structural typing (Protoc
 Any storage implementation that conforms to this protocol can be used with Edda.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -355,6 +355,20 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def prove_lock(self, instance_id: str, lock_id: str) -> None:
+        """
+        Prove that lock_id still holds the instance lock, in the current
+        transaction.
+
+        A conditional write that only matches while ``locked_by == lock_id``.
+        Inside a transaction it also orders the transaction after any lease
+        steal: the instance row stays locked until commit.
+
+        Raises:
+            LockLostError: If lock_id does not hold the lock
+        """
+        ...
+
     async def cleanup_stale_locks(self) -> list[dict[str, str]]:
         """
         Clean up locks that have expired (based on lock_expires_at column).
@@ -460,6 +474,19 @@ class StorageProtocol(Protocol):
 
         Returns:
             Number of history entries archived
+        """
+        ...
+
+    async def reset_instance_for_recur(
+        self, instance_id: str, input_data: dict[str, Any], lock_id: str
+    ) -> None:
+        """
+        Atomically reset a locked instance for its next recur iteration.
+
+        Implementations must archive history, delete channel subscriptions and
+        waits, timer subscriptions, group memberships, and compensations, keep
+        channel delivery cursors, replace input_data, and set status
+        ``recurred`` in one transaction fenced by lock_id.
         """
         ...
 
@@ -715,11 +742,14 @@ class StorageProtocol(Protocol):
     # Workflow Cancellation Methods
     # -------------------------------------------------------------------------
 
-    async def cancel_instance(self, instance_id: str, cancelled_by: str) -> bool:
+    async def cancel_instance(
+        self, instance_id: str, cancelled_by: str, *, allow_compensating: bool = True
+    ) -> bool:
         """
         Cancel a workflow instance.
 
-        Only running or waiting_for_event workflows can be cancelled.
+        Only running or waiting_for_event workflows can be cancelled
+        (compensating instances are never cancellable).
         This method will:
         1. Check current status (only cancel if running/waiting_for_event)
         2. Update status to 'cancelled'
@@ -733,8 +763,15 @@ class StorageProtocol(Protocol):
 
         Returns:
             True if successfully cancelled, False if already completed/failed/cancelled
-            or if instance not found
+            or if instance not found. The allow_compensating argument is retained
+            for compatibility and ignored.
         """
+        ...
+
+    async def finalize_cancelled_instance(
+        self, instance_id: str, cancelled_by: str, lock_id: str
+    ) -> bool:
+        """Finish a cancellation after compensations, fenced by lock_id."""
         ...
 
     # -------------------------------------------------------------------------
@@ -877,12 +914,15 @@ class StorageProtocol(Protocol):
         worker_id: str,
         limit: int | None = None,
         timeout_seconds: int = 300,
+        workflow_names: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Atomically claim resumable workflows (status='running', unlocked).
 
         Each returned row is already locked by worker_id — use an
         epoch-bearing identity so downstream writes are fenced.
+        workflow_names limits the claim to the workflows this worker has
+        registered (None: any).
 
         Returns:
             List of claimed workflows (instance_id, workflow_name,
@@ -898,6 +938,10 @@ class StorageProtocol(Protocol):
 
     async def unregister_actor_name(self, name: str) -> None:
         """Remove an actor name binding (idempotent)."""
+        ...
+
+    async def unregister_own_actor_name(self, name: str, owner: str) -> None:
+        """Remove a name held by owner; NotOwnerError if another instance holds it."""
         ...
 
     async def whereis_actor(self, name: str) -> str | None:
@@ -934,6 +978,10 @@ class StorageProtocol(Protocol):
         """Remove a capability grant by ID (idempotent)."""
         ...
 
+    async def revoke_own_capability(self, capability_id: str, owner: str) -> None:
+        """Remove a grant issued by owner; NotOwnerError if another instance issued it."""
+        ...
+
     async def has_capability_grants(self, kind: str, target: str) -> bool:
         """Whether ANY grant exists for (kind, target) — sealed-channel check."""
         ...
@@ -955,7 +1003,8 @@ class StorageProtocol(Protocol):
         ...
 
     async def delete_expired_capabilities(self) -> int:
-        """Remove expired capability grants (leader sweep)."""
+        """Remove expired grants that another live or newer grant makes redundant
+        (leader sweep); the newest expired grant stays and keeps its channel sealed."""
         ...
 
     async def fs_get(self, path: str) -> dict[str, Any] | None:
@@ -1003,7 +1052,12 @@ class StorageProtocol(Protocol):
     async def channel_messages_since(
         self, channel: str, message_id: str | None
     ) -> list[dict[str, Any]]:
-        """Return messages on channel published after message_id cursor."""
+        """Return messages on channel published after message_id cursor
+        (None/"" = all); CursorNotFoundError if no such message is on the channel."""
+        ...
+
+    async def channel_messages_after(self, channel: str, after_id: int) -> list[dict[str, Any]]:
+        """Return messages on channel with a row id above after_id (0 = all), by id."""
         ...
 
     async def find_resumable_workflows(self, limit: int | None = None) -> list[dict[str, Any]]:
@@ -1150,7 +1204,7 @@ class StorageProtocol(Protocol):
         worker_id: str,
         channel: str,
         activity_id: str | None = None,
-        timeout_seconds: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.

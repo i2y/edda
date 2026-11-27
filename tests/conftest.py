@@ -2,14 +2,15 @@
 Pytest configuration and fixtures for Edda tests.
 """
 
+import itertools
 import os
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import make_url, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool, StaticPool
 
 from edda.serialization.json import JSONSerializer
 from edda.storage.migrations import apply_dbmate_migrations
@@ -17,6 +18,66 @@ from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
 # Path to schema migrations (relative to project root)
 SCHEMA_DIR = Path(__file__).parent.parent / "schema" / "db" / "migrations"
+
+MULTIDB_BACKENDS = ["sqlite", "postgresql", "mysql"]
+_multidb_seq = itertools.count()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "multidb: run the module's sqlite_storage-based tests on SQLite, PostgreSQL and MySQL",
+    )
+
+
+def pytest_generate_tests(metafunc):
+    """Modules marked ``multidb`` get ``sqlite_storage`` parametrized over all
+    three backends (PostgreSQL/MySQL: one container per session, a fresh
+    database per test)."""
+    if (
+        metafunc.definition.get_closest_marker("multidb") is not None
+        and "sqlite_storage" in metafunc.fixturenames
+    ):
+        metafunc.parametrize("sqlite_storage", MULTIDB_BACKENDS, indirect=True)
+
+
+@pytest.fixture(scope="session")
+def multidb_postgresql_url():
+    try:
+        import asyncpg  # noqa: F401
+        from testcontainers.postgres import PostgresContainer
+    except ModuleNotFoundError:
+        pytest.skip("asyncpg/testcontainers not installed")
+    with PostgresContainer(
+        "postgres:17", username="edda", password="edda_test_password", dbname="edda_test"
+    ) as postgres:
+        yield postgres.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.fixture(scope="session")
+def multidb_mysql_url():
+    try:
+        import aiomysql  # noqa: F401
+        from testcontainers.mysql import MySqlContainer
+    except ModuleNotFoundError:
+        pytest.skip("aiomysql/testcontainers not installed")
+    # root: every test creates its own database
+    with MySqlContainer(
+        "mysql:9", username="root", password="edda_test_password", dbname="edda_test"
+    ) as mysql:
+        yield mysql.get_connection_url().replace("mysql://", "mysql+aiomysql://", 1)
+
+
+async def _fresh_database_engine(base_url: str) -> AsyncEngine:
+    """Create an empty database on the shared server and return an engine for it."""
+    name = f"edda_t{next(_multidb_seq)}"
+    admin = create_async_engine(base_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        await conn.execute(text(f"CREATE DATABASE {name}"))
+    await admin.dispose()
+    return create_async_engine(
+        make_url(base_url).set(database=name), echo=False, isolation_level="READ COMMITTED"
+    )
 
 
 def get_database_urls() -> dict[str, str]:
@@ -171,14 +232,22 @@ async def db_storage(request):
 
 
 @pytest_asyncio.fixture
-async def sqlite_storage():
-    """Create an in-memory SQLite storage for testing."""
-    # Use StaticPool to ensure all connections share the same in-memory database
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        echo=False,
-        poolclass=StaticPool,
-    )
+async def sqlite_storage(request):
+    """Create an in-memory SQLite storage for testing.
+
+    In modules marked ``multidb`` the fixture is parametrized (see
+    pytest_generate_tests) and also yields PostgreSQL and MySQL storages.
+    """
+    backend = getattr(request, "param", "sqlite")
+    if backend == "sqlite":
+        # Use StaticPool to ensure all connections share the same in-memory database
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            echo=False,
+            poolclass=StaticPool,
+        )
+    else:
+        engine = await _fresh_database_engine(request.getfixturevalue(f"multidb_{backend}_url"))
 
     # Apply migrations from SQL files
     await apply_dbmate_migrations(engine, SCHEMA_DIR)

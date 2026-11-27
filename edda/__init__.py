@@ -43,7 +43,15 @@ from edda.channels import (
 )
 from edda.compensation import compensation, on_failure, register_compensation
 from edda.context import WorkflowContext
-from edda.exceptions import RetryExhaustedError, TerminalError
+from edda.exceptions import (
+    ActorNameTakenError,
+    CursorNotFoundError,
+    InvalidArgumentError,
+    NotOwnerError,
+    RetryExhaustedError,
+    RunAbortedError,
+    TerminalError,
+)
 from edda.hooks import HooksBase, WorkflowHooks
 from edda.outbox import OutboxRelayer, send_event_transactional
 from edda.retry import RetryPolicy
@@ -92,6 +100,11 @@ __all__ = [
     "RetryPolicy",
     "RetryExhaustedError",
     "TerminalError",
+    "ActorNameTakenError",
+    "NotOwnerError",
+    "CursorNotFoundError",
+    "InvalidArgumentError",
+    "RunAbortedError",
     # WSGI
     "create_wsgi_app",
 ]

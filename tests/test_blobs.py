@@ -7,6 +7,8 @@ import pytest
 from edda import blobs
 from edda.context import WorkflowContext
 
+pytestmark = pytest.mark.multidb
+
 
 @pytest.mark.asyncio
 async def test_put_get_blob(sqlite_storage):

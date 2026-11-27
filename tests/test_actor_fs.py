@@ -1,10 +1,20 @@
 """Tests for the shared actor filesystem (CAS + fs_write capability)."""
 
+import asyncio
+
 import pytest
+from sqlalchemy import text
 
 from edda import actors, fs
+from edda.activity import activity
+from edda.channels import sleep
 from edda.context import WorkflowContext
 from edda.exceptions import FSConflictError, FSForbiddenError, FSOutsideActivityError
+from edda.replay import ReplayEngine
+from edda.retry import RetryPolicy
+from edda.workflow import set_replay_engine, workflow
+
+pytestmark = pytest.mark.multidb
 
 
 def _ctx(storage, iid="fs-actor-1"):
@@ -101,3 +111,124 @@ async def test_fs_list(sqlite_storage):
     await sqlite_storage.fs_put("/shared/100%/real", b"x", "wf-1", 0)
     lst = await sqlite_storage.fs_list("/shared/100%/")
     assert [o["path"] for o in lst] == ["/shared/100%/real"]
+
+
+@pytest.fixture
+def replay_engine(sqlite_storage):
+    engine = ReplayEngine(storage=sqlite_storage, service_name="fs-test", worker_id="fs-worker")
+    set_replay_engine(engine)
+    yield engine
+    set_replay_engine(None)
+
+
+async def _fire_timer_and_resume(storage, engine, iid, wf):
+    """Expire the instance's pending timer and resume it, as EddaApp does."""
+    async with storage.engine.begin() as conn:
+        timer_id, activity_id = (
+            await conn.execute(
+                text(
+                    "SELECT timer_id, activity_id FROM workflow_timer_subscriptions "
+                    "WHERE instance_id = :i"
+                ),
+                {"i": iid},
+            )
+        ).one()
+    await storage.append_history(
+        iid,
+        activity_id=activity_id,
+        event_type="TimerExpired",
+        event_data={"result": None, "timer_id": timer_id},
+    )
+    await storage.remove_timer_subscription(iid, timer_id)
+    await storage.update_instance_status(iid, "running")
+    await engine.resume_workflow(iid, wf.func)
+
+
+@pytest.mark.asyncio
+async def test_fs_inside_real_activity(sqlite_storage, replay_engine):
+    """FS calls are allowed in a real @activity body, including one that first
+    executes in a resumed (replaying) run."""
+
+    @activity(retry_policy=RetryPolicy(max_attempts=1))
+    async def fs_bump(ctx: WorkflowContext, data: str) -> dict:
+        path = f"/actor/{ctx.instance_id}/notes"
+        _, version = await fs.fs_read(ctx, path)
+        await fs.fs_write(ctx, path, data.encode(), version)
+        return {"version": version + 1}
+
+    @workflow
+    async def fs_activity_wf(ctx: WorkflowContext) -> dict:
+        first = await fs_bump(ctx, "v1")
+        await sleep(ctx, 1)
+        second = await fs_bump(ctx, "v2")
+        return {"versions": [first["version"], second["version"]]}
+
+    iid = await fs_activity_wf.start()
+    assert (await sqlite_storage.get_instance(iid))["status"] == "waiting_for_timer"
+    await _fire_timer_and_resume(sqlite_storage, replay_engine, iid, fs_activity_wf)
+
+    inst = await sqlite_storage.get_instance(iid)
+    assert inst["status"] == "completed"
+    assert inst["output_data"]["result"] == {"versions": [1, 2]}
+    assert (await sqlite_storage.fs_get(f"/actor/{iid}/notes"))["data"] == b"v2"
+
+
+@pytest.mark.asyncio
+async def test_fs_list_stays_inside_owner_boundary(sqlite_storage):
+    """A prefix is normalized to the owner boundary: "/actor/sup-1" must not
+    list "/actor/sup-1:a:g1/...", and "/shared" must not list "/sharedX"."""
+    me = _in_activity(_ctx(sqlite_storage, "sup-1"))
+    await sqlite_storage.fs_put("/actor/sup-1/own.txt", b"x", "sup-1", 0)
+    await sqlite_storage.fs_put("/actor/sup-1:a:g1/child.txt", b"x", "sup-1:a:g1", 0)
+    await sqlite_storage.fs_put("/shared/pub.txt", b"x", "sup-1", 0)
+    await sqlite_storage.fs_put("/sharedX/leak.txt", b"x", "sup-1", 0)
+
+    async def listed(prefix):
+        return [o["path"] for o in await fs.fs_list(me, prefix)]
+
+    assert await listed("/actor/sup-1") == ["/actor/sup-1/own.txt"]
+    assert await listed("/actor/sup-1/") == ["/actor/sup-1/own.txt"]
+    assert await listed("/actor/sup-1/o") == ["/actor/sup-1/own.txt"]
+    assert await listed("/shared") == ["/shared/pub.txt"]
+    assert await listed("/shared/") == ["/shared/pub.txt"]
+
+    for prefix in ("", "/", "/actor", "/actor/", "/actor/sup", "/actor/sup-1:a:g1/", "/sharedX"):
+        with pytest.raises(FSForbiddenError):
+            await fs.fs_list(me, prefix)
+
+
+@pytest.mark.asyncio
+async def test_fs_put_conflict_keeps_enclosing_transaction_usable(sqlite_storage):
+    """Losing a create race inside a caller transaction maps to
+    FSConflictError without aborting that transaction."""
+    storage = sqlite_storage
+    if storage.engine.dialect.name == "sqlite":
+        pytest.skip("needs two concurrent writers")
+    inserted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def winner():
+        await storage.begin_transaction()
+        await storage.fs_put("/shared/race", b"a", "wf-1", 0)
+        inserted.set()
+        await release.wait()
+        await storage.commit_transaction()
+
+    async def loser():
+        await inserted.wait()
+        await storage.begin_transaction()
+        try:
+            with pytest.raises(FSConflictError):
+                await storage.fs_put("/shared/race", b"b", "wf-2", 0)
+            await storage.fs_put("/shared/after", b"c", "wf-2", 0)
+            await storage.commit_transaction()
+        except BaseException:
+            await storage.rollback_transaction()
+            raise
+
+    racers = [asyncio.create_task(winner()), asyncio.create_task(loser())]
+    await asyncio.sleep(0.5)  # the loser's INSERT now waits on the winner's row
+    release.set()
+    await asyncio.gather(*racers)
+    assert (await storage.fs_get("/shared/race"))["data"] == b"a"
+    assert (await storage.fs_get("/shared/after"))["data"] == b"c"

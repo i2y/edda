@@ -9,8 +9,9 @@ and transactional outbox pattern.
 import json
 import logging
 import re
+import sqlite3
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     delete,
+    event,
     func,
     inspect,
     or_,
@@ -56,6 +58,139 @@ OUTBOX_CLAIM_STALE_SECONDS = 300
 # returns it to 'open' (orphaned by a crashed claimant).
 TASK_CLAIM_STALE_SECONDS = 300
 
+# Terminal workflow statuses. They are absorbing: no fenced write moves an
+# instance out of them.
+_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
+# Key in a pooled connection's info: the session settings are applied.
+_SESSION_PINNED = "edda_session_pinned"
+
+
+def _pin_postgresql_session(dbapi_connection: Any, record: Any) -> None:
+    # A SET inside a transaction that is later rolled back is undone, so it
+    # runs in autocommit (SQLAlchemy's search_path recipe).
+    previous = dbapi_connection.autocommit
+    dbapi_connection.autocommit = True
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET TIME ZONE 'UTC'")
+    finally:
+        cursor.close()
+        dbapi_connection.autocommit = previous
+    record.info[_SESSION_PINNED] = True
+
+
+def _pin_mysql_time_zone(dbapi_connection: Any, record: Any) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET time_zone = '+00:00'")
+    finally:
+        cursor.close()
+    record.info[_SESSION_PINNED] = True
+
+
+def _pin_mysql_session(dbapi_connection: Any, record: Any) -> None:
+    _pin_mysql_time_zone(dbapi_connection, record)
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    finally:
+        cursor.close()
+
+
+_CHECKOUT_PINS: dict[Callable[[Any, Any], None], Callable[[Any, Any, Any], None]] = {}
+
+
+def _pin_at_checkout(listener: Callable[[Any, Any], None]) -> Callable[[Any, Any, Any], None]:
+    """The checkout listener that applies ``listener`` to a pooled connection
+    it has not run on: one the engine opened before the storage existed."""
+    pin = _CHECKOUT_PINS.get(listener)
+    if pin is None:
+
+        def pin(dbapi_connection: Any, record: Any, _proxy: Any) -> None:
+            if not record.info.get(_SESSION_PINNED):
+                listener(dbapi_connection, record)
+
+        _CHECKOUT_PINS[listener] = pin
+    return pin
+
+
+def is_write_conflict(error: BaseException | None) -> bool:
+    """Whether the error is SQLite's SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT.
+
+    A transaction that read before it wrote fails at once with it when another
+    connection wrote in between, and any write fails with it once
+    busy_timeout is spent. The attempt can simply run again.
+    """
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, sqlite3.OperationalError):
+            code = getattr(error, "sqlite_errorcode", None)
+            if code is not None:
+                return bool((code & 0xFF) == sqlite3.SQLITE_BUSY)
+            return "database is locked" in str(error)
+        error = getattr(error, "orig", None) or error.__cause__ or error.__context__
+    return False
+
+
+def _use_sqlite_wal(dbapi_connection: Any, record: Any) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        # busy_timeout first: switching the journal mode needs a lock.
+        cursor.execute("PRAGMA busy_timeout = 5000")
+        cursor.execute("PRAGMA journal_mode = WAL")
+    finally:
+        cursor.close()
+    record.info[_SESSION_PINNED] = True
+
+
+def _is_sqlite_file_database(engine: AsyncEngine) -> bool:
+    url = engine.url
+    in_memory = (
+        url.database in (None, "", ":memory:")
+        or url.query.get("mode") == "memory"
+        or "mode=memory" in (url.database or "")
+    )
+    return url.get_backend_name() == "sqlite" and not in_memory
+
+
+def _install_session_settings(engine: AsyncEngine) -> None:
+    """
+    Pin every new connection of the engine to UTC and, on MySQL, to READ
+    COMMITTED -- also for an engine the caller built. File-backed SQLite
+    databases run in WAL mode (readers and a writer no longer block each
+    other); in-memory ones keep their default.
+
+    The schema stores TIMESTAMP without a zone and compares it with NOW(),
+    and edda writes UTC (deadlines, timer expiry, leases): in any other
+    session zone a fresh lease looks expired, or timers fire hours early or
+    late. The kernel's protocols assume READ COMMITTED, not MySQL's default
+    REPEATABLE READ (stale snapshots, gap locks). An engine created with an
+    explicit ``isolation_level`` keeps it. A connection the engine opened
+    before the storage was created (the caller ran migrations or its own
+    queries first) gets the settings when it is first checked out.
+    """
+    backend = engine.dialect.name
+    if backend == "postgresql":
+        listener = _pin_postgresql_session
+    elif backend == "mysql":
+        explicit = getattr(engine.dialect, "_on_connect_isolation_level", None)
+        listener = _pin_mysql_time_zone if explicit else _pin_mysql_session
+    elif _is_sqlite_file_database(engine):
+        listener = _use_sqlite_wal
+    else:
+        return
+    target = engine.sync_engine
+    if not event.contains(target, "connect", listener):
+        # First, so that an engine-level isolation_level, which SQLAlchemy
+        # applies in its own connect handler, still wins.
+        event.listen(target, "connect", listener, insert=True)
+    checkout = _pin_at_checkout(listener)
+    if not event.contains(target, "checkout", checkout):
+        event.listen(target, "checkout", checkout)
+
 
 def _like_escape(s: str) -> str:
     """Escape LIKE wildcards (and the escape char itself) for ESCAPE '\\'."""
@@ -77,14 +212,14 @@ def _canonical_ts(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _normalize_expiry(expires_at: str | None) -> str | None:
-    """Normalize a caller-supplied expiry to the canonical UTC form."""
+def _normalize_expiry(expires_at: str | None) -> datetime | None:
+    """Parse a caller-supplied expiry (ISO 8601; naive means UTC) as aware UTC."""
     if expires_at is None:
         return None
     dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return _canonical_ts(dt)
+    return dt.astimezone(UTC)
 
 
 class SchemaVersion(Base):
@@ -570,11 +705,54 @@ class SQLAlchemyStorage:
         self.engine = engine
         self._notify_listener = notify_listener
         self._migrations_dir = migrations_dir
+        _install_session_settings(engine)
 
     @property
     def _is_postgresql(self) -> bool:
         """Check if the database is PostgreSQL."""
         return self.engine.dialect.name == "postgresql"
+
+    def _ts_param(self, dt: datetime | None = None, *, tz: bool = False) -> Any:
+        """Bind value for a timestamp parameter of a raw text() statement (UTC).
+
+        text() binds carry no column type, so each driver needs its own form:
+        SQLite gets the canonical text of its datetime('now') defaults,
+        asyncpg a naive UTC datetime for TIMESTAMP and an aware one for
+        TIMESTAMPTZ (tz=True; only actor_tasks.claimed_at), MySQL a naive UTC
+        datetime. dt defaults to now; a naive dt is taken as UTC.
+        """
+        if dt is None:
+            dt = datetime.now(UTC)
+        elif dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        if self.engine.dialect.name == "sqlite":
+            return _canonical_ts(dt)
+        if tz and self._is_postgresql:
+            return dt
+        return dt.replace(tzinfo=None)
+
+    async def _insert_unless_exists(
+        self, session: AsyncSession, sql: str, conflict: str, params: dict[str, Any]
+    ) -> bool:
+        """Run a one-row INSERT; return False when it hits the unique key.
+
+        PostgreSQL and SQLite skip the row with ON CONFLICT DO NOTHING: a
+        unique violation would abort an enclosing PostgreSQL transaction.
+        MySQL keeps the transaction usable after a duplicate-key error, so it
+        is caught there (INSERT IGNORE would also hide truncation errors).
+        """
+        if self.engine.dialect.name == "mysql":
+            try:
+                await session.execute(text(sql), params)
+            except IntegrityError as exc:
+                if getattr(exc.orig, "args", (None,))[0] != 1062:  # ER_DUP_ENTRY
+                    raise
+                return False
+            return True
+        result = await session.execute(text(f"{sql} ON CONFLICT ({conflict}) DO NOTHING"), params)
+        return bool(result.rowcount)  # type: ignore[attr-defined]
 
     @property
     def _notify_enabled(self) -> bool:
@@ -632,6 +810,15 @@ class SQLAlchemyStorage:
             payload: Dictionary to serialize as JSON payload (max ~7500 bytes).
         """
         if not self._notify_enabled:
+            return
+
+        if self.in_transaction():
+            # Notify once the data is visible (and not at all on rollback):
+            # a listener woken before the commit would miss it.
+            async def notify_after_commit() -> None:
+                await self._send_notify(channel, payload)
+
+            self.register_post_commit_callback(notify_after_commit)
             return
 
         try:
@@ -1352,13 +1539,19 @@ class SQLAlchemyStorage:
         ``locked_by == lock_id`` still holds, and raises LockLostError
         otherwise.
         """
-        from edda.locking import LockLostError
-
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             conditions = [WorkflowInstance.instance_id == instance_id]
             if lock_id is not None:
                 conditions.append(WorkflowInstance.locked_by == lock_id)
+                # Terminal statuses are absorbing; rewriting the same status
+                # (output first, then status) stays a no-op success.
+                conditions.append(
+                    or_(
+                        WorkflowInstance.status == status,
+                        WorkflowInstance.status.notin_(_TERMINAL_STATUSES),
+                    )
+                )
             stmt = (
                 update(WorkflowInstance)
                 .where(and_(*conditions))
@@ -1373,9 +1566,32 @@ class SQLAlchemyStorage:
 
             result = await session.execute(stmt)
             if lock_id is not None and (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
-                await session.rollback()
-                raise LockLostError(f"Lock lost for instance {instance_id}")
+                # The refused write changed nothing; a caller's transaction
+                # is left for the caller to decide on (_session_scope rolls
+                # back a session of our own).
+                raise await self._fenced_write_refused(session, instance_id, lock_id)
             await self._commit_if_not_in_transaction(session)
+
+    async def _fenced_write_refused(
+        self, session: AsyncSession, instance_id: str, lock_id: str
+    ) -> Exception:
+        """Explain a fenced write that matched no row.
+
+        InstanceTerminatedError when lock_id still holds an instance that
+        already terminated, LockLostError otherwise.
+        """
+        from edda.locking import InstanceTerminatedError, LockLostError
+
+        row = (
+            await session.execute(
+                select(WorkflowInstance.locked_by, WorkflowInstance.status).where(
+                    WorkflowInstance.instance_id == instance_id
+                )
+            )
+        ).one_or_none()
+        if row is not None and row[0] == lock_id and row[1] in _TERMINAL_STATUSES:
+            return InstanceTerminatedError(f"Workflow instance {instance_id} already {row[1]}")
+        return LockLostError(f"Lock lost for instance {instance_id}")
 
     async def update_instance_activity(
         self, instance_id: str, activity_id: str, lock_id: str | None = None
@@ -1397,7 +1613,6 @@ class SQLAlchemyStorage:
                 .values(current_activity_id=activity_id, updated_at=func.now())
             )
             if lock_id is not None and (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
-                await session.rollback()
                 raise LockLostError(f"Lock lost for instance {instance_id}")
             await self._commit_if_not_in_transaction(session)
 
@@ -1735,6 +1950,37 @@ class SQLAlchemyStorage:
             await session.commit()
             return bool(result.rowcount and result.rowcount > 0)  # type: ignore[attr-defined]
 
+    async def prove_lock(self, instance_id: str, lock_id: str) -> None:
+        """
+        Prove that lock_id still holds the instance lock, in the current
+        transaction (unlike the lock operations, this joins it).
+
+        The conditional write only matches while ``locked_by == lock_id``.
+        It also orders the transaction after any lease steal: PostgreSQL
+        and MySQL keep the instance row locked until commit, SQLite holds
+        the write lock.
+
+        Raises:
+            LockLostError: If lock_id does not hold the lock
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.locked_by == lock_id,
+                    )
+                )
+                .values(updated_at=func.now())
+            )
+            if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                from edda.locking import LockLostError
+
+                raise LockLostError(f"Lock lost for instance {instance_id}")
+            await self._commit_if_not_in_transaction(session)
+
     async def cleanup_stale_locks(self) -> list[dict[str, str]]:
         """
         Clean up locks that have expired (based on lock_expires_at column).
@@ -1775,7 +2021,7 @@ class SQLAlchemyStorage:
                 stale_instance_ids.append(instance.instance_id)
 
                 # Add to resume list if status is 'running' or 'compensating'
-                if instance.status in ["running", "compensating"]:
+                if instance.status in ["running", "compensating", "recurred"]:
                     workflows_to_resume.append(
                         {
                             "instance_id": str(instance.instance_id),
@@ -1969,7 +2215,6 @@ class SQLAlchemyStorage:
                 if (guard.rowcount or 0) == 0:  # type: ignore[attr-defined]
                     from edda.locking import LockLostError
 
-                    await session.rollback()
                     raise LockLostError(f"Lock lost for instance {instance_id}")
 
             history = WorkflowHistory(
@@ -2071,6 +2316,108 @@ class SQLAlchemyStorage:
 
             await self._commit_if_not_in_transaction(session)
             return len(history_rows)
+
+    async def reset_instance_for_recur(
+        self, instance_id: str, input_data: dict[str, Any], lock_id: str
+    ) -> None:
+        """
+        Reset one instance for its next recur iteration in a single fenced
+        transaction.
+
+        The lock proof and all mutations share one session/transaction: either
+        the whole iteration boundary commits or nothing does. Instance-scoped
+        actor state (names, monitors, capabilities, tasks, FS ownership,
+        sandboxing) and channel delivery cursors deliberately survive.
+        """
+        import base64
+
+        from edda.locking import LockLostError
+
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            result = await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.locked_by == lock_id,
+                    )
+                )
+                .values(updated_at=func.now())
+            )
+            if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                raise LockLostError(f"Lock lost for instance {instance_id}")
+
+            history_rows = (
+                (
+                    await session.execute(
+                        select(WorkflowHistory)
+                        .where(WorkflowHistory.instance_id == instance_id)
+                        .order_by(WorkflowHistory.created_at.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in history_rows:
+                event_data_json: str | None
+                if row.data_type == "binary" and row.event_data_binary is not None:
+                    event_data_json = json.dumps(
+                        {
+                            "_binary": True,
+                            "data": base64.b64encode(row.event_data_binary).decode("ascii"),
+                        }
+                    )
+                else:
+                    event_data_json = row.event_data
+                session.add(
+                    WorkflowHistoryArchive(
+                        instance_id=row.instance_id,
+                        activity_id=row.activity_id,
+                        event_type=row.event_type,
+                        event_data=event_data_json,
+                        created_at=row.created_at,
+                    )
+                )
+
+            await session.execute(
+                delete(WorkflowHistory).where(WorkflowHistory.instance_id == instance_id)
+            )
+            await session.execute(
+                delete(WorkflowTimerSubscription).where(
+                    WorkflowTimerSubscription.instance_id == instance_id
+                )
+            )
+            await session.execute(
+                delete(ChannelSubscription).where(ChannelSubscription.instance_id == instance_id)
+            )
+            await session.execute(
+                delete(ChannelMessageClaim).where(ChannelMessageClaim.instance_id == instance_id)
+            )
+            await session.execute(
+                delete(WorkflowGroupMembership).where(
+                    WorkflowGroupMembership.instance_id == instance_id
+                )
+            )
+            await session.execute(
+                delete(WorkflowCompensation).where(WorkflowCompensation.instance_id == instance_id)
+            )
+            await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.locked_by == lock_id,
+                    )
+                )
+                .values(
+                    status="recurred",
+                    input_data=json.dumps(input_data),
+                    output_data=None,
+                    current_activity_id=None,
+                    updated_at=func.now(),
+                )
+            )
 
     async def find_first_cancellation_event(self, instance_id: str) -> dict[str, Any] | None:
         """
@@ -2247,13 +2594,16 @@ class SQLAlchemyStorage:
                     .values(current_activity_id=activity_id, updated_at=func.now())
                 )
 
-            # 4. Update status to 'waiting_for_timer' and release lock
-            await session.execute(
+            # 4. Update status to 'waiting_for_timer' and release lock. A
+            # terminated instance stays terminated: raising rolls back the
+            # timer registered above.
+            result = await session.execute(
                 update(WorkflowInstance)
                 .where(
                     and_(
                         WorkflowInstance.instance_id == instance_id,
                         WorkflowInstance.locked_by == worker_id,
+                        WorkflowInstance.status.notin_(_TERMINAL_STATUSES),
                     )
                 )
                 .values(
@@ -2263,6 +2613,8 @@ class SQLAlchemyStorage:
                     updated_at=func.now(),
                 )
             )
+            if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                raise await self._fenced_write_refused(session, instance_id, worker_id)
 
     async def find_expired_timers(self) -> list[dict[str, Any]]:
         """Find timer subscriptions that have expired.
@@ -2538,11 +2890,14 @@ class SQLAlchemyStorage:
     # Workflow Cancellation Methods
     # -------------------------------------------------------------------------
 
-    async def cancel_instance(self, instance_id: str, cancelled_by: str) -> bool:
+    async def cancel_instance(
+        self, instance_id: str, cancelled_by: str, *, allow_compensating: bool = True
+    ) -> bool:
         """
         Cancel a workflow instance.
 
-        Only running or waiting_for_event workflows can be cancelled.
+        Only running or waiting_for_event workflows can be cancelled
+        (and compensating ones unless allow_compensating is False).
         This method atomically:
         1. Checks current status
         2. Updates status to 'cancelled' if allowed (with atomic status check)
@@ -2559,18 +2914,24 @@ class SQLAlchemyStorage:
         Args:
             instance_id: Workflow instance to cancel
             cancelled_by: Who/what triggered the cancellation
+            allow_compensating: Deprecated compatibility argument; ignored.
+                Compensating instances are never cancellable.
 
         Returns:
             True if successfully cancelled, False otherwise
 
         Note: Uses LOCK operation session (separate from external session).
         """
-        cancellable_statuses = (
+        # ``allow_compensating`` is kept for source compatibility but ignored:
+        # compensation is kernel recovery and is never externally cancellable.
+        # ``recurred`` is a live between-iterations state and is cancellable.
+        _ = allow_compensating
+        cancellable_statuses: tuple[str, ...] = (
             "running",
             "waiting_for_event",
             "waiting_for_timer",
             "waiting_for_message",
-            "compensating",
+            "recurred",
         )
 
         session = self._get_session_for_operation(is_lock_operation=True)
@@ -2587,8 +2948,7 @@ class SQLAlchemyStorage:
 
             current_status = row[0]
 
-            # Only allow cancellation of running, waiting, or compensating workflows
-            # compensating workflows can be marked as cancelled after compensation completes
+            # Only live non-compensating workflows are externally cancellable.
             if current_status not in cancellable_statuses:
                 # Already completed, failed, or cancelled
                 return False
@@ -2626,22 +2986,71 @@ class SQLAlchemyStorage:
                 # Another worker may have resumed/modified the workflow
                 return False
 
-            # Remove timer subscriptions if waiting for timer
-            if current_status == "waiting_for_timer":
-                await session.execute(
-                    delete(WorkflowTimerSubscription).where(
-                        WorkflowTimerSubscription.instance_id == instance_id
+            # Drop the instance's timers and channel waits whatever it was
+            # doing: a timer or delivery that fires later must not resume a
+            # cancelled instance (e.g. one registered by a run that held the
+            # lock while it was cancelled).
+            await session.execute(
+                delete(WorkflowTimerSubscription).where(
+                    WorkflowTimerSubscription.instance_id == instance_id
+                )
+            )
+            await session.execute(
+                update(ChannelSubscription)
+                .where(ChannelSubscription.instance_id == instance_id)
+                .values(activity_id=None, timeout_at=None)
+            )
+
+            return True
+
+    async def finalize_cancelled_instance(
+        self, instance_id: str, cancelled_by: str, lock_id: str
+    ) -> bool:
+        """
+        Finish a user cancellation after its compensations completed.
+
+        This is an internal recovery transition, not a cancel operation: the
+        row must already be ``compensating`` and the caller must still hold
+        the fenced lock. External cancellation of ``compensating`` remains
+        impossible.
+        """
+        session = self._get_session_for_operation(is_lock_operation=True)
+        async with self._session_scope(session) as session:
+            cancellation_metadata = {
+                "cancelled_by": cancelled_by,
+                "cancelled_at": datetime.now(UTC).isoformat(),
+                "previous_status": "compensating",
+            }
+            result = await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.status == "compensating",
+                        WorkflowInstance.locked_by == lock_id,
                     )
                 )
-
-            # Clear channel subscriptions if waiting for event/message
-            if current_status in ("waiting_for_event", "waiting_for_message"):
-                await session.execute(
-                    update(ChannelSubscription)
-                    .where(ChannelSubscription.instance_id == instance_id)
-                    .values(activity_id=None, timeout_at=None)
+                .values(
+                    status="cancelled",
+                    output_data=json.dumps(cancellation_metadata),
+                    locked_by=None,
+                    locked_at=None,
+                    lock_expires_at=None,
+                    updated_at=func.now(),
                 )
-
+            )
+            if not result.rowcount:  # type: ignore[attr-defined]
+                return False
+            await session.execute(
+                delete(WorkflowTimerSubscription).where(
+                    WorkflowTimerSubscription.instance_id == instance_id
+                )
+            )
+            await session.execute(
+                update(ChannelSubscription)
+                .where(ChannelSubscription.instance_id == instance_id)
+                .values(activity_id=None, timeout_at=None)
+            )
             return True
 
     # -------------------------------------------------------------------------
@@ -2799,24 +3208,19 @@ class SQLAlchemyStorage:
                 instance = instance_result.scalar_one_or_none()
                 workflow_name = instance.workflow_name if instance else "unknown"
 
-                # Build message data for history
+                # Build message data for history (JSON; bytes base64-encoded)
+                from edda.channels import _message_history_fields
+
                 message_id = str(uuid.uuid4())
                 message_data = {
                     "id": message_id,
                     "channel": channel,
-                    "data": data if isinstance(data, dict) else None,
+                    **_message_history_fields(data),
                     "metadata": metadata,
                 }
-
-                # Handle binary data
-                if isinstance(data, bytes):
-                    data_type = "binary"
-                    event_data_json = None
-                    event_data_binary = data
-                else:
-                    data_type = "json"
-                    event_data_json = json.dumps(message_data)
-                    event_data_binary = None
+                data_type = "json"
+                event_data_json: str | None = json.dumps(message_data)
+                event_data_binary = None
 
                 # Record in history
                 history_entry = WorkflowHistory(
@@ -2890,8 +3294,10 @@ class SQLAlchemyStorage:
                     and_(
                         ChannelSubscription.timeout_at.isnot(None),
                         ChannelSubscription.activity_id.isnot(None),  # Only waiting subscriptions
+                        # Strictly '<': timestamps are kept to the second, so
+                        # '<=' would fire up to a second before the deadline.
                         self._make_datetime_comparable(ChannelSubscription.timeout_at)
-                        <= self._get_current_time_expr(),
+                        < self._get_current_time_expr(),
                         WorkflowInstance.framework == "python",
                     )
                 )
@@ -3029,7 +3435,7 @@ class SQLAlchemyStorage:
                 WorkflowInstance.workflow_name,
             ).where(
                 and_(
-                    WorkflowInstance.status == "running",
+                    WorkflowInstance.status.in_(("running", "recurred")),
                     WorkflowInstance.locked_by.is_(None),
                     WorkflowInstance.framework == "python",
                 )
@@ -3050,9 +3456,10 @@ class SQLAlchemyStorage:
         worker_id: str,
         limit: int | None = None,
         timeout_seconds: int = 300,
+        workflow_names: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Atomically claim resumable workflows (status='running', unlocked).
+        Atomically claim resumable workflows (running/recurred, unlocked).
 
         find_resumable_workflows + per-instance try_acquire_lock in one step:
         candidates are selected with FOR UPDATE SKIP LOCKED (PostgreSQL/MySQL)
@@ -3065,7 +3472,13 @@ class SQLAlchemyStorage:
             worker_id: Lock identity to stamp on claimed rows (use an
                 epoch-bearing identity so downstream writes are fenced)
             limit: Max workflows to claim (default 10)
-            timeout_seconds: Lock lease in seconds
+            timeout_seconds: Default lock lease in seconds (an instance's
+                own lock_timeout_seconds takes precedence, as in
+                try_acquire_lock)
+            workflow_names: Only instances of these workflows are claimed (the
+                ones this worker has registered, so it never claims and
+                releases instances it cannot run); None claims any. Edda
+                resumes by name and does not compare source hashes.
 
         Returns:
             List of claimed workflows (instance_id, workflow_name,
@@ -3073,21 +3486,24 @@ class SQLAlchemyStorage:
         """
         if limit is None:
             limit = 10
+        if workflow_names is not None and not workflow_names:
+            return []
+
+        conditions = [
+            WorkflowInstance.status.in_(("running", "recurred")),
+            WorkflowInstance.locked_by.is_(None),
+            WorkflowInstance.framework == "python",
+        ]
+        if workflow_names is not None:
+            conditions.append(WorkflowInstance.workflow_name.in_(list(workflow_names)))
 
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
             now = datetime.now(UTC)
-            expires = now + timedelta(seconds=timeout_seconds)
 
             result = await session.execute(
                 select(WorkflowInstance)
-                .where(
-                    and_(
-                        WorkflowInstance.status == "running",
-                        WorkflowInstance.locked_by.is_(None),
-                        WorkflowInstance.framework == "python",
-                    )
-                )
+                .where(and_(*conditions))
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
@@ -3096,17 +3512,35 @@ class SQLAlchemyStorage:
                 await session.commit()
                 return []
 
-            instance_ids = [r.instance_id for r in rows]
-            await session.execute(
-                update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id.in_(instance_ids))
-                .values(
-                    locked_by=worker_id,
-                    locked_at=now,
-                    lock_expires_at=expires,
-                    updated_at=now,
+            # Claim row by row, re-checking the selection: SQLite's SELECT
+            # locks nothing, so a lock taken since then must not be
+            # overwritten. Only rows actually claimed are returned.
+            claimed = []
+            for r in rows:
+                lease = int(
+                    r.lock_timeout_seconds
+                    if r.lock_timeout_seconds is not None
+                    else timeout_seconds
                 )
-            )
+                res = await session.execute(
+                    update(WorkflowInstance)
+                    .where(
+                        and_(
+                            WorkflowInstance.instance_id == r.instance_id,
+                            WorkflowInstance.status.in_(("running", "recurred")),
+                            WorkflowInstance.locked_by.is_(None),
+                        )
+                    )
+                    .values(
+                        status="running",
+                        locked_by=worker_id,
+                        locked_at=now,
+                        lock_expires_at=now + timedelta(seconds=lease),
+                        updated_at=now,
+                    )
+                )
+                if res.rowcount:  # type: ignore[attr-defined]
+                    claimed.append(r)
             await session.commit()
 
             return [
@@ -3116,7 +3550,7 @@ class SQLAlchemyStorage:
                     "source_hash": r.source_hash,
                     "status": r.status,
                 }
-                for r in rows
+                for r in claimed
             ]
 
     # -------------------------------------------------------------------------
@@ -3126,13 +3560,32 @@ class SQLAlchemyStorage:
     async def register_actor_name(
         self, name: str, instance_id: str, framework: str = "python"
     ) -> None:
-        """Bind a unique actor name to an instance. Fails if name is taken."""
+        """Bind a unique actor name to an instance.
+
+        Idempotent for the holder; raises ValueError when the name is bound
+        to another instance. The insert skips an existing name instead of
+        raising a unique violation (which would abort an enclosing
+        PostgreSQL transaction), and the binding is read back.
+        """
+        insert_sql = "INSERT INTO actor_names (name, instance_id, framework) VALUES (:n, :i, :f)"
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            await session.execute(
-                text("INSERT INTO actor_names (name, instance_id, framework) VALUES (:n, :i, :f)"),
-                {"n": name, "i": instance_id, "f": framework},
-            )
+            params = {"n": name, "i": instance_id, "f": framework}
+            if self.engine.dialect.name == "mysql":
+                await session.execute(
+                    text(f"{insert_sql} ON DUPLICATE KEY UPDATE name = name"), params
+                )
+            else:
+                await session.execute(text(f"{insert_sql} ON CONFLICT (name) DO NOTHING"), params)
+            holder = (
+                await session.execute(
+                    text("SELECT instance_id FROM actor_names WHERE name = :n"), {"n": name}
+                )
+            ).scalar_one_or_none()
+            if holder != instance_id:
+                from edda.exceptions import ActorNameTakenError
+
+                raise ActorNameTakenError(f"actor name {name!r} is already registered to {holder}")
             await self._commit_if_not_in_transaction(session)
 
     async def unregister_actor_name(self, name: str) -> None:
@@ -3140,6 +3593,30 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             await session.execute(text("DELETE FROM actor_names WHERE name = :n"), {"n": name})
+            await self._commit_if_not_in_transaction(session)
+
+    async def unregister_own_actor_name(self, name: str, owner: str) -> None:
+        """Remove a name binding held by owner (idempotent).
+
+        A name held by another instance raises NotOwnerError; an unbound
+        name is a no-op.
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            deleted = await session.execute(
+                text("DELETE FROM actor_names WHERE name = :n AND instance_id = :o"),
+                {"n": name, "o": owner},
+            )
+            if not getattr(deleted, "rowcount", 0):
+                holder = (
+                    await session.execute(
+                        text("SELECT instance_id FROM actor_names WHERE name = :n"), {"n": name}
+                    )
+                ).scalar_one_or_none()
+                if holder is not None:
+                    from edda.exceptions import NotOwnerError
+
+                    raise NotOwnerError(f"actor name {name!r} is held by {holder}")
             await self._commit_if_not_in_transaction(session)
 
     async def whereis_actor(self, name: str) -> str | None:
@@ -3158,23 +3635,11 @@ class SQLAlchemyStorage:
         """Register that watcher is notified on channel when target terminates."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            if self._is_postgresql:
-                sql = (
-                    "INSERT INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
-                    "VALUES (:w, :t, :c) ON CONFLICT (watcher_instance_id, target_instance_id) DO NOTHING"
-                )
-            elif self.engine.dialect.name == "mysql":
-                sql = (
-                    "INSERT IGNORE INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
-                    "VALUES (:w, :t, :c)"
-                )
-            else:
-                sql = (
-                    "INSERT OR IGNORE INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
-                    "VALUES (:w, :t, :c)"
-                )
-            await session.execute(
-                text(sql),
+            await self._insert_unless_exists(
+                session,
+                "INSERT INTO actor_monitors (watcher_instance_id, target_instance_id, channel) "
+                "VALUES (:w, :t, :c)",
+                "watcher_instance_id, target_instance_id",
                 {"w": watcher_instance_id, "t": target_instance_id, "c": channel},
             )
             await self._commit_if_not_in_transaction(session)
@@ -3195,9 +3660,13 @@ class SQLAlchemyStorage:
     async def emit_actor_down_for_terminated(self) -> int:
         """
         Publish a DOWN message to each monitor channel whose target is in a
-        terminal status, then remove the monitor rows and the target's
-        actor_names bindings — all in one transaction (leader sweep, safe to
-        run repeatedly). Returns the number of notifications emitted.
+        terminal status and remove the monitor rows, then free the
+        actor_names bindings of every terminated instance, monitored or not
+        -- all in one transaction (leader sweep, safe to run repeatedly).
+
+        A monitor row is deleted before its DOWN is published and only the
+        delete that removed it publishes, so overlapping sweeps emit each
+        DOWN exactly once. Returns the number of notifications emitted.
         """
         session = self._get_session_for_operation(is_lock_operation=True)
         async with self._session_scope(session) as session:
@@ -3206,32 +3675,36 @@ class SQLAlchemyStorage:
                     "SELECT m.id, m.target_instance_id, m.channel, w.status "
                     "FROM actor_monitors m "
                     "JOIN workflow_instances w ON w.instance_id = m.target_instance_id "
-                    "WHERE w.status IN ('completed', 'failed', 'cancelled', 'recurred')"
+                    "WHERE w.status IN ('completed', 'failed', 'cancelled')"
                 )
             )
             monitors = result.all()
 
-            if not monitors:
-                await session.commit()
-                return 0
-
-            now = datetime.now(UTC).isoformat()
+            emitted = 0
             for m_id, target_id, channel, status in monitors:
+                deleted = await session.execute(
+                    text("DELETE FROM actor_monitors WHERE id = :i"), {"i": m_id}
+                )
+                if deleted.rowcount != 1:  # type: ignore[attr-defined]
+                    continue  # another sweep emitted this DOWN
                 payload = json.dumps({"type": "DOWN", "actor": target_id, "status": status})
                 await session.execute(
                     text(
-                        "INSERT INTO channel_messages (channel, message_id, data_type, data, published_at) "
-                        "VALUES (:c, :m, 'json', :d, :p)"
+                        "INSERT INTO channel_messages (channel, message_id, data_type, data) "
+                        "VALUES (:c, :m, 'json', :d)"
                     ),
-                    {"c": channel, "m": str(uuid.uuid4()), "d": payload, "p": now},
+                    {"c": channel, "m": str(uuid.uuid4()), "d": payload},
                 )
-                await session.execute(text("DELETE FROM actor_monitors WHERE id = :i"), {"i": m_id})
-            for target_id in {m[1] for m in monitors}:
-                await session.execute(
-                    text("DELETE FROM actor_names WHERE instance_id = :i"), {"i": target_id}
+                emitted += 1
+            await session.execute(
+                text(
+                    "DELETE FROM actor_names WHERE instance_id IN ("
+                    "SELECT instance_id FROM workflow_instances "
+                    "WHERE status IN ('completed', 'failed', 'cancelled'))"
                 )
+            )
             await session.commit()
-            return len(monitors)
+            return emitted
 
     # -------------------------------------------------------------------------
     # Capability Methods
@@ -3247,6 +3720,7 @@ class SQLAlchemyStorage:
         expires_at: str | None = None,
     ) -> None:
         """Persist a capability grant (secret is stored only as a hash)."""
+        expiry = _normalize_expiry(expires_at)
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             await session.execute(
@@ -3261,7 +3735,7 @@ class SQLAlchemyStorage:
                     "t": target,
                     "h": secret_hash,
                     "g": granted_by,
-                    "e": _normalize_expiry(expires_at),
+                    "e": None if expiry is None else self._ts_param(expiry),
                 },
             )
             await self._commit_if_not_in_transaction(session)
@@ -3273,6 +3747,32 @@ class SQLAlchemyStorage:
             await session.execute(
                 text("DELETE FROM actor_capabilities WHERE id = :i"), {"i": capability_id}
             )
+            await self._commit_if_not_in_transaction(session)
+
+    async def revoke_own_capability(self, capability_id: str, owner: str) -> None:
+        """Remove a grant issued by owner (idempotent).
+
+        A grant issued by another instance raises NotOwnerError; an unknown
+        id is a no-op.
+        """
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            deleted = await session.execute(
+                text("DELETE FROM actor_capabilities WHERE id = :i AND granted_by = :o"),
+                {"i": capability_id, "o": owner},
+            )
+            if not getattr(deleted, "rowcount", 0):
+                exists = (
+                    await session.execute(
+                        text("SELECT 1 FROM actor_capabilities WHERE id = :i"), {"i": capability_id}
+                    )
+                ).first()
+                if exists is not None:
+                    from edda.exceptions import NotOwnerError
+
+                    raise NotOwnerError(
+                        f"capability {capability_id!r} was issued by another instance"
+                    )
             await self._commit_if_not_in_transaction(session)
 
     async def has_capability_grants(self, kind: str, target: str) -> bool:
@@ -3303,6 +3803,8 @@ class SQLAlchemyStorage:
             if expires_at is None:
                 return True
             if isinstance(expires_at, datetime):
+                if expires_at.tzinfo is None:  # TIMESTAMP columns hold UTC
+                    expires_at = expires_at.replace(tzinfo=UTC)
                 expires_at = _canonical_ts(expires_at)
             return bool(str(expires_at) > _canonical_ts(datetime.now(UTC)))
 
@@ -3310,23 +3812,12 @@ class SQLAlchemyStorage:
         """Store data under its content hash (idempotent CAS write)."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            if self._is_postgresql:
-                sql = (
-                    "INSERT INTO payload_blobs (hash, data, size_bytes, created_by) "
-                    "VALUES (:h, :d, :s, :c) ON CONFLICT (hash) DO NOTHING"
-                )
-            elif self.engine.dialect.name == "mysql":
-                sql = (
-                    "INSERT IGNORE INTO payload_blobs (hash, data, size_bytes, created_by) "
-                    "VALUES (:h, :d, :s, :c)"
-                )
-            else:
-                sql = (
-                    "INSERT OR IGNORE INTO payload_blobs (hash, data, size_bytes, created_by) "
-                    "VALUES (:h, :d, :s, :c)"
-                )
-            await session.execute(
-                text(sql), {"h": hash, "d": data, "s": len(data), "c": created_by}
+            await self._insert_unless_exists(
+                session,
+                "INSERT INTO payload_blobs (hash, data, size_bytes, created_by) "
+                "VALUES (:h, :d, :s, :c)",
+                "hash",
+                {"h": hash, "d": data, "s": len(data), "c": created_by},
             )
             await self._commit_if_not_in_transaction(session)
 
@@ -3363,17 +3854,12 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             if expected_version == 0:
-                try:
-                    result = await session.execute(
-                        text(
-                            "INSERT INTO actor_fs (path, owner, data, version) "
-                            "SELECT :p, :o, :d, 1 "
-                            "WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = :p2)"
-                        ),
-                        {"p": path, "o": owner, "d": data, "p2": path},
-                    )
-                except IntegrityError as exc:
-                    raise FSConflictError(f"actor_fs version conflict: {path}") from exc
+                written = await self._insert_unless_exists(
+                    session,
+                    "INSERT INTO actor_fs (path, owner, data, version) VALUES (:p, :o, :d, 1)",
+                    "path",
+                    {"p": path, "o": owner, "d": data},
+                )
             else:
                 result = await session.execute(
                     text(
@@ -3386,10 +3872,11 @@ class SQLAlchemyStorage:
                         "o": owner,
                         "p": path,
                         "v": expected_version,
-                        "u": datetime.now(UTC),
+                        "u": self._ts_param(),
                     },
                 )
-            if getattr(result, "rowcount", 0) == 0:
+                written = getattr(result, "rowcount", 0) != 0
+            if not written:
                 raise FSConflictError(f"actor_fs version conflict: {path}")
             await self._commit_if_not_in_transaction(session)
 
@@ -3414,13 +3901,15 @@ class SQLAlchemyStorage:
 
     async def fs_list(self, prefix: str) -> list[dict[str, Any]]:
         """Return FS objects (path/owner/version — no data) under prefix."""
+        # MySQL string literals treat the backslash as an escape character.
+        escape = "'\\\\'" if self.engine.dialect.name == "mysql" else "'\\'"
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             rows = (
                 await session.execute(
                     text(
                         "SELECT path, owner, version FROM actor_fs "
-                        "WHERE path LIKE :p ESCAPE '\\' ORDER BY path"
+                        f"WHERE path LIKE :p ESCAPE {escape} ORDER BY path"
                     ),
                     {"p": _like_escape(prefix) + "%"},
                 )
@@ -3448,15 +3937,29 @@ class SQLAlchemyStorage:
             }
 
     async def delete_expired_capabilities(self) -> int:
-        """Remove capability grants whose expires_at is in the past."""
+        """Remove expired capability grants, never unsealing a channel.
+
+        A channel is sealed while any grant of the kind exists, so an expired
+        grant goes only when another grant of the same (kind, target) is live
+        or newer (created_at, then id); the newest expired grant stays. The
+        derived table keeps MySQL from rejecting the self-referencing DELETE.
+        """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             result = await session.execute(
                 text(
-                    "DELETE FROM actor_capabilities "
-                    "WHERE expires_at IS NOT NULL AND expires_at <= :now"
+                    "DELETE FROM actor_capabilities WHERE id IN ("
+                    "SELECT id FROM ("
+                    "SELECT g.id AS id FROM actor_capabilities g "
+                    "WHERE g.expires_at IS NOT NULL AND g.expires_at <= :now "
+                    "AND EXISTS (SELECT 1 FROM actor_capabilities h "
+                    "WHERE h.kind = g.kind AND h.target = g.target AND h.id <> g.id "
+                    "AND (h.expires_at IS NULL OR h.expires_at > :now "
+                    "OR h.created_at > g.created_at "
+                    "OR (h.created_at = g.created_at AND h.id > g.id)))"
+                    ") AS doomed)"
                 ),
-                {"now": _canonical_ts(datetime.now(UTC))},
+                {"now": self._ts_param()},
             )
             await self._commit_if_not_in_transaction(session)
             return int(getattr(result, "rowcount", 0) or 0)
@@ -3652,8 +4155,8 @@ class SQLAlchemyStorage:
             channel: Channel name
 
         Returns:
-            Subscription info dict with: mode, activity_id, cursor_message_id
-            or None if not subscribed
+            Subscription info dict with: mode, activity_id, cursor_message_id,
+            timeout_at, or None if not subscribed
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
@@ -3674,6 +4177,7 @@ class SQLAlchemyStorage:
                 "mode": subscription.mode,
                 "activity_id": subscription.activity_id,
                 "cursor_message_id": subscription.cursor_message_id,
+                "timeout_at": subscription.timeout_at,
             }
 
     async def get_channel_mode(self, channel: str) -> str | None:
@@ -3702,7 +4206,7 @@ class SQLAlchemyStorage:
         worker_id: str,
         channel: str,
         activity_id: str | None = None,
-        timeout_seconds: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.
@@ -3726,25 +4230,11 @@ class SQLAlchemyStorage:
 
         Raises:
             RuntimeError: If the worker doesn't hold the lock
+            InstanceTerminatedError: If the instance already terminated
             ValueError: If workflow is not subscribed to the channel
         """
         async with self.engine.begin() as conn:
             session = AsyncSession(bind=conn, expire_on_commit=False)
-
-            # Verify lock ownership
-            result = await session.execute(
-                select(WorkflowInstance).where(WorkflowInstance.instance_id == instance_id)
-            )
-            instance = result.scalar_one_or_none()
-
-            if instance is None:
-                raise RuntimeError(f"Instance not found: {instance_id}")
-
-            if instance.locked_by != worker_id:
-                raise RuntimeError(
-                    f"Worker {worker_id} does not hold lock for {instance_id}. "
-                    f"Locked by: {instance.locked_by}"
-                )
 
             # Verify subscription exists
             sub_result = await session.execute(
@@ -3766,44 +4256,49 @@ class SQLAlchemyStorage:
             pending_check = await self._has_pending_channel_message(
                 session, instance_id, channel, subscription
             )
-            if pending_check:
-                # Release the lock only; keep status='running' so the
-                # resumable-workflow sweep replays into the pending message.
-                await session.execute(
-                    update(WorkflowInstance)
-                    .where(WorkflowInstance.instance_id == instance_id)
-                    .values(
-                        locked_by=None,
-                        locked_at=None,
-                        lock_expires_at=None,
-                        updated_at=datetime.now(UTC),
+
+            # Fenced suspend + release first: only the lock holder of a live
+            # instance may register the wait. With a pending message, only
+            # the lock is released (status stays 'running' so the
+            # resumable-workflow sweep replays into the message).
+            current_time = datetime.now(UTC)
+            values: dict[str, Any] = {
+                "locked_by": None,
+                "locked_at": None,
+                "lock_expires_at": None,
+                "updated_at": current_time,
+            }
+            if not pending_check:
+                values.update(current_activity_id=activity_id, status="waiting_for_message")
+            result = await session.execute(
+                update(WorkflowInstance)
+                .where(
+                    and_(
+                        WorkflowInstance.instance_id == instance_id,
+                        WorkflowInstance.locked_by == worker_id,
+                        WorkflowInstance.status.notin_(_TERMINAL_STATUSES),
                     )
                 )
+                .values(**values)
+            )
+            if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                from edda.locking import InstanceTerminatedError
+
+                refused = await self._fenced_write_refused(session, instance_id, worker_id)
+                if isinstance(refused, InstanceTerminatedError):
+                    raise refused
+                raise RuntimeError(f"Worker {worker_id} does not hold lock for {instance_id}")
+            if pending_check:
                 await session.commit()
                 return False
 
-            # Update subscription to mark as waiting
-            current_time = datetime.now(UTC)
+            # Only now mark the subscription as waiting
             subscription.activity_id = activity_id
             # Calculate timeout_at if timeout_seconds is provided
             if timeout_seconds is not None:
                 subscription.timeout_at = current_time + timedelta(seconds=timeout_seconds)
             else:
                 subscription.timeout_at = None
-
-            # Update instance: set activity, status, release lock
-            await session.execute(
-                update(WorkflowInstance)
-                .where(WorkflowInstance.instance_id == instance_id)
-                .values(
-                    current_activity_id=activity_id,
-                    status="waiting_for_message",
-                    locked_by=None,
-                    locked_at=None,
-                    lock_expires_at=None,
-                    updated_at=current_time,
-                )
-            )
 
             await session.commit()
             return True
@@ -3895,10 +4390,27 @@ class SQLAlchemyStorage:
                 if await self._has_pending_channel_message(
                     session, sub.instance_id, sub.channel, sub
                 ):
-                    await session.execute(
+                    # Conditional flip (the wait may have been resumed since
+                    # the scan), and clear the wait it leaves: a stale
+                    # activity_id/timeout_at would later fire a timeout into
+                    # a run that has moved on.
+                    flipped = await session.execute(
                         update(WorkflowInstance)
-                        .where(WorkflowInstance.instance_id == sub.instance_id)
+                        .where(
+                            and_(
+                                WorkflowInstance.instance_id == sub.instance_id,
+                                WorkflowInstance.status == "waiting_for_message",
+                                WorkflowInstance.locked_by.is_(None),
+                            )
+                        )
                         .values(status="running", updated_at=datetime.now(UTC))
+                    )
+                    if not flipped.rowcount:  # type: ignore[attr-defined]
+                        continue
+                    await session.execute(
+                        update(ChannelSubscription)
+                        .where(ChannelSubscription.instance_id == sub.instance_id)
+                        .values(activity_id=None, timeout_at=None)
                     )
                     requeued += 1
 
@@ -4018,6 +4530,15 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
+            # Lock the message row first. A concurrent claimer then waits for
+            # this transaction and finds the message gone once it was
+            # consumed, instead of waiting on an uncommitted claim and failing
+            # its FK check (which aborts an enclosing PostgreSQL transaction;
+            # MySQL deadlocks).
+            if not await self._lock_message_row(session, message_id):
+                await self._commit_if_not_in_transaction(session)
+                return False
+
             now = datetime.now(UTC)
             stale_before = now - timedelta(seconds=CHANNEL_CLAIM_STALE_SECONDS)
             terminal_owners = select(WorkflowInstance.instance_id).where(
@@ -4039,25 +4560,28 @@ class SQLAlchemyStorage:
                 )
                 .values(instance_id=instance_id, claimed_at=now)
             )
-            await self._commit_if_not_in_transaction(session)
             if result.rowcount and result.rowcount > 0:  # type: ignore[attr-defined]
-                return True
-
-            # Fresh claim (no existing row)
-            try:
-                claim = ChannelMessageClaim(
-                    message_id=message_id,
-                    instance_id=instance_id,
-                    claimed_at=now,
-                )
-                session.add(claim)
-                await session.flush()
                 await self._commit_if_not_in_transaction(session)
                 return True
-            except Exception:
-                # Another claimant won the INSERT race
-                await session.rollback()
-                return False
+
+            # Fresh claim; an existing (live) claim keeps the message
+            claimed = await self._insert_unless_exists(
+                session,
+                "INSERT INTO channel_message_claims (message_id, instance_id, claimed_at) "
+                "VALUES (:m, :i, :c)",
+                "message_id",
+                {"m": message_id, "i": instance_id, "c": self._ts_param(now)},
+            )
+            await self._commit_if_not_in_transaction(session)
+            return claimed
+
+    async def _lock_message_row(self, session: AsyncSession, message_id: str) -> bool:
+        """Lock a channel message row (PostgreSQL/MySQL: FOR UPDATE; SQLite
+        serializes writers). Returns False when the message is gone."""
+        stmt = select(ChannelMessage.message_id).where(ChannelMessage.message_id == message_id)
+        if self.engine.dialect.name != "sqlite":
+            stmt = stmt.with_for_update()
+        return (await session.execute(stmt)).first() is not None
 
     async def delete_channel_message(self, message_id: str) -> None:
         """
@@ -4230,36 +4754,63 @@ class SQLAlchemyStorage:
                         return None
                     workflow_name = row[0]
 
-                    # Prepare message data for history
-                    # Use "id" key to match what context.py expects when loading history
+                    # Competing: lock the message row before claiming it. A
+                    # message another subscriber consumed meanwhile is gone,
+                    # and nothing is delivered.
+                    if subscription.mode != "broadcast" and not await self._lock_message_row(
+                        session, message_id
+                    ):
+                        logger.debug(f"Message {message_id} already consumed; not delivered")
+                        return None
+
+                    # Deliver only into a registered wait: flip the instance
+                    # out of waiting_for_message before writing anything. A
+                    # subscriber that is not waiting (requeued, resumed,
+                    # cancelled) keeps the message pending for its next
+                    # receive instead of recording it under an id that no
+                    # receive reads. The flip also proves this delivery holds
+                    # the instance lock, in the transaction that records the
+                    # message (claim, history and delete commit together).
                     current_time = datetime.now(UTC)
+                    flipped = await session.execute(
+                        update(WorkflowInstance)
+                        .where(
+                            and_(
+                                WorkflowInstance.instance_id == instance_id,
+                                WorkflowInstance.status == "waiting_for_message",
+                                WorkflowInstance.locked_by == worker_id,
+                            )
+                        )
+                        .values(
+                            status="running",
+                            updated_at=current_time,
+                        )
+                    )
+                    if not flipped.rowcount:  # type: ignore[attr-defined]
+                        logger.debug(f"{instance_id} is not waiting on {channel}; not delivered")
+                        return None
+
+                    # Prepare message data for history (JSON; bytes base64-encoded).
+                    # Use "id" key to match what context.py expects when loading history
+                    from edda.channels import _message_history_fields
+
                     message_result = {
                         "id": message_id,
                         "channel": channel,
-                        "data": data if isinstance(data, dict) else None,
+                        **_message_history_fields(data),
                         "metadata": metadata,
                         "published_at": current_time.isoformat(),
                     }
 
                     # Record to history
-                    if isinstance(data, bytes):
-                        history = WorkflowHistory(
-                            instance_id=instance_id,
-                            activity_id=activity_id,
-                            event_type="ChannelMessageReceived",
-                            data_type="binary",
-                            event_data=None,
-                            event_data_binary=data,
-                        )
-                    else:
-                        history = WorkflowHistory(
-                            instance_id=instance_id,
-                            activity_id=activity_id,
-                            event_type="ChannelMessageReceived",
-                            data_type="json",
-                            event_data=json.dumps(message_result),
-                            event_data_binary=None,
-                        )
+                    history = WorkflowHistory(
+                        instance_id=instance_id,
+                        activity_id=activity_id,
+                        event_type="ChannelMessageReceived",
+                        data_type="json",
+                        event_data=json.dumps(message_result),
+                        event_data_binary=None,
+                    )
                     session.add(history)
 
                     # Handle mode-specific logic
@@ -4286,17 +4837,6 @@ class SQLAlchemyStorage:
 
                     # Clear waiting state
                     subscription.activity_id = None
-
-                    # Update instance status to running
-                    current_time = datetime.now(UTC)
-                    await session.execute(
-                        update(WorkflowInstance)
-                        .where(WorkflowInstance.instance_id == instance_id)
-                        .values(
-                            status="running",
-                            updated_at=current_time,
-                        )
-                    )
 
                     await session.commit()
 
@@ -4436,7 +4976,7 @@ class SQLAlchemyStorage:
                     "claimed_at = NULL, updated_at = :u "
                     "WHERE state = 'claimed' AND claimed_at < :c"
                 ),
-                {"u": datetime.now(UTC), "c": cutoff},
+                {"u": self._ts_param(), "c": self._ts_param(cutoff, tz=True)},
             )
             await self._commit_if_not_in_transaction(session)
             return res.rowcount or 0  # type: ignore[attr-defined]
@@ -4446,30 +4986,38 @@ class SQLAlchemyStorage:
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             for _ in range(3):
+                task_id = (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM actor_tasks WHERE channel = :c AND state = 'open' "
+                            "ORDER BY created_at, id LIMIT 1"
+                        ),
+                        {"c": channel},
+                    )
+                ).scalar_one_or_none()
+                if task_id is None:
+                    break
+                # claimed_at is the TIMESTAMPTZ column on PostgreSQL and
+                # updated_at a TIMESTAMP, so they take separate binds.
                 result = await session.execute(
                     text(
                         "UPDATE actor_tasks SET state = 'claimed', claimed_by = :w, "
-                        "claimed_at = :u, attempts = attempts + 1, updated_at = :u "
-                        "WHERE id = ("
-                        "  SELECT id FROM ("
-                        "    SELECT id FROM actor_tasks "
-                        "    WHERE channel = :c AND state = 'open' ORDER BY created_at LIMIT 1"
-                        "  ) _t"
-                        ") AND state = 'open'"
+                        "claimed_at = :ca, attempts = attempts + 1, updated_at = :u "
+                        "WHERE id = :i AND state = 'open'"
                     ),
-                    {"w": claimant, "u": datetime.now(UTC), "c": channel},
+                    {
+                        "w": claimant,
+                        "ca": self._ts_param(tz=True),
+                        "u": self._ts_param(),
+                        "i": task_id,
+                    },
                 )
                 if (result.rowcount or 0) == 0:  # type: ignore[attr-defined]
-                    break
+                    continue  # another claimant won this task; take the next
                 row = (
                     await session.execute(
-                        text(
-                            "SELECT id, channel, data, claimed_by "
-                            "FROM actor_tasks "
-                            "WHERE channel = :c AND claimed_by = :w AND state = 'claimed' "
-                            "ORDER BY updated_at DESC LIMIT 1"
-                        ),
-                        {"c": channel, "w": claimant},
+                        text("SELECT id, channel, data, claimed_by FROM actor_tasks WHERE id = :i"),
+                        {"i": task_id},
                     )
                 ).first()
                 if row is None:
@@ -4498,8 +5046,13 @@ class SQLAlchemyStorage:
     async def complete_task(
         self, task_id: str, claimant: str, result: str | None, failed: bool
     ) -> None:
-        """Mark a claimed task done/failed; TaskConflictError if not claimant."""
-        from edda.exceptions import TaskConflictError
+        """Mark a claimed task done/failed; TaskConflictError if not claimant.
+
+        Idempotent: settling a task again into the same state by the same
+        claimant succeeds without a second notice. TaskNotFoundError when no
+        task has that ID.
+        """
+        from edda.exceptions import TaskConflictError, TaskNotFoundError
 
         state = "failed" if failed else "done"
         session = self._get_session_for_operation()
@@ -4512,12 +5065,22 @@ class SQLAlchemyStorage:
                 {
                     "s": state,
                     "r": result,
-                    "u": datetime.now(UTC),
+                    "u": self._ts_param(),
                     "i": task_id,
                     "w": claimant,
                 },
             )
             if (res.rowcount or 0) == 0:  # type: ignore[attr-defined]
+                current = (
+                    await session.execute(
+                        text("SELECT state, claimed_by FROM actor_tasks WHERE id = :i"),
+                        {"i": task_id},
+                    )
+                ).first()
+                if current is None:
+                    raise TaskNotFoundError(f"actor_tasks: no task {task_id}")
+                if tuple(current) == (state, claimant):
+                    return  # already settled by this claimant
                 raise TaskConflictError(f"actor_tasks conflict: {task_id}")
             channel = (
                 await session.execute(
@@ -4563,29 +5126,60 @@ class SQLAlchemyStorage:
     async def channel_messages_since(
         self, channel: str, message_id: str | None
     ) -> list[dict[str, Any]]:
-        """Return messages on channel after message_id cursor (None = all)."""
+        """Return messages on channel after message_id cursor (None/"" = all).
+
+        A cursor with no message of that id on this channel raises
+        CursorNotFoundError instead of returning the whole channel.
+        """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            rows = (
-                await session.execute(
-                    text(
-                        "SELECT message_id, channel, data_type, data, data_binary, "
-                        "metadata, published_at FROM channel_messages "
-                        "WHERE channel = :c AND id > COALESCE(("
-                        "  SELECT id FROM channel_messages WHERE message_id = :m"
-                        "), 0) ORDER BY id"
-                    ),
-                    {"c": channel, "m": message_id or ""},
-                )
-            ).all()
-            return [
-                {
-                    "message_id": r[0],
-                    "channel": r[1],
-                    "data_type": r[2],
-                    "data": r[3] if r[2] == "json" else r[4],
-                    "metadata": json.loads(r[5]) if r[5] else {},
-                    "published_at": r[6],
-                }
-                for r in rows
-            ]
+            after_id = 0
+            if message_id:
+                cursor = (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM channel_messages WHERE message_id = :m AND channel = :c"
+                        ),
+                        {"m": message_id, "c": channel},
+                    )
+                ).scalar_one_or_none()
+                if cursor is None:
+                    from edda.exceptions import CursorNotFoundError
+
+                    raise CursorNotFoundError(
+                        f"message {message_id!r} is not on channel {channel!r}"
+                    )
+                after_id = int(cursor)
+            return await self._channel_messages_after(session, channel, after_id)
+
+    async def channel_messages_after(self, channel: str, after_id: int) -> list[dict[str, Any]]:
+        """Return messages on channel with a row id above after_id (0 = all), by id."""
+        session = self._get_session_for_operation()
+        async with self._session_scope(session) as session:
+            return await self._channel_messages_after(session, channel, after_id)
+
+    async def _channel_messages_after(
+        self, session: AsyncSession, channel: str, after_id: int
+    ) -> list[dict[str, Any]]:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, message_id, channel, data_type, data, data_binary, "
+                    "metadata, published_at FROM channel_messages "
+                    "WHERE channel = :c AND id > :a ORDER BY id"
+                ),
+                {"c": channel, "a": after_id},
+            )
+        ).all()
+        return [
+            {
+                "id": r[0],
+                "message_id": r[1],
+                "channel": r[2],
+                "data_type": r[3],
+                "data": r[4] if r[3] == "json" else r[5],
+                "metadata": json.loads(r[6]) if r[6] else {},
+                "published_at": r[7],
+            }
+            for r in rows
+        ]

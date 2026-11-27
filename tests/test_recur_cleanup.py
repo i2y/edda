@@ -5,9 +5,9 @@ Tests cover:
 - Event subscription cleanup during recur() (via Message Passing layer)
 - Timer subscription cleanup during recur()
 - Message subscription cleanup during recur()
-- Group membership handling (currently NOT cleaned up during recur)
+- Group membership cleanup at the fenced recur boundary
 - Archive before cleanup ordering
-- New instance can rejoin groups after recur()
+- The same instance can rejoin groups after recur()
 
 Note: CloudEvents internally uses Message Passing, so event subscriptions
 are registered and cleaned up via the message subscription API.
@@ -152,9 +152,8 @@ class TestRecurSubscriptionCleanup:
         """
         Test that group memberships are NOT removed by cleanup_instance_subscriptions.
 
-        Note: This is the current behavior. Group memberships are intentionally
-        not removed during subscription cleanup, allowing workflows to maintain
-        group membership across recur() calls if desired.
+        Note: this legacy helper only cleans subscriptions. The fenced recur
+        reset (tested in test_kernel_rules.py) is what deletes group memberships.
         """
         instance_id = workflow_instance
 
@@ -213,48 +212,29 @@ class TestRecurSubscriptionCleanup:
             subs = await sqlite_storage.find_waiting_instances_by_channel(channel)
             assert not any(s["instance_id"] == instance_id for s in subs)
 
-    async def test_new_instance_can_rejoin_groups_after_recur(
+    async def test_same_instance_can_rejoin_groups_after_recur_reset(
         self, sqlite_storage, create_test_instance
     ):
-        """
-        Test that a new instance can join the same groups after recur().
+        """The recur reset removes group memberships on the same instance."""
+        instance_id = "same-instance-recur-001"
 
-        This simulates the pattern where a recurring workflow re-joins groups
-        after each recur() call.
-        """
-        original_id = "original-instance-001"
-        new_id = "new-instance-001"
-
-        # Create original instance and join group
         await create_test_instance(
-            instance_id=original_id,
+            instance_id=instance_id,
             workflow_name="recurring_workflow",
             owner_service="test-service",
             input_data={"count": 0},
         )
-        await sqlite_storage.join_group(original_id, "order_watchers")
+        await sqlite_storage.join_group(instance_id, "order_watchers")
+        assert instance_id in await sqlite_storage.get_group_members("order_watchers")
 
-        # Verify original is in group
-        members = await sqlite_storage.get_group_members("order_watchers")
-        assert original_id in members
+        lock_id = "recur-reset-worker"
+        assert await sqlite_storage.try_acquire_lock(instance_id, lock_id)
+        await sqlite_storage.reset_instance_for_recur(instance_id, {"count": 100}, lock_id)
+        await sqlite_storage.release_lock(instance_id, lock_id)
 
-        # Simulate recur: clean up original subscriptions (but NOT groups)
-        await sqlite_storage.cleanup_instance_subscriptions(original_id)
-
-        # Create new instance (simulating recur)
-        await create_test_instance(
-            instance_id=new_id,
-            workflow_name="recurring_workflow",
-            owner_service="test-service",
-            input_data={"count": 100},
-        )
-
-        # New instance joins the same group
-        await sqlite_storage.join_group(new_id, "order_watchers")
-
-        # Both should be in the group (if original wasn't removed from groups)
-        members = await sqlite_storage.get_group_members("order_watchers")
-        assert new_id in members
+        assert instance_id not in await sqlite_storage.get_group_members("order_watchers")
+        await sqlite_storage.join_group(instance_id, "order_watchers")
+        assert instance_id in await sqlite_storage.get_group_members("order_watchers")
 
 
 @pytest.mark.asyncio

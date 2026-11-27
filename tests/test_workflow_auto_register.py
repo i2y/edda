@@ -103,6 +103,9 @@ class TestEddaAppAutoRegistration:
                     return "auto_handler_test"
                 raise KeyError(key)
 
+            def get_attributes(self):
+                return {}
+
             def get_data(self):
                 return self._data
 
@@ -147,6 +150,9 @@ class TestEddaAppAutoRegistration:
                 if key == "type":
                     return "precedence_test"
                 raise KeyError(key)
+
+            def get_attributes(self):
+                return {}
 
         event = MockCloudEvent()
 
@@ -203,6 +209,9 @@ class TestEddaAppAutoRegistration:
                 if key == "type":
                     return "non_dict_test"
                 raise KeyError(key)
+
+            def get_attributes(self):
+                return {}
 
             def get_data(self):
                 return "simple string"  # Not a dict

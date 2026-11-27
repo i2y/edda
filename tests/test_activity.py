@@ -382,8 +382,8 @@ class TestActivityErrorHandling:
         async def test_activity(ctx: WorkflowContext) -> dict:
             return {"should": "not_execute"}
 
-        # Should raise cached error during replay
-        with pytest.raises(Exception, match="ValueError: Cached error"):
+        # Replay restores the recorded error class and message.
+        with pytest.raises(ValueError, match="Cached error"):
             await test_activity(ctx, activity_id="test_activity:1")
 
     async def test_activity_error_tracks_activity_id(self, context):

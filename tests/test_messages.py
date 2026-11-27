@@ -313,12 +313,14 @@ class TestSendMessage:
 
         assert message_id is not None
 
-        # Verify binary data was recorded
-        # For binary data, event_data is the raw bytes directly
+        # Verify binary data was recorded (base64 in the JSON history entry)
+        from edda.channels import _message_data_from_history
+
         history = await sqlite_storage.get_history(receiver_instance)
         msg_history = [h for h in history if h["event_type"] == "ChannelMessageReceived"]
         assert len(msg_history) == 1
-        assert msg_history[0]["event_data"] == binary_data
+        assert msg_history[0]["event_data"]["data_type"] == "binary"
+        assert _message_data_from_history(msg_history[0]["event_data"]) == binary_data
 
     async def test_send_message_with_metadata(
         self, sqlite_storage, sender_instance, receiver_instance

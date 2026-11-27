@@ -90,3 +90,63 @@ class TaskConflictError(Exception):
 
 class TaskNotFoundError(Exception):
     """Task ID does not exist."""
+
+
+class ActorNameTakenError(ValueError):
+    """An actor name is already bound to another instance."""
+
+
+class NotOwnerError(Exception):
+    """An ownership-scoped operation was attempted by a non-owner."""
+
+
+class CursorNotFoundError(Exception):
+    """A channel cursor does not refer to an existing message."""
+
+
+class InvalidArgumentError(ValueError):
+    """A kernel primitive received an invalid argument."""
+
+
+class RunAbortedError(BaseException):
+    """The current workflow run must stop without a recorded outcome.
+
+    Unexpected primitive/storage failures are not workflow outcomes. This
+    exception derives from BaseException so ordinary ``except Exception``
+    handlers do not swallow it, and carries the original error as __cause__.
+    """
+
+    def __init__(self, original_error: BaseException):
+        self.original_error = original_error
+        self.__cause__ = original_error
+        super().__init__(f"workflow run aborted: {original_error}")
+
+
+_KERNEL_ERROR_CODES: dict[type[BaseException], str] = {
+    TaskConflictError: "task_conflict",
+    TaskNotFoundError: "task_not_found",
+    ActorNameTakenError: "actor_name_taken",
+    FSConflictError: "fs_conflict",
+    SandboxedError: "sandboxed",
+    ChannelPermissionError: "channel_forbidden",
+    NotOwnerError: "not_owner",
+    CursorNotFoundError: "cursor_not_found",
+    InvalidArgumentError: "invalid_argument",
+}
+
+_KERNEL_ERRORS_BY_CODE = {code: cls for cls, code in _KERNEL_ERROR_CODES.items()}
+
+
+def kernel_error_code(error: BaseException) -> str | None:
+    """Return the stable cross-port code for a kernel-defined error."""
+    for cls, code in _KERNEL_ERROR_CODES.items():
+        if isinstance(error, cls):
+            return code
+    return None
+
+
+def kernel_error_class(code: str | None) -> type[BaseException] | None:
+    """Return the edda class for a stable cross-port kernel error code."""
+    if code is None:
+        return None
+    return _KERNEL_ERRORS_BY_CODE.get(code)

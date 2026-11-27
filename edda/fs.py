@@ -10,8 +10,9 @@ Permission model:
   - ``/shared/...``     : read is open; write requires an ``fs_write``
     capability token for the path or for "/shared/"
 
-FS operations are non-deterministic I/O and MUST run inside an activity;
-calls outside an activity (or during replay) raise FSOutsideActivityError.
+FS operations are non-deterministic I/O and MUST run inside an executing
+activity body; calls anywhere else raise FSOutsideActivityError. (A replayed
+activity returns its recorded result without running its body.)
 
 NOTE for synchronous activities: ``fs_*`` functions are async. A sync
 activity body runs via ``anyio.to_thread`` — call these via
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
 
 
 def _check_activity(ctx: "WorkflowContext") -> None:
-    if ctx.is_replaying or ctx._activity_depth == 0:
+    if ctx._activity_depth == 0:
         raise FSOutsideActivityError("fs operations must run inside an activity")
 
 
@@ -87,14 +88,17 @@ async def fs_list(ctx: "WorkflowContext", prefix: str) -> list[dict[str, Any]]:
     List FS objects whose path starts with prefix, ordered by path.
     Metadata-only (path/owner/version — no data). Permission rules follow
     fs_read: an actor may only list its own /actor/{id}/ space; /shared/
-    is open.
+    is open. The prefix must lie inside one of those spaces ("/actor/{id}"
+    and "/shared" stand for the space itself), so a listing never crosses
+    into a neighbour such as "/actor/{id}:child/".
     """
     _check_activity(ctx)
-    if prefix.startswith("/actor/"):
-        owner = prefix[len("/actor/") :].split("/", 1)[0]
-        if owner != ctx.instance_id:
-            raise FSForbiddenError("cannot list another actor's private space")
-    elif not prefix.startswith("/shared"):
+    own = f"/actor/{ctx.instance_id}/"
+    if prefix in (own[:-1], "/shared"):
+        prefix += "/"
+    if prefix.startswith("/actor/") and not prefix.startswith(own):
+        raise FSForbiddenError("cannot list another actor's private space")
+    if not prefix.startswith((own, "/shared/")):
         raise FSForbiddenError("prefix must be under /actor/{id}/ or /shared/")
     return await ctx.storage.fs_list(prefix)
 

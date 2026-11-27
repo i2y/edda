@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import random
 import sys
 import time
@@ -19,9 +20,11 @@ from typing import Any, Literal
 import uvloop
 from cloudevents.exceptions import GenericException as CloudEventsException
 from cloudevents.http import from_http
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda import workflow
+from edda.exceptions import ChannelPermissionError
 from edda.hooks import WorkflowHooks
 from edda.locking import (
     auto_resume_stale_workflows_periodically,
@@ -70,6 +73,7 @@ class EddaApp:
         # Leader election settings (for coordinating background tasks across workers)
         leader_heartbeat_interval: int = 15,
         leader_lease_duration: int = 45,
+        capability_key: bytes | str | None = None,
     ):
         """
         Initialize Edda application.
@@ -111,6 +115,12 @@ class EddaApp:
                                       Controls how often workers attempt to become/maintain leadership.
             leader_lease_duration: Duration in seconds for leader lease (default: 45).
                                   If leader fails to heartbeat within this time, another worker takes over.
+            capability_key: Key that derives capability secrets (HMAC-SHA256 of the
+                           capability ID), so no token is written to history. A str is
+                           UTF-8 encoded. Falls back to a non-empty DURAX_CAPABILITY_KEY
+                           environment variable. Without a key tokens are random and
+                           recorded in history. Use the same key on every worker, and
+                           keep it while instances that issued capabilities are alive.
         """
         self.db_url = db_url
         self.service_name = service_name
@@ -120,6 +130,11 @@ class EddaApp:
             raise ValueError("broker_url is required when outbox_enabled=True")
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
+        if capability_key is None:
+            capability_key = os.environ.get("DURAX_CAPABILITY_KEY") or None
+        self._capability_key = (
+            capability_key.encode("utf-8") if isinstance(capability_key, str) else capability_key
+        )
         self._message_retention_days = message_retention_days
 
         # Connection pool settings
@@ -227,6 +242,12 @@ class EddaApp:
                     "pool_pre_ping": self._pool_pre_ping,
                 }
             )
+
+        # The storage pins every session to UTC (and MySQL to READ
+        # COMMITTED, see _install_session_settings); here SQLAlchemy owns
+        # the isolation level, so it also restores it on pooled connections.
+        if make_url(db_url).get_backend_name() == "mysql":
+            engine_kwargs["isolation_level"] = "READ COMMITTED"
 
         # Create async engine
         engine = create_async_engine(db_url, **engine_kwargs)
@@ -418,6 +439,7 @@ class EddaApp:
             worker_id=self.worker_id,
             hooks=self.hooks,
             default_retry_policy=self.default_retry_policy,
+            capability_key=self._capability_key,
         )
 
         # Set global replay engine for workflow decorator
@@ -791,6 +813,9 @@ class EddaApp:
 
         event_type = event["type"]
 
+        # A sealed channel takes events only with a valid token; nothing runs otherwise.
+        await self._enforce_cloudevent_seal(event)
+
         # Find handlers for this event type
         handlers = self.event_handlers.get(event_type, [])
 
@@ -804,6 +829,27 @@ class EddaApp:
             for handler in handlers:
                 asyncio.create_task(self._run_handler(handler, event, event_type))
             asyncio.create_task(self._deliver_event_to_waiting_workflows_safe(event))
+
+    async def _enforce_cloudevent_seal(self, event: Any) -> None:
+        """Refuse an event whose target channel is sealed for ``channel_pub``
+        unless its ``capabilitytoken`` extension (``ce-capabilitytoken`` header
+        in binary mode) is a valid token. The target is the event type, or
+        ``{type}:{instance}`` for a targeted event; the seal scopes are the
+        ones ``publish`` checks.
+
+        Raises:
+            ChannelPermissionError: If the channel is sealed and the token is
+                missing or invalid
+        """
+        from edda.channels import _enforce_channel_capability
+
+        attributes = event.get_attributes()
+        channel = event["type"]
+        if attributes.get("eddainstanceid"):
+            channel = f"{channel}:{attributes['eddainstanceid']}"
+        await _enforce_channel_capability(
+            self.storage, "channel_pub", channel, attributes.get("capabilitytoken")
+        )
 
     async def _run_handler(self, handler: Callable[..., Any], event: Any, event_type: str) -> None:
         """
@@ -883,12 +929,18 @@ class EddaApp:
             "data",
             "data_base64",
         }
-        extensions = {k: v for k, v in event.get_attributes().items() if k not in standard_attrs}
+        # The capability token was checked on arrival and must not be stored.
+        extensions = {
+            k: v
+            for k, v in event.get_attributes().items()
+            if k not in standard_attrs and k != "capabilitytoken"
+        }
         if extensions:
             metadata["ce_extensions"] = extensions
 
         # Check for eddainstanceid extension attribute for Point-to-Point delivery
         target_instance_id = extensions.get("eddainstanceid")
+        capability_token = event.get_attributes().get("capabilitytoken")
 
         if target_instance_id:
             # Point-to-Point: Deliver to specific instance only
@@ -906,6 +958,7 @@ class EddaApp:
                     metadata=metadata,
                     target_instance_id=target_instance_id,
                     worker_id=self.worker_id,
+                    capability_token=capability_token,
                 )
                 logger.debug(
                     "Published '%s' to channel (target: %s)",
@@ -932,6 +985,7 @@ class EddaApp:
                     data=event_data,
                     metadata=metadata,
                     worker_id=self.worker_id,
+                    capability_token=capability_token,
                 )
                 logger.debug(
                     "Published '%s' to channel (message_id: %s)",
@@ -1016,38 +1070,54 @@ class EddaApp:
                     activity_id,
                 )
 
-                # 1. Record timer expiration to history (allows deterministic replay)
-                # During replay, wait_timer() will find this entry and skip the wait
+                # Consume the timer in one transaction under the lock: remove
+                # the subscription, record the expiration (allows
+                # deterministic replay: wait_timer() finds this entry and
+                # skips the wait) and flip the instance to running. If the
+                # resume below fails, the instance is left running for the
+                # resumable sweep instead of waiting_for_timer with no timer.
+                # Timers of terminated instances are dropped, never resumed.
+                consumed = False
+                await self.storage.begin_transaction()
                 try:
-                    await self.storage.append_history(
-                        instance_id,
-                        activity_id=activity_id,
-                        event_type="TimerExpired",
-                        event_data={
-                            "result": None,
-                            "timer_id": timer_id,
-                            "expires_at": timer["expires_at"],
-                        },
-                    )
+                    instance = await self.storage.get_instance(instance_id)
+                    status = instance["status"] if instance else None
+                    if status in ("completed", "failed", "cancelled"):
+                        await self.storage.remove_timer_subscription(instance_id, timer_id)
+                    elif status == "waiting_for_timer":
+                        await self.storage.remove_timer_subscription(instance_id, timer_id)
+                        await self.storage.append_history(
+                            instance_id,
+                            activity_id=activity_id,
+                            event_type="TimerExpired",
+                            event_data={
+                                "result": None,
+                                "timer_id": timer_id,
+                                "expires_at": timer["expires_at"],
+                            },
+                            lock_id=lock_id,
+                        )
+                        await self.storage.update_instance_status(
+                            instance_id, "running", lock_id=lock_id
+                        )
+                        consumed = True
+                    await self.storage.commit_transaction()
                 except Exception as history_error:
+                    await self.storage.rollback_transaction()
                     # If history entry already exists (UNIQUE constraint), this timer was already
                     # processed by another worker in a multi-process environment.
                     # Skip workflow resumption to prevent duplicate processing.
                     logger.debug(
-                        "History already exists for activity_id %s: %s",
-                        activity_id,
+                        "Timer '%s' for %s not consumed (already processed?): %s",
+                        timer_id,
+                        instance_id,
                         history_error,
                     )
-                    logger.debug(
-                        "Timer '%s' was already processed by another worker, skipping",
-                        timer_id,
-                    )
+                    continue
+                if not consumed:
                     continue
 
-                # 2. Remove timer subscription
-                await self.storage.remove_timer_subscription(instance_id, timer_id)
-
-                # 3. Resume workflow (lock already held by this worker - distributed coroutine pattern)
+                # Resume workflow (lock already held by this worker - distributed coroutine pattern)
                 if self.replay_engine is None:
                     logger.error("Replay engine not initialized")
                     continue
@@ -1093,7 +1163,7 @@ class EddaApp:
         Check for message subscriptions that have timed out and fail those workflows.
 
         This method:
-        1. Finds all message subscriptions where timeout_at <= now
+        1. Finds all message subscriptions where timeout_at < now
         2. For each timeout, acquires workflow lock (Lock-First pattern)
         3. Records MessageTimeout to history
         4. Removes message subscription
@@ -1161,14 +1231,34 @@ class EddaApp:
                     )
                     continue
 
-                # 1. Record message timeout to history
-                # This allows the workflow to see what happened during replay
-                # Convert datetime to ISO string for JSON serialization
+                # Re-check under the lock: fire only into the wait the scan
+                # saw, while the instance still waits on it. A wait left
+                # behind by an instance that moved on (e.g. requeued and
+                # resumed) is only cleared -- a timeout recorded there would
+                # end a receive that already got its message.
+                current = await self.storage.get_channel_subscription(instance_id, channel)
+                instance = await self.storage.get_instance(instance_id)
+                if instance is None or current is None:
+                    continue
+                if instance["status"] != "waiting_for_message":
+                    await self.storage.remove_message_subscription(instance_id, channel)
+                    continue
+                if current.get("activity_id") != activity_id or current.get("timeout_at") != (
+                    timeout_at
+                ):
+                    continue
+
+                # Record the timeout, clear the wait and flip the instance to
+                # running in one transaction under the lock (a failed resume
+                # then leaves it for the resumable sweep). The history entry
+                # lets the workflow see what happened during replay; the
+                # datetime becomes an ISO string for JSON serialization.
                 from datetime import datetime as dt_type
 
                 timeout_at_str = (
                     timeout_at.isoformat() if isinstance(timeout_at, dt_type) else str(timeout_at)
                 )
+                await self.storage.begin_transaction()
                 try:
                     await self.storage.append_history(
                         instance_id,
@@ -1181,24 +1271,25 @@ class EddaApp:
                             "channel": channel,
                             "timeout_at": timeout_at_str,
                         },
+                        lock_id=lock_id,
                     )
+                    await self.storage.remove_message_subscription(instance_id, channel)
+                    await self.storage.update_instance_status(
+                        instance_id, "running", lock_id=lock_id
+                    )
+                    await self.storage.commit_transaction()
                 except Exception as history_error:
+                    await self.storage.rollback_transaction()
                     # If history entry already exists, this timeout was already processed
                     logger.debug(
-                        "History already exists for activity_id %s: %s",
-                        activity_id,
-                        history_error,
-                    )
-                    logger.debug(
-                        "Timeout for channel '%s' was already processed, skipping",
+                        "Timeout for channel '%s' on %s not recorded (already processed?): %s",
                         channel,
+                        instance_id,
+                        history_error,
                     )
                     continue
 
-                # 2. Remove message subscription
-                await self.storage.remove_message_subscription(instance_id, channel)
-
-                # 3. Resume workflow (lock already held - distributed coroutine pattern)
+                # Resume workflow (lock already held - distributed coroutine pattern)
                 # The workflow will replay and receive() will raise TimeoutError from cached history
                 if self.replay_engine is None:
                     logger.error("Replay engine not initialized")
@@ -1369,8 +1460,12 @@ class EddaApp:
         # one transaction, stamped with an epoch identity so resumed runs and
         # their fenced writes all share this claim epoch.
         lock_id = new_lock_identity(self.worker_id)
+        from edda.workflow import get_all_workflows
+
         resumable = await self.storage.claim_resumable_workflows(
-            worker_id=lock_id, limit=effective_batch
+            worker_id=lock_id,
+            limit=effective_batch,
+            workflow_names=list(get_all_workflows()),
         )
         processed_count = 0
 
@@ -1601,6 +1696,15 @@ class EddaApp:
             # Success: 202 Accepted (async processing)
             status = 202
             response_body: dict[str, Any] = {"status": "accepted"}
+
+        except ChannelPermissionError as e:
+            # Sealed channel without a valid capability token: 403 Forbidden (non-retryable)
+            status = 403
+            response_body = {
+                "error": str(e),
+                "error_type": "Forbidden",
+                "retryable": False,
+            }
 
         except (ValueError, TypeError, KeyError, CloudEventsException) as e:
             # CloudEvents parsing/validation error: 400 Bad Request (non-retryable)

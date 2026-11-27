@@ -10,7 +10,21 @@ from edda.exceptions import SandboxedError
 from edda.replay import ReplayEngine
 from edda.workflow import set_replay_engine, workflow
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.multidb]
+
+
+# Instances started by compensation_spawn (module level: compensations are
+# looked up by function name)
+COMPENSATION_SPAWNS: list[str] = []
+
+
+@workflow
+async def compensation_spawned_child(ctx: WorkflowContext):
+    return {"ok": True}
+
+
+async def compensation_spawn(ctx: WorkflowContext) -> None:
+    COMPENSATION_SPAWNS.append(await compensation_spawned_child.start())
 
 
 @pytest.fixture
@@ -114,6 +128,26 @@ async def test_sandboxed_inherited_across_recur(sqlite_storage, replay_engine):
         inst = await sqlite_storage.get_instance(row["instance_id"])
         assert inst is not None
         assert inst["sandboxed"] is True
+
+
+async def test_sandboxed_inherited_by_compensation_spawn(sqlite_storage, replay_engine):
+    """A compensation runs outside the workflow body but still on behalf of
+    the (sandboxed) instance: what it spawns inherits the sandbox."""
+    from edda.compensation import register_compensation
+
+    COMPENSATION_SPAWNS.clear()
+
+    @workflow
+    async def sandboxed_saga_wf(ctx: WorkflowContext):
+        await register_compensation(ctx, compensation_spawn)
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await sandboxed_saga_wf.start(sandboxed=True)
+    assert COMPENSATION_SPAWNS, "compensation did not run"
+    child = await sqlite_storage.get_instance(COMPENSATION_SPAWNS[0])
+    assert child is not None
+    assert child["sandboxed"] is True
 
 
 async def test_sandboxed_inherited_by_supervised_child(tmp_path):

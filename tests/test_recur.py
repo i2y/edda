@@ -6,7 +6,7 @@ Tests cover:
 - recur() method in WorkflowContext
 - ReplayEngine handling of RecurException
 - History archiving
-- Continued workflow chain tracking
+- Same-instance iteration semantics
 - Pydantic model and Enum serialization in recur kwargs
 """
 
@@ -153,8 +153,8 @@ class TestRecurInReplayEngine:
             worker_id="worker-test-001",
         )
 
-    async def test_recur_creates_new_instance(self, replay_engine, sqlite_storage):
-        """Test that recur() creates a new workflow instance."""
+    async def test_recur_keeps_the_same_instance(self, replay_engine, sqlite_storage):
+        """Test that recur() continues the same workflow instance."""
 
         @activity
         async def process_item(ctx: WorkflowContext, item_id: str) -> dict:
@@ -169,21 +169,20 @@ class TestRecurInReplayEngine:
 
             return result
 
-        # Start workflow - it should recur and create a new instance
+        # Start workflow - it recurs and completes on the same instance
         new_instance_id = await replay_engine.start_workflow(
             workflow_name="recur_workflow",
             workflow_func=recur_workflow,
             input_data={"iteration": 0},
         )
 
-        # The returned ID should be the new instance (after recur)
         assert new_instance_id is not None
         assert new_instance_id.startswith("recur_workflow-")
 
-        # Get the new instance
-        new_instance = await sqlite_storage.get_instance(new_instance_id)
-        assert new_instance is not None
-        # New instance should be completed (it ran iteration=1 and returned)
+        instance = await sqlite_storage.get_instance(new_instance_id)
+        assert instance is not None
+        # The same instance is completed (it ran iteration=1 and returned)
+        new_instance = instance
         assert new_instance["status"] == "completed"
         assert new_instance["input_data"] == {"iteration": 1}
 
@@ -220,18 +219,19 @@ class TestRecurInReplayEngine:
             input_data={"count": 0},
         )
 
-        # Find the original instance (status = 'recurred')
+        # The original instance itself continued and completed with the new input.
         async with AsyncSession(sqlite_storage.engine) as session:
             result = await session.execute(
-                select(WorkflowInstance).where(WorkflowInstance.status == "recurred")
+                select(WorkflowInstance).where(WorkflowInstance.workflow_name == "recur_workflow")
             )
-            recurred_instance = result.scalar_one_or_none()
+            instances = result.scalars().all()
 
-            assert recurred_instance is not None
-            assert recurred_instance.input_data == '{"count": 0}'
+            assert len(instances) == 1
+            assert instances[0].status == "completed"
+            assert instances[0].input_data == '{"count": 1}'
 
-    async def test_recur_sets_continued_from(self, replay_engine, sqlite_storage):
-        """Test that new instance has continued_from set to old instance."""
+    async def test_recur_does_not_write_continued_from(self, replay_engine, sqlite_storage):
+        """Test that recur keeps one row and does not write continued_from."""
 
         async def simple_recur(ctx: WorkflowContext, n: int = 0) -> dict:
             if n == 0:
@@ -244,25 +244,17 @@ class TestRecurInReplayEngine:
             input_data={"n": 0},
         )
 
-        # Get new instance and check continued_from
         async with AsyncSession(sqlite_storage.engine) as session:
-            # Find the new instance
             result = await session.execute(
-                select(WorkflowInstance).where(WorkflowInstance.instance_id == new_instance_id)
+                select(WorkflowInstance).where(WorkflowInstance.workflow_name == "simple_recur")
             )
-            new_instance = result.scalar_one()
+            instances = result.scalars().all()
 
-            assert new_instance.continued_from is not None
-
-            # Find the old instance
-            result = await session.execute(
-                select(WorkflowInstance).where(
-                    WorkflowInstance.instance_id == new_instance.continued_from
-                )
-            )
-            old_instance = result.scalar_one()
-
-            assert old_instance.status == "recurred"
+            assert len(instances) == 1
+            assert instances[0].instance_id == new_instance_id
+            assert instances[0].continued_from is None
+            assert instances[0].status == "completed"
+            assert instances[0].input_data == '{"n": 1}'
 
     async def test_recur_archives_history(self, replay_engine, sqlite_storage):
         """Test that history is archived when workflow recurs."""
@@ -321,32 +313,24 @@ class TestRecurInReplayEngine:
             return {"action": "done", "value": value}
 
         async def workflow_with_compensation(ctx: WorkflowContext, count: int = 0) -> dict:
-            await action_with_compensation(ctx, f"value-{count}")
-
             if count == 0:
+                await action_with_compensation(ctx, f"value-{count}")
                 await ctx.recur(count=1)
 
             return {"count": count}
 
-        await replay_engine.start_workflow(
+        instance_id = await replay_engine.start_workflow(
             workflow_name="workflow_with_compensation",
             workflow_func=workflow_with_compensation,
             input_data={"count": 0},
         )
 
-        # Check that compensations were cleared for the recurred instance
-        async with AsyncSession(sqlite_storage.engine) as session:
-            result = await session.execute(
-                select(WorkflowInstance).where(WorkflowInstance.status == "recurred")
-            )
-            recurred_instance = result.scalar_one()
+        # Compensations from the prior iteration were cleared on the same instance.
+        compensations = await sqlite_storage.get_compensations(instance_id)
+        assert len(compensations) == 0
 
-            # Get compensations for recurred instance
-            compensations = await sqlite_storage.get_compensations(recurred_instance.instance_id)
-            assert len(compensations) == 0
-
-            # Compensation should not have been called (recur, not failure)
-            assert len(compensation_called) == 0
+        # Compensation should not have been called (recur, not failure)
+        assert len(compensation_called) == 0
 
     async def test_multiple_recurs(self, replay_engine, sqlite_storage):
         """Test multiple recur operations creating a chain."""
@@ -362,28 +346,19 @@ class TestRecurInReplayEngine:
             input_data={"step": 0},
         )
 
-        # Should have 3 instances in total (step 0, 1, 2)
+        # All iterations ran on one instance; only the final input remains current.
         async with AsyncSession(sqlite_storage.engine) as session:
             result = await session.execute(
                 select(WorkflowInstance).where(WorkflowInstance.workflow_name == "chain_workflow")
             )
             all_instances = result.scalars().all()
 
-            assert len(all_instances) == 3
+            assert len(all_instances) == 1
+            assert all_instances[0].status == "completed"
+            assert '"step": 2' in all_instances[0].input_data
 
-            # Count statuses
-            recurred_count = sum(1 for i in all_instances if i.status == "recurred")
-            completed_count = sum(1 for i in all_instances if i.status == "completed")
-
-            assert recurred_count == 2  # step 0 and 1
-            assert completed_count == 1  # step 2 (final)
-
-            # Final instance should have input step=2
-            final_instance = next(i for i in all_instances if i.status == "completed")
-            assert '"step": 2' in final_instance.input_data
-
-    async def test_recur_new_instance_has_fresh_history(self, replay_engine, sqlite_storage):
-        """Test that new instance starts with fresh history."""
+    async def test_recur_same_instance_has_fresh_history(self, replay_engine, sqlite_storage):
+        """Test that the next iteration starts with fresh history on the same instance."""
 
         @activity
         async def count_activity(ctx: WorkflowContext, n: int) -> dict:
@@ -405,7 +380,7 @@ class TestRecurInReplayEngine:
             input_data={"iteration": 0},
         )
 
-        # Get history for the final instance
+        # Get history for the same instance after its final iteration
         final_history = await sqlite_storage.get_history(final_id)
 
         # Should have 3 fresh entries (not 6)

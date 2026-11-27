@@ -6,17 +6,25 @@ allowing workflows to resume from where they left off by replaying their
 execution history.
 """
 
+import asyncio
 import hashlib
 import inspect
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from edda.channels import WaitForChannelMessageException, WaitForTimerException
 from edda.compensation import execute_compensations
 from edda.context import WorkflowContext, _current_workflow_context
-from edda.locking import LockLostError, new_lock_identity, workflow_lock
+from edda.exceptions import RunAbortedError
+from edda.locking import (
+    LockLostError,
+    new_lock_identity,
+    run_with_lock_heartbeat,
+    workflow_lock,
+)
 from edda.pydantic_utils import (
     enum_value_to_enum,
     extract_enum_from_annotation,
@@ -28,6 +36,13 @@ from edda.storage.protocol import StorageProtocol
 from edda.workflow import RecurException
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_if_task_cancelled() -> None:
+    """Re-raise a cancellation even when workflow code swallowed it."""
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError
 
 
 class ReplayEngine:
@@ -45,6 +60,7 @@ class ReplayEngine:
         worker_id: str,
         hooks: Any = None,
         default_retry_policy: Any = None,
+        capability_key: bytes | None = None,
     ):
         """
         Initialize the replay engine.
@@ -55,12 +71,14 @@ class ReplayEngine:
             worker_id: Unique worker ID for this process
             hooks: Optional WorkflowHooks implementation for observability
             default_retry_policy: Default retry policy for all activities (RetryPolicy or None)
+            capability_key: Key deriving capability secrets (None: random secrets)
         """
         self.storage = storage
         self.service_name = service_name
         self.worker_id = worker_id
         self.hooks = hooks
         self.default_retry_policy = default_retry_policy
+        self.capability_key = capability_key
 
     async def _invoke_workflow(
         self,
@@ -217,7 +235,7 @@ class ReplayEngine:
 
         # Execute the workflow with distributed lock
         lock_id = new_lock_identity(self.worker_id)
-        async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
+        async with self._run_under_lock(instance_id, lock_id):
             # Create context for new execution
             ctx = WorkflowContext(
                 instance_id=instance_id,
@@ -230,6 +248,7 @@ class ReplayEngine:
             )
             # Set default retry policy for activity resolution
             ctx._app_retry_policy = self.default_retry_policy
+            ctx._capability_key = self.capability_key
 
             try:
                 # Call hook: workflow start
@@ -241,6 +260,9 @@ class ReplayEngine:
 
                 # Execute workflow function
                 result = await self._invoke_workflow(ctx, workflow_func, processed_input)
+
+                _raise_if_task_cancelled()
+                ctx._raise_if_run_aborted()
 
                 # Before marking as completed, check if workflow was cancelled
                 instance = await ctx.storage.get_instance(instance_id)
@@ -264,6 +286,7 @@ class ReplayEngine:
                 return instance_id
 
             except WaitForTimerException as exc:
+                _raise_if_task_cancelled()
                 # Workflow is waiting for a timer
                 # Before marking as waiting_for_timer, check if workflow was cancelled
                 instance = await ctx.storage.get_instance(instance_id)
@@ -292,6 +315,7 @@ class ReplayEngine:
                 return instance_id
 
             except WaitForChannelMessageException as exc:
+                _raise_if_task_cancelled()
                 # Workflow is waiting for a message on a channel
                 # Before marking as waiting_for_message, check if workflow was cancelled
                 instance = await ctx.storage.get_instance(instance_id)
@@ -318,43 +342,43 @@ class ReplayEngine:
                 return instance_id
 
             except RecurException as exc:
-                # Workflow is recurring (Erlang-style tail recursion pattern)
-                # This resets history growth in long-running loops by:
-                # 1. Completing the current instance (marking as "recurred")
-                # 2. Archiving the current history
-                # 3. Cleaning up subscriptions
-                # 4. Starting a new instance with the provided arguments
-                # 5. Linking new instance to old via `continued_from`
-
-                logger.info(f"Workflow {instance_id} recurring with args: {exc.kwargs}")
-
-                # Mark current workflow as "recurred"
-                await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
-
-                # Archive history (move to archive table)
-                archived_count = await self.storage.archive_history(instance_id)
-                logger.info(f"Archived {archived_count} history entries for {instance_id}")
-
-                # Clean up all subscriptions (event/timer/message)
-                # This prevents old subscriptions from receiving events meant for the new instance
-                await self.storage.cleanup_instance_subscriptions(instance_id)
-
-                # Clear compensations (fresh start)
-                await ctx._clear_compensations()
-
-                # Create and start a new workflow instance
-                new_instance_id = await self._start_recurred_workflow(
-                    workflow_name=workflow_name,
-                    workflow_func=workflow_func,
-                    input_data=exc.kwargs,
-                    continued_from=instance_id,
-                    lock_timeout_seconds=lock_timeout_seconds,
+                _raise_if_task_cancelled()
+                # Commit the complete iteration boundary in one fenced
+                # transaction, then continue the same instance under the lock
+                # and heartbeat this worker already holds.
+                logger.info("Workflow %s recurring on the same instance", instance_id)
+                try:
+                    await self.storage.reset_instance_for_recur(instance_id, exc.kwargs, lock_id)
+                except LockLostError:
+                    logger.warning("Lock lost before %s recurred; new owner continues", instance_id)
+                    return instance_id
+                instance = await self.storage.get_instance(instance_id)
+                if instance is None:
+                    raise ValueError(f"Workflow instance {instance_id} not found") from None
+                await self._execute_workflow_logic(
+                    instance, instance_id, workflow_func, lock_id=lock_id
                 )
+                return instance_id
 
-                logger.info(f"Workflow {instance_id} recurred to {new_instance_id}")
-                return new_instance_id
+            except RunAbortedError:
+                # Unexpected primitive/storage failures are not workflow
+                # outcomes. End this run only; a later resume re-executes.
+                logger.warning("Run of %s aborted; leaving it running for resume", instance_id)
+                return instance_id
+
+            except LockLostError:
+                # A lost lease ends the run without compensations or a terminal record.
+                logger.warning("Lock lost during run of %s; new owner continues", instance_id)
+                return instance_id
 
             except Exception as error:
+                _raise_if_task_cancelled()
+                if ctx._run_abort_error is not None:
+                    logger.warning(
+                        "Run of %s aborted despite workflow error handling; leaving running",
+                        instance_id,
+                    )
+                    return instance_id
                 # Check if this is a cancellation exception
                 from edda.exceptions import WorkflowCancelledException
 
@@ -410,6 +434,25 @@ class ReplayEngine:
 
                 raise
 
+        # A lost lease ended the first run; the instance's new owner continues it.
+        return instance_id
+
+    @asynccontextmanager
+    async def _run_under_lock(self, instance_id: str, lock_id: str) -> AsyncIterator[None]:
+        """
+        Hold the instance lock, with a heartbeat, for one run started here.
+
+        A run that loses its lease stops and leaves the instance to its new
+        owner (SEMANTICS §1). That ends the run, not the caller: the block is
+        left without an error, so start() returns the instance id (as when
+        the workflow suspends) and a resume simply returns.
+        """
+        try:
+            async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
+                yield
+        except LockLostError:
+            logger.warning("Lock lost during a run of %s; new owner continues", instance_id)
+
     async def resume_workflow(
         self,
         instance_id: str,
@@ -439,8 +482,9 @@ class ReplayEngine:
         if instance is None:
             raise ValueError(f"Workflow instance {instance_id} not found")
 
-        if instance["status"] == "completed":
-            # Already completed, nothing to do
+        if instance["status"] in ("completed", "cancelled"):
+            # Terminal statuses are absorbing: nothing to resume (a timer or
+            # message that fires after a cancel must not run it again)
             return
 
         if instance["status"] == "failed":
@@ -451,27 +495,68 @@ class ReplayEngine:
         if already_locked:
             # Lock already held by caller (distributed coroutine pattern).
             # lock_id must be the identity used for that claim so fenced
-            # writes match.
+            # writes match. The heartbeat first proves the claim is still
+            # ours (a batch claim may have lapsed while earlier items ran)
+            # and then keeps the lease alive.
+            claim_id = lock_id or self.worker_id
             try:
-                await self._execute_workflow_logic(
-                    instance, instance_id, workflow_func, lock_id=lock_id
+                await run_with_lock_heartbeat(
+                    self.storage,
+                    instance_id,
+                    claim_id,
+                    lambda: self._execute_workflow_logic(
+                        instance, instance_id, workflow_func, lock_id=claim_id
+                    ),
+                    refresh_interval=60,
                 )
             except LockLostError:
                 logger.warning("Lock lost during resume of %s; new owner continues", instance_id)
         else:
             # Acquire lock for this workflow under a fresh epoch identity
             lock_id = new_lock_identity(self.worker_id)
-            async with workflow_lock(self.storage, instance_id, lock_id, refresh_interval=60):
-                try:
-                    await self._execute_workflow_logic(
-                        instance, instance_id, workflow_func, lock_id=lock_id
-                    )
-                except LockLostError:
-                    logger.warning(
-                        "Lock lost during resume of %s; new owner continues", instance_id
-                    )
+            async with self._run_under_lock(instance_id, lock_id):
+                await self._execute_workflow_logic(
+                    instance, instance_id, workflow_func, lock_id=lock_id
+                )
 
     async def _execute_workflow_logic(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        workflow_func: Callable[..., Any],
+        lock_id: str | None = None,
+    ) -> None:
+        """Execute consecutive iterations of one instance without growing frames.
+
+        An instance in ``recurred`` (its last iteration committed the reset)
+        is set running first, so a run that resumes it after a crash or a
+        released lock continues from the new input like this worker would.
+        """
+        lock_id = lock_id or self.worker_id
+        while True:
+            try:
+                if instance.get("status") == "recurred":
+                    await self.storage.update_instance_status(
+                        instance_id, "running", lock_id=lock_id
+                    )
+                    instance = {**instance, "status": "running"}
+                await self._execute_workflow_iteration(
+                    instance, instance_id, workflow_func, lock_id=lock_id
+                )
+                return
+            except RecurException:
+                # The iteration has committed its fenced reset as ``recurred``.
+                refreshed = await self.storage.get_instance(instance_id)
+                if refreshed is None:
+                    raise ValueError(f"Workflow instance {instance_id} not found") from None
+                instance = refreshed
+            except LockLostError:
+                # The reset or the status write found the lease gone (or the
+                # instance cancelled): the new owner continues.
+                logger.warning("Lock lost while %s recurred; new owner continues", instance_id)
+                return
+
+    async def _execute_workflow_iteration(
         self,
         instance: dict[str, Any],
         instance_id: str,
@@ -502,6 +587,7 @@ class ReplayEngine:
         )
         # Set default retry policy for activity resolution
         ctx._app_retry_policy = self.default_retry_policy
+        ctx._capability_key = self.capability_key
 
         # Load history for replay
         await ctx._load_history()
@@ -514,6 +600,9 @@ class ReplayEngine:
             processed_input = self._prepare_workflow_input(workflow_func, input_data)
 
             result = await self._invoke_workflow(ctx, workflow_func, processed_input)
+
+            _raise_if_task_cancelled()
+            ctx._raise_if_run_aborted()
 
             # Before marking as completed, check if workflow was cancelled
             instance_check = await ctx.storage.get_instance(instance_id)
@@ -533,6 +622,7 @@ class ReplayEngine:
                 await self.hooks.on_workflow_complete(instance_id, workflow_name, result)
 
         except WaitForTimerException as exc:
+            _raise_if_task_cancelled()
             # Workflow is waiting for a timer (again)
             # Atomically register timer subscription and release lock (distributed coroutines)
             # Use the expires_at from the exception (calculated at wait_timer() call time)
@@ -549,6 +639,7 @@ class ReplayEngine:
             # by register_timer_subscription_and_release_lock()
 
         except WaitForChannelMessageException as exc:
+            _raise_if_task_cancelled()
             # Workflow is waiting for a message on a channel (again)
             # Atomically register channel receive and release lock (distributed coroutines)
             await self.storage.register_channel_receive_and_release_lock(
@@ -563,44 +654,31 @@ class ReplayEngine:
             # by register_channel_receive_and_release_lock()
 
         except RecurException as exc:
-            # Workflow is recurring (Erlang-style tail recursion pattern)
-            # This resets history growth in long-running loops by:
-            # 1. Completing the current instance (marking as "recurred")
-            # 2. Archiving the current history
-            # 3. Cleaning up subscriptions
-            # 4. Starting a new instance with the provided arguments
-            # 5. Linking new instance to old via `continued_from`
+            _raise_if_task_cancelled()
+            # Commit the complete iteration boundary atomically; the looping
+            # facade then replays this same instance from empty history.
+            logger.info("Workflow %s recurring on the same instance", instance_id)
+            await self.storage.reset_instance_for_recur(instance_id, exc.kwargs, lock_id)
+            raise
 
-            logger.info(f"Workflow {instance_id} recurring with args: {exc.kwargs}")
+        except RunAbortedError:
+            # Unexpected primitive/storage failures are not workflow outcomes.
+            logger.warning("Run of %s aborted; leaving it running for resume", instance_id)
+            return
 
-            # Mark current workflow as "recurred"
-            await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
-
-            # Archive history (move to archive table)
-            archived_count = await self.storage.archive_history(instance_id)
-            logger.info(f"Archived {archived_count} history entries for {instance_id}")
-
-            # Clean up all subscriptions (event/timer/message)
-            # This prevents old subscriptions from receiving events meant for the new instance
-            await self.storage.cleanup_instance_subscriptions(instance_id)
-
-            # Clear compensations (fresh start)
-            await ctx._clear_compensations()
-
-            # Create and start a new workflow instance
-            # Note: we don't return the new instance_id here since _execute_workflow_logic returns None
-            # The new workflow will execute in its own context
-            await self._start_recurred_workflow(
-                workflow_name=instance["workflow_name"],
-                workflow_func=workflow_func,
-                input_data=exc.kwargs,
-                continued_from=instance_id,
-                lock_timeout_seconds=instance.get("lock_timeout_seconds"),
-            )
-
-            logger.info(f"Workflow {instance_id} recurred successfully")
+        except LockLostError:
+            # A lost lease ends the run without compensations or a terminal record.
+            logger.warning("Lock lost during run of %s; new owner continues", instance_id)
+            return
 
         except Exception as error:
+            _raise_if_task_cancelled()
+            if ctx._run_abort_error is not None:
+                logger.warning(
+                    "Run of %s aborted despite workflow error handling; leaving running",
+                    instance_id,
+                )
+                return
             # Check if this is a cancellation exception
             from edda.exceptions import WorkflowCancelledException
 
@@ -699,180 +777,6 @@ class ReplayEngine:
             lock_id=lock_id,
         )
 
-    async def _start_recurred_workflow(
-        self,
-        workflow_name: str,
-        workflow_func: Callable[..., Any],
-        input_data: dict[str, Any],
-        continued_from: str,
-        lock_timeout_seconds: int | None = None,
-    ) -> str:
-        """
-        Start a new workflow instance as a recurrence of an existing workflow.
-
-        This is an internal helper method used by the RecurException handler.
-        It creates a new workflow instance linked to the previous one via continued_from.
-
-        Args:
-            workflow_name: Name of the workflow
-            workflow_func: The workflow function to execute
-            input_data: Input parameters for the workflow (from recur() kwargs)
-            continued_from: Instance ID of the workflow that is recurring
-            lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
-
-        Returns:
-            Instance ID of the new workflow
-        """
-        # Generate new instance ID
-        new_instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
-
-        # Extract source code for visualization
-        try:
-            source_code = inspect.getsource(workflow_func)
-        except (OSError, TypeError) as e:
-            logger.warning(
-                f"Could not extract source code for workflow '{workflow_name}': {e}. "
-                "Hybrid diagram visualization will not be available."
-            )
-            source_code = f"# Source code not available\n# Workflow: {workflow_name}\n# Error: {e}"
-
-        # Calculate source code hash
-        source_hash = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
-
-        # Store workflow definition (idempotent)
-        await self.storage.upsert_workflow_definition(
-            workflow_name=workflow_name,
-            source_hash=source_hash,
-            source_code=source_code,
-        )
-
-        # Create workflow instance in storage with continued_from reference
-        await self.storage.create_instance(
-            instance_id=new_instance_id,
-            workflow_name=workflow_name,
-            source_hash=source_hash,
-            owner_service=self.service_name,
-            input_data=input_data,
-            lock_timeout_seconds=lock_timeout_seconds,
-            continued_from=continued_from,
-        )
-
-        # Execute the new workflow with distributed lock
-        lock_id = new_lock_identity(self.worker_id)
-        async with workflow_lock(self.storage, new_instance_id, lock_id, refresh_interval=60):
-            # Create context for new execution
-            ctx = WorkflowContext(
-                instance_id=new_instance_id,
-                workflow_name=workflow_name,
-                storage=self.storage,
-                worker_id=self.worker_id,
-                is_replaying=False,
-                hooks=self.hooks,
-                lock_id=lock_id,
-            )
-            # Set default retry policy for activity resolution
-            ctx._app_retry_policy = self.default_retry_policy
-
-            try:
-                # Call hook: workflow start
-                if self.hooks and hasattr(self.hooks, "on_workflow_start"):
-                    await self.hooks.on_workflow_start(new_instance_id, workflow_name, input_data)
-
-                # Prepare input: convert JSON dicts to Pydantic models based on type hints
-                processed_input = self._prepare_workflow_input(workflow_func, input_data)
-
-                # Execute workflow function
-                result = await self._invoke_workflow(ctx, workflow_func, processed_input)
-
-                # Convert Pydantic model result to JSON dict for storage
-                result_dict = to_json_dict(result)
-
-                # Mark as completed
-                await ctx._update_status("completed", {"result": result_dict})
-
-                # Call hook: workflow complete
-                if self.hooks and hasattr(self.hooks, "on_workflow_complete"):
-                    await self.hooks.on_workflow_complete(new_instance_id, workflow_name, result)
-
-                return new_instance_id
-
-            except WaitForTimerException as exc:
-                # Workflow is waiting for a timer
-                await self.storage.register_timer_subscription_and_release_lock(
-                    instance_id=new_instance_id,
-                    worker_id=self.worker_id,
-                    timer_id=exc.timer_id,
-                    expires_at=exc.expires_at,
-                    activity_id=exc.activity_id,
-                )
-                return new_instance_id
-
-            except WaitForChannelMessageException as exc:
-                # Workflow is waiting for a message
-                await self.storage.register_channel_receive_and_release_lock(
-                    instance_id=new_instance_id,
-                    worker_id=self.worker_id,
-                    channel=exc.channel,
-                    activity_id=exc.activity_id,
-                    timeout_seconds=exc.timeout_seconds,
-                )
-                return new_instance_id
-
-            except RecurException as exc:
-                # Recur again immediately (nested recur)
-                logger.info(
-                    f"Workflow {new_instance_id} recurring immediately with args: {exc.kwargs}"
-                )
-
-                await ctx._update_status("recurred", {"recur_kwargs": exc.kwargs})
-                archived_count = await self.storage.archive_history(new_instance_id)
-                logger.info(f"Archived {archived_count} history entries for {new_instance_id}")
-
-                # Clean up all subscriptions (event/timer/message)
-                await self.storage.cleanup_instance_subscriptions(new_instance_id)
-
-                await ctx._clear_compensations()
-
-                # Recursively start another recurred workflow
-                return await self._start_recurred_workflow(
-                    workflow_name=workflow_name,
-                    workflow_func=workflow_func,
-                    input_data=exc.kwargs,
-                    continued_from=new_instance_id,
-                    lock_timeout_seconds=lock_timeout_seconds,
-                )
-
-            except Exception as error:
-                # Execute compensations before marking as failed
-                await execute_compensations(ctx)
-
-                import traceback
-
-                stack_trace = "".join(
-                    traceback.format_exception(type(error), error, error.__traceback__)
-                )
-
-                error_data = {
-                    "error_message": str(error),
-                    "error_type": type(error).__name__,
-                    "stack_trace": stack_trace,
-                }
-
-                await self.storage.append_history(
-                    lock_id=lock_id,
-                    instance_id=new_instance_id,
-                    activity_id="workflow_failed",
-                    event_type="WorkflowFailed",
-                    event_data=error_data,
-                )
-
-                await ctx._update_status("failed", error_data)
-
-                if self.hooks and hasattr(self.hooks, "on_workflow_failed"):
-                    await self.hooks.on_workflow_failed(new_instance_id, workflow_name, error)
-
-                raise
-
     async def execute_with_lock(
         self,
         instance_id: str,
@@ -908,9 +812,11 @@ class ReplayEngine:
                 worker_id=self.worker_id,
                 is_replaying=is_replay,
                 hooks=self.hooks,
+                lock_id=lock_id,
             )
             # Set default retry policy for activity resolution
             ctx._app_retry_policy = self.default_retry_policy
+            ctx._capability_key = self.capability_key
 
             # Load history if replaying
             if is_replay:
@@ -959,6 +865,7 @@ class ReplayEngine:
             "waiting_for_event",
             "waiting_for_timer",
             "waiting_for_message",
+            "recurred",
         ):
             return False
 
@@ -997,13 +904,22 @@ class ReplayEngine:
                 )
                 # Set default retry policy for activity resolution
                 ctx._app_retry_policy = self.default_retry_policy
+                ctx._capability_key = self.capability_key
 
                 # Execute compensations to clean up
                 logger.debug("Executing compensations for %s", instance_id)
                 await execute_compensations(ctx)
 
-                # Mark as cancelled in storage
-                success = await self.storage.cancel_instance(instance_id, cancelled_by)
+                # Mark as cancelled in storage. When compensations ran, this
+                # is the internal finalizing transition out of compensating;
+                # compensating itself is never externally cancellable.
+                after = await self.storage.get_instance(instance_id)
+                if after is not None and after["status"] == "compensating":
+                    success = await self.storage.finalize_cancelled_instance(
+                        instance_id, cancelled_by, lock_id
+                    )
+                else:
+                    success = await self.storage.cancel_instance(instance_id, cancelled_by)
 
                 return success
 
@@ -1085,6 +1001,7 @@ class ReplayEngine:
                 )
                 # Set default retry policy for activity resolution
                 ctx._app_retry_policy = self.default_retry_policy
+                ctx._capability_key = self.capability_key
 
                 # Re-execute compensations (idempotent - skips already executed)
                 logger.debug("Re-executing compensations for %s", instance_id)
@@ -1092,7 +1009,9 @@ class ReplayEngine:
 
                 # Mark with target status
                 if target_status == "cancelled":
-                    success = await self.storage.cancel_instance(instance_id, "crash_recovery")
+                    success = await self.storage.finalize_cancelled_instance(
+                        instance_id, "crash_recovery", lock_id
+                    )
                     logger.info("Marked %s as cancelled", instance_id)
                 else:
                     await ctx._update_status(

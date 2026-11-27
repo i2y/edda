@@ -15,8 +15,9 @@ from typing import Any, TypeVar, cast
 
 import anyio
 
-from edda.context import WorkflowContext
+from edda.context import WorkflowContext, _restore_step_error
 from edda.exceptions import RetryExhaustedError, TerminalError, WorkflowCancelledException
+from edda.locking import LockLostError
 from edda.pydantic_utils import (
     enum_value_to_enum,
     extract_enum_from_annotation,
@@ -25,8 +26,12 @@ from edda.pydantic_utils import (
     to_json_dict,
 )
 from edda.retry import RetryMetadata, RetryPolicy
+from edda.storage.sqlalchemy_storage import is_write_conflict
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# SQLite write conflicts an attempt is restarted for, without counting a retry.
+_MAX_CONFLICT_RESTARTS = 10
 
 
 class Activity:
@@ -91,6 +96,8 @@ class Activity:
                     my_activity(ctx, arg2, activity_id="my_activity:2"),
                 )
         """
+        ctx._raise_if_run_aborted()
+
         # Resolve activity ID (explicit or auto-generated)
         activity_id = self._resolve_id(ctx, kwargs.pop("activity_id", None))
 
@@ -114,12 +121,7 @@ class Activity:
             if found:
                 # Check if this was an error
                 if isinstance(cached_result, dict) and cached_result.get("_error"):
-                    # Reconstruct and raise the error
-                    error_type = cached_result.get("error_type", "Exception")
-                    error_message = cached_result.get("error_message", "Unknown error")
-
-                    # Call hook: activity failed (from cache)
-                    error_obj = Exception(f"{error_type}: {error_message}")
+                    error_obj = _restore_step_error(cached_result)
                     if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
                         await ctx.hooks.on_activity_failed(
                             ctx.instance_id, activity_id, self.name, error_obj
@@ -156,6 +158,27 @@ class Activity:
         # Resolve retry policy (activity-level > app-level > default)
         retry_policy = self._resolve_retry_policy(ctx)
 
+        async def record_failure_or_abort(
+            error: Exception, retry_meta: RetryMetadata | None
+        ) -> None:
+            input_data = {
+                "args": [to_json_dict(arg) for arg in args],
+                "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
+            }
+            try:
+                await ctx._record_activity_failed(
+                    activity_id, self.name, error, input_data, retry_meta
+                )
+            except (WorkflowCancelledException, LockLostError):
+                raise
+            except Exception as record_error:
+                raise ctx._poison_run(record_error) from record_error
+
+        # An activity inside another activity's transaction leaves a write
+        # conflict to the outer attempt.
+        nested = ctx.in_transaction()
+        conflict_restarts = 0
+
         # Retry loop (OUTSIDE transaction - each attempt is independent)
         attempt = 0
         start_time = time.time()
@@ -164,10 +187,12 @@ class Activity:
 
         while True:
             attempt += 1
+            phase = "begin"
 
             try:
                 # Execute activity in transaction (one attempt)
                 async with ctx.transaction():
+                    phase = "body"
                     # Calculate retry metadata if there were retries
                     retry_meta = None
                     if attempt > 1:
@@ -175,8 +200,12 @@ class Activity:
                         retry_metadata.total_attempts = attempt  # Update attempt count on success
                         retry_meta = retry_metadata
 
+                    def mark_recording() -> None:
+                        nonlocal phase
+                        phase = "record"
+
                     result = await self._execute_and_record(
-                        ctx, activity_id, args, kwargs, retry_meta
+                        ctx, activity_id, args, kwargs, retry_meta, mark_recording
                     )
                     return result
 
@@ -184,16 +213,14 @@ class Activity:
                 # Never retry cancellation
                 raise
 
+            except LockLostError:
+                # The lease is gone: another worker owns the instance now.
+                # Neither retry the body nor record anything.
+                raise
+
             except TerminalError as error:
                 # Never retry terminal errors, but record the failure
-                input_data = {
-                    "args": [to_json_dict(arg) for arg in args],
-                    "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
-                }
-                # Record failure (no retry metadata for terminal errors)
-                await ctx._record_activity_failed(
-                    activity_id, self.name, error, input_data, retry_metadata=None
-                )
+                await record_failure_or_abort(error, retry_meta=None)
 
                 # Call hook: activity failed
                 if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
@@ -205,6 +232,18 @@ class Activity:
                 raise
 
             except Exception as error:
+                if is_write_conflict(error):
+                    if nested:
+                        raise
+                    if conflict_restarts < _MAX_CONFLICT_RESTARTS:
+                        # The attempt is rolled back; run it again in a new
+                        # transaction. Not a retry: no attempt is counted.
+                        conflict_restarts += 1
+                        attempt -= 1
+                        await asyncio.sleep(0.01 * conflict_restarts)
+                        continue
+                if phase != "body":
+                    raise ctx._poison_run(error) from error
                 last_error = error
 
                 # Record this attempt in metadata
@@ -218,15 +257,9 @@ class Activity:
                     retry_metadata.exhausted = True
                     retry_metadata.total_duration_ms = int((time.time() - start_time) * 1000)
 
-                    # Record failure with retry metadata outside transaction
-                    input_data = {
-                        "args": [to_json_dict(arg) for arg in args],
-                        "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
-                    }
-                    # Include retry metadata in the failure record
-                    await ctx._record_activity_failed(
-                        activity_id, self.name, error, input_data, retry_metadata
-                    )
+                    # Record failure with retry metadata outside the rolled-back
+                    # attempt transaction.
+                    await record_failure_or_abort(error, retry_metadata)
 
                     # Call hook: activity failed
                     if ctx.hooks and hasattr(ctx.hooks, "on_activity_failed"):
@@ -258,6 +291,7 @@ class Activity:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         retry_metadata: Any = None,
+        mark_recording: Callable[[], None] | None = None,
     ) -> Any:
         """
         Execute activity function and record the result.
@@ -287,12 +321,21 @@ class Activity:
             "kwargs": {k: to_json_dict(v) for k, v in kwargs.items()},
         }
 
-        # Execute the activity function (sync or async)
-        if self.is_async:
-            result = await self.func(ctx, *args, **kwargs)
-        else:
-            # Run sync function in thread pool to avoid blocking
-            result = await anyio.to_thread.run_sync(self.func, ctx, *args, **kwargs)
+        # Execute the activity function (sync or async). While the body runs,
+        # FS calls are allowed and kernel primitives run as part of this
+        # activity instead of as recorded steps of their own.
+        ctx._activity_depth += 1
+        try:
+            if self.is_async:
+                result = await self.func(ctx, *args, **kwargs)
+            else:
+                # Run sync function in thread pool to avoid blocking
+                result = await anyio.to_thread.run_sync(self.func, ctx, *args, **kwargs)
+        finally:
+            ctx._activity_depth -= 1
+
+        if mark_recording is not None:
+            mark_recording()
 
         # Convert Pydantic model result to JSON dict for storage
         result_for_storage = to_json_dict(result)
