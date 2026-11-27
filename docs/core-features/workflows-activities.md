@@ -574,6 +574,8 @@ async def concurrent_workflow(ctx: WorkflowContext, urls: list[str]):
 - `async for` loops - Dynamic parallel execution
 - Any scenario where execution order is non-deterministic
 
+**Choosing manual IDs:** auto-generated IDs are `{function_name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetch_data(ctx, url)` without one, which would return the earlier call's result without running. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance.
+
 ### Best Practices
 
 ✅ **Do:** Rely on auto-generation for sequential execution

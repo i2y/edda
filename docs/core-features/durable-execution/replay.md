@@ -67,6 +67,8 @@ results = await asyncio.gather(
 )
 ```
 
+A manual ID does not advance the auto-generated count: if the workflow later calls `process_a(ctx, data)` without an ID, that call is also `process_a:1` and returns this call's result without running. When an activity is called both ways, give the manual IDs a form the generated ones never take, such as `process_a:parallel`.
+
 ### How Replay Works Internally
 
 When an activity is called:
