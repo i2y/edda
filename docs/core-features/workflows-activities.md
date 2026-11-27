@@ -121,6 +121,32 @@ async def create_order_with_db(ctx: WorkflowContext, order_id: str):
     return {"order_id": order_id}
 ```
 
+### Calling an Activity from Another Activity
+
+An activity called inside another activity's body is part of the outer activity. Its function runs directly, in the outer activity's transaction:
+
+```python
+@activity
+async def reserve_item(ctx: WorkflowContext, item_id: str) -> dict:
+    return {"item_id": item_id, "reserved": True}
+
+
+@activity
+async def reserve_order(ctx: WorkflowContext, item_ids: list[str]) -> dict:
+    # Each reserve_item call runs as part of reserve_order
+    items = [await reserve_item(ctx, item_id) for item_id in item_ids]
+    return {"items": items}
+```
+
+- The nested call takes no activity ID and is not recorded in history; a manual `activity_id` passed to it is ignored. Only `reserve_order` is recorded, and a replay returns its result without running its body.
+- What the nested call writes commits or rolls back with the outer activity.
+- An exception from the nested call is an exception of the outer attempt. The outer activity's retry policy decides whether the whole attempt runs again; the nested activity's own `retry_policy` does not apply.
+- The nested activity's compensation (`@on_failure`) is not registered, and no activity hooks run for the nested call.
+
+To get two steps that are recorded and retried separately, call both activities from the workflow.
+
+Before edda 0.17.2 the nested call took an ID from the workflow's counter. A replay does not run the outer activity's body, so the IDs of later calls shifted, and a later call of the same activity from the workflow could receive the nested call's result. History that already holds such a record keeps it.
+
 ### Sync Activities (WSGI Compatibility)
 
 For WSGI environments (gunicorn, uWSGI) or legacy codebases, Edda supports synchronous activities:

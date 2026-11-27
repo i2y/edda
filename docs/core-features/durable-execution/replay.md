@@ -69,6 +69,8 @@ results = await asyncio.gather(
 
 A manual ID does not advance the auto-generated count. Had the IDs above been `process_a:1` and so on, a later `process_a(ctx, data)` without an ID would also be `process_a:1`: its result could not be recorded, its run would be aborted, and the replay would return the earlier call's result without running it. Give manual IDs a form the generated ones never take, such as `process_a:parallel`. Edda logs a warning when one run uses an ID twice.
 
+**Nested calls take no ID:** an activity called inside another activity's body runs as part of the outer activity, which is the recorded unit (see [Calling an Activity from Another Activity](../workflows-activities.md#calling-an-activity-from-another-activity)).
+
 ### How Replay Works Internally
 
 When an activity is called:

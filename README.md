@@ -323,7 +323,7 @@ async def user_signup(ctx: WorkflowContext, email: str):
     return {"status": "completed"}
 ```
 
-**Activity IDs**: Activities are automatically identified with IDs like `"send_email:1"` for deterministic replay. Manual IDs are only needed for concurrent execution (e.g., `asyncio.gather`).
+**Activity IDs**: Activities are automatically identified with IDs like `"send_email:1"` for deterministic replay. Manual IDs are only needed for concurrent execution (e.g., `asyncio.gather`). An activity called inside another activity's body takes no ID: it runs as part of the outer activity, in its transaction.
 
 ### Durable Execution
 
