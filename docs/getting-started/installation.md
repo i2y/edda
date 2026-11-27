@@ -4,7 +4,7 @@ This guide will help you install Edda and set up your development environment.
 
 ## Prerequisites
 
-- **Python 3.11 or higher**
+- **Python 3.12 or higher**
 - **uv** package manager (recommended) or pip
 
 ## Installing Edda
