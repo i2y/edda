@@ -291,14 +291,14 @@ Workflows can use standard Python control flow (if statements, loops, etc.), but
 @workflow
 async def order_workflow(ctx: WorkflowContext, order_id: str, amount: float):
     # ✅ Condition based on activity result (deterministic)
-    payment = await process_payment(ctx, amount, activity_id="process_payment:1")
+    payment = await process_payment(ctx, amount)
 
     if payment["status"] == "approved":
         # This path will always be taken on replay
-        await ship_order(ctx, order_id, activity_id="ship_order:1")
+        await ship_order(ctx, order_id)
     else:
         # Or this path will always be taken on replay
-        await refund(ctx, order_id, activity_id="refund:1")
+        await refund(ctx, order_id)
 
     return {"status": payment["status"]}
 ```
@@ -338,9 +338,9 @@ async def fresh_inventory_check(ctx: WorkflowContext, item_id: str):
 
     if current_stock["available"] > 0:
         # Decision based on CURRENT state, not historical state
-        await create_order(ctx, item_id, activity_id="create_order:1")
+        await create_order(ctx, item_id)
     else:
-        await notify_out_of_stock(ctx, item_id, activity_id="notify:1")
+        await notify_out_of_stock(ctx, item_id)
 ```
 
 **Key difference**: Wrap external checks in an **activity** so they're executed fresh on replay.

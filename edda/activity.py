@@ -92,8 +92,8 @@ class Activity:
             Concurrent execution (manual IDs - required)::
 
                 results = await asyncio.gather(
-                    my_activity(ctx, arg1, activity_id="my_activity:1"),
-                    my_activity(ctx, arg2, activity_id="my_activity:2"),
+                    my_activity(ctx, arg1, activity_id="my_activity:arg1"),
+                    my_activity(ctx, arg2, activity_id="my_activity:arg2"),
                 )
         """
         ctx._raise_if_run_aborted()

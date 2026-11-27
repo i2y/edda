@@ -96,7 +96,7 @@ async def temporary_subscriber(ctx: WorkflowContext):
     # Process some messages...
     for i in range(10):
         msg = await receive(ctx, "temp_channel")
-        await process(ctx, msg.data, activity_id=f"process:{i+1}")
+        await process(ctx, msg.data)
 
     # Done subscribing
     await unsubscribe(ctx, "temp_channel")
@@ -119,7 +119,7 @@ async def consumer(ctx: WorkflowContext, id: str):
 
     while True:
         msg = await receive(ctx, "tasks")
-        await process(ctx, msg.data, activity_id=f"process:{msg.id}")
+        await process(ctx, msg.data, activity_id=f"process:msg-{msg.id}")
         await ctx.recur(id=id)
 ```
 
@@ -187,7 +187,7 @@ async def approver(ctx: WorkflowContext, requester_id: str):
     await subscribe(ctx, "review", mode="direct")
     request = await receive(ctx, "review")
 
-    decision = await review(ctx, request.data["request_id"], activity_id="review:1")
+    decision = await review(ctx, request.data["request_id"])
 
     # Send decision to requester
     await send_to(
@@ -530,7 +530,7 @@ async def temporary_subscriber(ctx: WorkflowContext):
     # Process some messages...
     for i in range(10):
         msg = await receive(ctx, "temp_channel")
-        await process(ctx, msg.data, activity_id=f"process:{i+1}")
+        await process(ctx, msg.data)
 
     # Done subscribing
     await unsubscribe(ctx, "temp_channel")

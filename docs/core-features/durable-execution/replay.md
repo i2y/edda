@@ -61,13 +61,13 @@ for item in items:
 import asyncio
 
 results = await asyncio.gather(
-    process_a(ctx, data, activity_id="process_a:1"),
-    process_b(ctx, data, activity_id="process_b:1"),
-    process_c(ctx, data, activity_id="process_c:1"),
+    process_a(ctx, data, activity_id="process_a:parallel"),
+    process_b(ctx, data, activity_id="process_b:parallel"),
+    process_c(ctx, data, activity_id="process_c:parallel"),
 )
 ```
 
-A manual ID does not advance the auto-generated count: if the workflow later calls `process_a(ctx, data)` without an ID, that call is also `process_a:1` and returns this call's result without running. When an activity is called both ways, give the manual IDs a form the generated ones never take, such as `process_a:parallel`.
+A manual ID does not advance the auto-generated count. Had the IDs above been `process_a:1` and so on, a later `process_a(ctx, data)` without an ID would also be `process_a:1`: its result could not be recorded, its run would be aborted, and the replay would return the earlier call's result without running it. Give manual IDs a form the generated ones never take, such as `process_a:parallel`. Edda logs a warning when one run uses an ID twice.
 
 ### How Replay Works Internally
 

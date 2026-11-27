@@ -561,9 +561,9 @@ import asyncio
 async def concurrent_workflow(ctx: WorkflowContext, urls: list[str]):
     # Manual IDs required for asyncio.gather
     results = await asyncio.gather(
-        fetch_data(ctx, urls[0], activity_id="fetch_data:1"),
-        fetch_data(ctx, urls[1], activity_id="fetch_data:2"),
-        fetch_data(ctx, urls[2], activity_id="fetch_data:3"),
+        fetch_data(ctx, urls[0], activity_id="fetch_data:url-1"),
+        fetch_data(ctx, urls[1], activity_id="fetch_data:url-2"),
+        fetch_data(ctx, urls[2], activity_id="fetch_data:url-3"),
     )
     return {"results": results}
 ```
@@ -574,7 +574,7 @@ async def concurrent_workflow(ctx: WorkflowContext, urls: list[str]):
 - `async for` loops - Dynamic parallel execution
 - Any scenario where execution order is non-deterministic
 
-**Choosing manual IDs:** auto-generated IDs are `{function_name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetch_data(ctx, url)` without one, which would return the earlier call's result without running. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance.
+**Choosing manual IDs:** auto-generated IDs are `{function_name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetch_data(ctx, url)` without one. The two calls then share one history record: the later call cannot be recorded, so its run is aborted, and the replay returns the earlier call's result without running it. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance. Edda logs a warning when one run uses an ID twice.
 
 ### Best Practices
 

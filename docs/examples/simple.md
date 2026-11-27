@@ -161,9 +161,9 @@ import asyncio
 async def concurrent_workflow(ctx: WorkflowContext, items: list) -> dict:
     # Activities called concurrently - you MUST specify activity_id manually
     results = await asyncio.gather(
-        my_activity(ctx, items[0], activity_id="my_activity:1"),
-        my_activity(ctx, items[1], activity_id="my_activity:2"),
-        my_activity(ctx, items[2], activity_id="my_activity:3"),
+        my_activity(ctx, items[0], activity_id="my_activity:item-0"),
+        my_activity(ctx, items[1], activity_id="my_activity:item-1"),
+        my_activity(ctx, items[2], activity_id="my_activity:item-2"),
     )
 
     return {"results": results}
