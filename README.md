@@ -889,6 +889,12 @@ async def payment_workflow(ctx: WorkflowContext, order_id: str) -> dict:
 
 **Performance note**: ASGI servers (uvicorn, hypercorn) are recommended for better performance with Edda's async architecture. WSGI support is provided for compatibility with existing infrastructure and users who prefer synchronous programming.
 
+### Event Loop
+
+Edda runs on the event loop of the server that runs it. uvicorn (with its default `--loop auto`) and tsuno use uvloop, which Edda installs as a dependency; with hypercorn, pass `--worker-class uvloop`. `create_wsgi_app()` runs the application on a uvloop loop, in a background thread of each worker process. In a script, start the loop with `uvloop.run(main())`.
+
+Edda does not set an event loop policy: that API is deprecated since Python 3.14 and goes away in 3.16. Before Edda 0.18, `EddaApp.initialize()` set uvloop's policy. It ran inside the server's loop, so it changed only the loops created after it.
+
 ## MCP Integration
 
 Edda integrates with the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), allowing AI assistants like Claude to interact with your durable workflows as long-running tools.

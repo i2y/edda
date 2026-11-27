@@ -217,6 +217,12 @@ Run with uWSGI:
 uwsgi --http :8000 --wsgi-file demo_app.py --callable wsgi_application
 ```
 
+### Event Loop
+
+Edda runs on the event loop of the server that runs it. uvicorn (with its default `--loop auto`) and tsuno use uvloop, which Edda installs as a dependency; with hypercorn, pass `--worker-class uvloop`. `create_wsgi_app()` runs the application on a uvloop loop, in a background thread of each worker process. In a script, start the loop with `uvloop.run(main())`.
+
+Edda does not set an event loop policy: that API is deprecated since Python 3.14 and goes away in 3.16. Before Edda 0.18, `EddaApp.initialize()` set uvloop's policy. It ran inside the server's loop, so it changed only the loops created after it.
+
 ## Retry Policies
 
 Activities automatically retry on failure with exponential backoff. This provides resilience against transient failures like network timeouts or temporary service unavailability.

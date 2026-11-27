@@ -179,14 +179,14 @@ async def order_processing_saga(
 
 # Application setup
 
-app = EddaApp()
-app.initialize()
+app = EddaApp(service_name="order-service", db_url="sqlite:///workflow.db")
 
 if __name__ == "__main__":
-    import asyncio
     import uvloop
 
     async def test_saga():
+        await app.initialize()
+
         # This will succeed
         success_result = await order_processing_saga.start(
             order_id="ORD-001",
@@ -209,8 +209,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Failed with compensation: {e}")
 
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    asyncio.run(test_saga())
+        await app.shutdown()
+
+    uvloop.run(test_saga())
 ```
 
 ## Best Practices

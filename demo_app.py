@@ -1,14 +1,10 @@
 """Demo Edda ASGI application for tsuno."""
 
-import asyncio
 import logging
 import os
-import sys
 from datetime import datetime
 from enum import Enum
 from typing import Any, cast
-
-import uvloop
 
 # Configure logging to see Edda startup messages (must be before edda import)
 logging.basicConfig(
@@ -34,13 +30,6 @@ from edda import (  # noqa: E402
     workflow,
 )
 from edda.wsgi import create_wsgi_app  # noqa: E402
-
-# Python 3.12+ uses asyncio.set_event_loop_policy() instead of uvloop.install()
-if sys.version_info >= (3, 12):
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-else:
-    uvloop.install()
-
 
 # ========== Enum Definitions for Advanced Workflow ==========
 
