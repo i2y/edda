@@ -116,7 +116,7 @@ async def test_nested_activity_conflict_restarts_only_the_outer_attempt(file_sto
     @activity
     async def outer(ctx: WorkflowContext) -> None:
         outer_runs.append(1)
-        await inner(ctx, activity_id=f"inner:{len(outer_runs)}")
+        await inner(ctx)
 
     async def workflow(ctx: WorkflowContext) -> None:
         await outer(ctx)
@@ -125,8 +125,8 @@ async def test_nested_activity_conflict_restarts_only_the_outer_attempt(file_sto
     instance_id = await engine.start_workflow("s11_nested", workflow, {})
 
     assert (await file_storage.get_instance(instance_id))["status"] == "completed"
-    # The inner activity did not restart itself: the conflict went up and the
-    # outer attempt ran again, running the inner once more.
+    # The inner activity is part of the outer attempt: the conflict restarted
+    # the outer attempt, which ran the inner once more.
     assert len(outer_runs) == 2
     assert len(inner_runs) == 2
 

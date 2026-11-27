@@ -74,6 +74,10 @@ class Activity:
                        (asyncio.gather, async for, etc.)
                      - For sequential execution, rely on auto-generation
 
+        Called inside another activity's body (or a compensation), the
+        activity runs as part of that one: directly, in its transaction,
+        with no ID, no history record, no retry of its own and no hooks.
+
         Returns:
             Activity result
 
@@ -97,6 +101,20 @@ class Activity:
                 )
         """
         ctx._raise_if_run_aborted()
+
+        # Called inside another activity's body (or a compensation), the
+        # activity is part of that one (SEMANTICS §2): its function runs
+        # directly, in the outer attempt's transaction. It takes no ID (a
+        # manual one is ignored) and records nothing; its retry policy and
+        # compensation do not apply and no hooks run. An error is the outer
+        # attempt's error.
+        if ctx._activity_depth > 0:
+            kwargs.pop("activity_id", None)
+            if self.is_async:
+                return await self.func(ctx, *args, **kwargs)
+            return await anyio.to_thread.run_sync(
+                functools.partial(self.func, ctx, *args, **kwargs)
+            )
 
         # Resolve activity ID (explicit or auto-generated)
         activity_id = self._resolve_id(ctx, kwargs.pop("activity_id", None))
@@ -174,8 +192,10 @@ class Activity:
             except Exception as record_error:
                 raise ctx._poison_run(record_error) from record_error
 
-        # An activity inside another activity's transaction leaves a write
-        # conflict to the outer attempt.
+        # An activity that runs inside a transaction it did not begin (a
+        # workflow's ctx.transaction()) leaves a write conflict to the code
+        # that began it. (An activity called inside another activity's body
+        # never gets here: it is part of the outer attempt.)
         nested = ctx.in_transaction()
         conflict_restarts = 0
 
