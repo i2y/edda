@@ -363,6 +363,20 @@ dbmate -d ./schema/db/migrations/postgresql status
 
 > **Note**: Edda's auto-migration uses the same SQL files as dbmate, so you can switch between modes freely.
 
+### Session Settings and Database Notes
+
+Edda sets the session time zone to UTC (PostgreSQL and MySQL) and the isolation level to `READ COMMITTED` (MySQL) on every connection. This also applies to an engine you create yourself and pass to `SQLAlchemyStorage`, including connections it opened before the storage was created. An explicit `isolation_level` on your engine is kept.
+
+**MySQL identifiers.** MySQL compares identifiers (instance IDs, channel names, actor names, paths, capability targets) with the database collation. The default `utf8mb4_0900_ai_ci` ignores case and accents, so `Orders` and `orders` are the same channel. For exact matching create the database with `utf8mb4_0900_bin`:
+
+```sql
+CREATE DATABASE edda_workflows CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin;
+```
+
+Never change the collation of single columns. Migration `20261208000000_widen_actor_owner_columns` widens the MySQL instance-id columns of the actor tables to `VARCHAR(255)`.
+
+**SQLite.** File-backed SQLite databases run in WAL mode: `-wal` and `-shm` files appear next to the database file, and the database must not be on a network filesystem. An activity that hits a SQLite write conflict is restarted in a new transaction; this does not count as a retry.
+
 ### Multi-Worker Configuration
 
 When running multiple Edda workers (e.g., in Kubernetes or with multiple processes), Edda automatically coordinates background tasks using **leader election**. Only one worker runs maintenance tasks (timers, message cleanup, etc.) while others focus on workflow execution.
@@ -388,6 +402,7 @@ app = EddaApp(
 
 **Notes:**
 
+- A worker claims only instances of the workflows it has registered. Every worker must register the workflows it should run
 - Default values work well for most deployments
 - Reduce `leader_lease_duration` for faster failover (minimum: 3x heartbeat interval)
 - Leader election uses the database for coordination (no external dependencies)

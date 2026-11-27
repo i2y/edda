@@ -29,6 +29,7 @@ For detailed documentation, visit [https://i2y.github.io/edda/](https://i2y.gith
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
 - 📬 **Channel-based Messaging**: Actor-model style communication with competing (job queue) and broadcast (fan-out) modes
+- 🧩 **Actor OS Primitives**: Names, monitors, capabilities and sealed channels, tasks, an actor filesystem and supervision trees, shared with Romancy (Go) and Shikibu (Ruby)
 - ⚡ **Instant Notifications**: PostgreSQL LISTEN/NOTIFY for near-instant event delivery (optional)
 - 🤖 **MCP Integration**: Expose durable workflows as AI tools via Model Context Protocol
 - 🧠 **Mirascope Integration**: Durable LLM calls
@@ -224,6 +225,12 @@ pip install "git+https://github.com/i2y/edda.git[postgresql,viewer]"
 | **SQLite** | Development, testing, single-process deployments | ❌ No | ⚠️ Limited | Supports multiple async workers within one process, but not multiple processes/pods (K8s, Docker Compose with multiple replicas) |
 | **PostgreSQL** | Production, multi-process/multi-pod systems | ✅ Yes | ✅ Yes | **Recommended for production** - Full support for database-based exclusive control and concurrent workflows |
 | **MySQL** | Production with existing MySQL infrastructure | ✅ Yes | ✅ Yes | Suitable for production - Good choice if you already use MySQL |
+
+**Session settings**: Edda sets the session time zone to UTC (PostgreSQL and MySQL) and the isolation level to `READ COMMITTED` (MySQL) on every connection. This also applies to an engine you create yourself and pass to `SQLAlchemyStorage`, including connections it opened before the storage was created. An explicit `isolation_level` on your engine is kept.
+
+**MySQL identifiers**: MySQL compares identifiers (instance IDs, channel names, actor names, paths, capability targets) with the database collation. The default `utf8mb4_0900_ai_ci` ignores case and accents, so `Orders` and `orders` are the same channel. For exact matching create the database with `utf8mb4_0900_bin`. Never change the collation of single columns. Migration `20261208000000_widen_actor_owner_columns` widens the MySQL instance-id columns of the actor tables to `VARCHAR(255)`.
+
+**SQLite**: File-backed SQLite databases run in WAL mode, so `-wal` and `-shm` files appear next to the database (do not use a network filesystem). An activity that hits a SQLite write conflict is restarted in a new transaction; this does not count as a retry.
 
 **Important**: For multi-process or multi-pod deployments (K8s, Docker Compose with multiple replicas, etc.), you **must** use PostgreSQL or MySQL. SQLite supports multiple async workers within a single process, but its table-level locking makes it unsuitable for multi-process/multi-pod scenarios.
 
@@ -477,6 +484,7 @@ Multiple workers can safely process workflows using database-based exclusive con
 
 - Edda uses database-based locks (not Redis or ZooKeeper)
 - Each workflow instance runs on only one worker at a time
+- A worker claims only instances of the workflows it has registered, so every worker must register the workflows it should run
 - If a worker crashes, another worker automatically resumes
 - No additional infrastructure required
 
@@ -591,7 +599,8 @@ app = EddaApp(
 **CloudEvents handling**:
 - All HTTP requests (any path) are accepted as CloudEvents
 - Events without matching workflow handlers are silently discarded
-- Special endpoint: `POST /cancel/{instance_id}` for workflow cancellation
+- Special endpoint: `POST /cancel/{instance_id}` for workflow cancellation. `running`, `waiting_*` and `recurred` instances can be cancelled; an instance that is running its compensations cannot (the request is refused and the compensations run to the end)
+- An event for a channel sealed for `channel_pub` must carry the token in the `capabilitytoken` extension attribute (binary mode: `ce-capabilitytoken` header). Otherwise the endpoint answers 403 `{"error", "error_type": "Forbidden", "retryable": false}` and nothing is published. The attribute is not stored
 - Automatic CloudEvents validation and parsing
 - Works with CloudEvents-compatible systems (Knative Eventing, CloudEvents SDKs, etc.)
 
@@ -679,10 +688,9 @@ async def job_worker(ctx: WorkflowContext, worker_id: str):
     # Subscribe with competing mode - each job goes to ONE worker only
     await subscribe(ctx, channel="jobs", mode="competing")
 
-    while True:
-        job = await receive(ctx, channel="jobs")  # Get next job
-        await process_job(ctx, job.data)
-        await ctx.recur(worker_id)  # Continue processing
+    job = await receive(ctx, channel="jobs")  # Get next job
+    await process_job(ctx, job.data)
+    await ctx.recur(worker_id=worker_id)  # Continue with fresh history
 
 # Notification Handler - receives ALL messages (broadcast mode)
 @workflow
@@ -690,10 +698,9 @@ async def notification_handler(ctx: WorkflowContext, handler_id: str):
     # Subscribe with broadcast mode - ALL handlers receive each message
     await subscribe(ctx, channel="notifications", mode="broadcast")
 
-    while True:
-        msg = await receive(ctx, channel="notifications")
-        await send_notification(ctx, msg.data)
-        await ctx.recur(handler_id)
+    msg = await receive(ctx, channel="notifications")
+    await send_notification(ctx, msg.data)
+    await ctx.recur(handler_id=handler_id)
 
 # Publish to channel (all subscribers or one competing subscriber)
 await publish(ctx, channel="jobs", data={"task": "send_report"})
@@ -709,9 +716,57 @@ await send_to(ctx, instance_id="workflow-123", channel="approval", data={"approv
 **Key features**:
 - **Channel-based messaging**: Messages are delivered to workflows waiting on specific channels
 - **Competing vs Broadcast**: Choose semantics per subscription
-- **Direct messaging**: `send_to()` for workflow-to-workflow communication
+- **Direct messaging**: `send_to(ctx, instance_id, data, channel=...)` delivers to `"{channel}:{instance_id}"`; the receiver subscribes with `mode="direct"`
+- **Payloads**: `receive()` returns the published value as it was sent: any JSON value (dict, list, str, int, float, bool, None) or `bytes`. `publish()` and `send_to()` take `data: Any`
+- **Workflow code only**: `receive()` called inside an activity raises `TerminalError`. `publish()` and `send_to()` inside an activity join the activity's transaction and deliver after commit
 - **Database-backed**: All messages are persisted for durability
 - **Lock-first delivery**: Safe for multi-worker environments
+- **Replay-safe**: Called from workflow code, `publish()` and `send_to()` are recorded steps; a replay does not publish again
+- **Sealed channels**: Once a `channel_pub` or `channel_sub` capability is issued for a channel, publishing or receiving on it (including its direct channels) requires a token, passed as `capability_token=`
+- **Seals outlast expiry**: an expired grant keeps its channel sealed; only revoking the last grant re-opens it. `revoke_capability` works only for the instance that issued the capability and `unregister_name` only for the instance that holds the name (`NotOwnerError` otherwise; an unknown ID or an unbound name is a no-op). A sweep never removes the newest grant of a channel
+- **Capability key**: `EddaApp(capability_key=...)` (or `DURAX_CAPABILITY_KEY`) derives every new secret as the HMAC-SHA256 of the capability ID, and history then records no token. Without a key the token is stored in history. Keep the key the same on all workers while the issuing instances are alive
+- **CloudEvents ingress**: an event for a channel sealed for `channel_pub` needs a valid token in the `capabilitytoken` extension (`ce-capabilitytoken` header in binary mode), or the endpoint answers 403
+- **Direct channels are private**: only the receiving instance can `subscribe`, `receive` or read (`read_channel_since`, `read_channel_after`) its `"{channel}:{instance_id}"`. For another existing instance these raise `ChannelPermissionError` whatever the seal state; `send_to()` and targeted CloudEvents to it stay allowed
+
+### Actor Primitives
+
+Workflows double as actors of a kernel shared with Romancy and Shikibu (same schema, same semantics). The primitives live in their own modules:
+
+- **`edda.actors`**: `register_name`, `unregister_name`, `whereis`, `monitor`, `unmonitor`, `issue_capability` (`expires_at=` issues an expiring capability), `check_capability`, `revoke_capability`
+- **`edda.tasks`**: `post_task`, `claim_task`, `complete_task`, `fail_task`, `list_tasks`, `wait_task`, `wait_any_task`, `read_channel_since` (raises `CursorNotFoundError` when the cursor message is not on the channel), `read_channel_after` (numeric `id` cursor, `0` = from the start; keeps working after the cursor message is deleted). Returned messages carry `id` and `message_id`
+- **`edda.fs`** (inside activities only): `fs_read`, `fs_write`, `fs_list`, `fs_delete`
+- **`edda.blobs`**: `store_payload`, `load_payload`, `stat_payload`
+- **`edda.supervisor`**: `define_supervisor`, `ChildSpec`, `Strategy`, `RestartMode`
+
+```python
+from edda import workflow, subscribe, receive, WorkflowContext
+from edda.actors import whereis, monitor
+from edda.supervisor import ChildSpec, RestartMode, Strategy, define_supervisor
+
+@workflow
+async def watcher(ctx: WorkflowContext) -> str:
+    target = await whereis(ctx, "ingest")
+    if target is None:
+        return "not running"
+    # The DOWN message arrives on this instance's direct channel
+    await subscribe(ctx, channel="down", mode="direct")
+    await monitor(ctx, target, "down")
+    msg = await receive(ctx, channel="down")
+    return msg.data["status"]  # "completed", "failed" or "cancelled" (a recurring instance stays alive: no DOWN)
+
+sup = define_supervisor(
+    "pipeline-sup",
+    strategy=Strategy.ONE_FOR_ONE,
+    max_restarts=5,
+    within_seconds=60,
+    children=[ChildSpec(name="ingest", workflow="ingest", restart=RestartMode.PERMANENT)],
+)
+# instance_id = await sup.start()
+```
+
+Called from workflow code, every primitive is a recorded step: a replay returns the recorded outcome, exceptions included, instead of running it again. A primitive with a side effect first proves that the run still holds the instance lock, so a run that lost its lease changes nothing (`LockLostError`). Only kernel errors that carry a code are recorded (`task_conflict`, `task_not_found`, `actor_name_taken`, `fs_conflict`, `sandboxed`, `channel_forbidden`, `not_owner`, `cursor_not_found`, `invalid_argument`).
+
+Any other failure aborts the run: a database error inside a primitive or around an activity attempt (raised as `RunAbortedError`), a lost lock (`LockLostError`), or a shutdown. An aborted run is not failed and nothing is compensated; the instance stays `running` and a later run replays it. `RunAbortedError` derives from `BaseException`, so `except Exception:` does not swallow it. Do not catch either error. Task handlers and supervised children are at-least-once and must be idempotent.
 
 ### Sandboxed Actors
 
@@ -724,14 +779,14 @@ child_id = await untrusted_workflow.start(sandboxed=True, input=value)
 Sandboxing enforces three rules:
 
 - A sandboxed workflow cannot mint new capabilities with `issue_capability`.
-- Children started by a sandboxed workflow inherit the sandbox flag, as do `recur()` continuations.
+- Children started by a sandboxed workflow inherit the sandbox flag. A `recur()` continues the same instance and keeps its flag.
 - Only an unsandboxed parent (or an external caller) may use `sandboxed=True` for a child.
 
-Delegation itself uses the existing capability tokens: pass tokens the child needs in its input. Phase B enforcement is application-layer enforcement inside edda. Code running in the worker process can still bypass it by using storage directly; database-enforced isolation such as PostgreSQL row-level security is Phase C scope.
+Delegation itself uses the existing capability tokens: pass tokens the child needs in its input. Edda itself enforces these rules. Code in the worker process that uses the storage directly can bypass them, and database-level isolation (for example PostgreSQL row-level security) is not provided.
 
 ### Workflow Recurrence
 
-Long-running workflows can use `ctx.recur()` to restart with fresh history while maintaining the same instance ID. This is essential for workflows that run indefinitely (job workers, notification handlers, etc.):
+Long-running workflows can use `ctx.recur()` to continue with fresh history. This is essential for workflows that run indefinitely (job workers, notification handlers, etc.):
 
 ```python
 from edda import workflow, subscribe, receive, WorkflowContext
@@ -744,16 +799,17 @@ async def job_worker(ctx: WorkflowContext, worker_id: str):
     job = await receive(ctx, channel="jobs")
     await process_job(ctx, job.data)
 
-    # Archive history and restart with same instance_id
-    # Prevents unbounded history growth
-    await ctx.recur(worker_id)
+    # Archive history and continue on the same instance id
+    # (keyword arguments become the next iteration's input)
+    await ctx.recur(worker_id=worker_id)
 ```
 
-**Key benefits**:
-- **Prevents history growth**: Archives old history, starts fresh
-- **Maintains instance ID**: Same workflow continues logically
-- **Preserves subscriptions**: Channel subscriptions survive recurrence
-- **Enables infinite loops**: Essential for long-running workers
+**How it works**:
+- **Prevents history growth**: The current history is archived to `workflow_history_archive`, and the next iteration starts fresh
+- **Same instance id**: `recur()` archives the history, clears the instance's subscriptions, timers, group memberships and registered compensations, stores the new input and continues on the same instance id. Between iterations the status is `recurred`, which counts as alive: no DOWN message is sent and registered names stay bound. There is no `continued_from` chain
+- **Subscribe again**: Subscriptions are cleared, so subscribe again at the start of the workflow (as above). A broadcast channel you subscribe to again continues after the last message delivered to the instance; competing messages wait in the channel
+- **Identity survives**: Names, monitors, issued capabilities, tasks, the actor FS (`/actor/{id}/`) and the sandbox flag all stay with the instance. A supervisor keeps its id across recurs, so its children's ids stay stable too
+- **Compensations**: Each iteration is a finished unit; a failure in a later iteration does not undo an earlier one
 
 ### ASGI Integration
 
@@ -871,7 +927,7 @@ Each `@durable_tool` automatically generates **four MCP tools**:
 1. **Main tool** (`process_order`): Starts the workflow, returns instance ID
 2. **Status tool** (`process_order_status`): Checks workflow progress with completed activity count and suggested poll interval
 3. **Result tool** (`process_order_result`): Gets final result when completed
-4. **Cancel tool** (`process_order_cancel`): Cancels workflow if running or waiting, executes compensation handlers
+4. **Cancel tool** (`process_order_cancel`): Cancels workflow if running or waiting, executes compensation handlers (refused while the workflow is already running its compensations)
 
 This enables AI assistants to work with workflows that take minutes, hours, or even days to complete, with full control over the workflow lifecycle.
 

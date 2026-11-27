@@ -797,27 +797,31 @@ async def notification_service(ctx: WorkflowContext, processed_count: int = 0):
 
 ### How It Works
 
-When `ctx.recur()` is called:
+When `ctx.recur()` is called, in one transaction (after proving the run still holds the lock):
 
-1. **Current workflow completes** with status `"recurred"`
-2. **History is archived** (moved to archive table, not deleted)
-3. **New workflow instance starts** with provided arguments
-4. **Chain is tracked** via `continued_from` field
+1. **History is archived** (moved to the archive table, not deleted)
+2. **Subscriptions, timers, group memberships and registered compensations are cleared**
+3. **The new input is stored** (the keyword arguments you passed)
+4. **Status becomes `"recurred"`**, and the workflow continues from the start with empty history **on the same instance id**
+
+There is no new instance and no `continued_from` chain. Between iterations the instance is alive: no DOWN message is sent and its registered names stay bound. If the worker crashes after the commit, a sweep resumes the `recurred` instance, so nothing is lost.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Instance 1 (processed_count=0)                                      │
+│ Instance order-svc-1 (processed_count=0)                            │
 │ ├─ Activity 1...1000                                                │
-│ └─ Status: "recurred" → Archive history → Instance 2 starts         │
+│ └─ recur: archive history, status "recurred"                        │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Instance 2 (processed_count=1000, continued_from=Instance 1)        │
+│ Instance order-svc-1 (processed_count=1000)    same id              │
 │ ├─ Activity 1...1000                                                │
-│ └─ Status: "recurred" → Archive history → Instance 3 starts         │
+│ └─ recur: archive history, status "recurred"                        │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Instance 3 (processed_count=2000, continued_from=Instance 2)        │
+│ Instance order-svc-1 (processed_count=2000)    same id              │
 │ └─ ... continues ...                                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Everything bound to the instance id survives an iteration: names, monitors, issued capabilities, tasks, the actor FS (`/actor/{id}/`) and the sandbox flag. A supervisor keeps its id across recurs, and so do its children's ids. A child that recurs stays the same child and is not restarted while it is alive.
 
 ### API Reference
 
@@ -827,8 +831,8 @@ async def recur(self, **kwargs: Any) -> None:
     Restart the workflow with fresh history.
 
     Args:
-        **kwargs: Arguments to pass to the new workflow instance.
-                 These become the input parameters for the next iteration.
+        **kwargs: Arguments for the next iteration. They replace the
+                 instance's input; the instance id stays the same.
 
     Raises:
         RecurException: Always raised to signal the ReplayEngine.
@@ -874,8 +878,8 @@ async def event_processor(ctx: WorkflowContext, state: ServiceState):
 
 ### Important Notes
 
-1. **Channel subscriptions are NOT transferred** - You must re-subscribe to channels in the new workflow iteration
-2. **Compensations are cleared** - Registered compensations do not carry over
+1. **Channel subscriptions are cleared** - You must re-subscribe to channels in the next iteration. A broadcast channel you subscribe to again continues after the last message delivered to the instance, so messages published in between are not lost
+2. **Compensations are cleared** - Each iteration is a finished unit; a failure in a later iteration does not undo an earlier one
 3. **History is archived, not deleted** - Old history is preserved for auditing
 4. **Code after `recur()` is never executed** - Always place recur at the end of a branch
 

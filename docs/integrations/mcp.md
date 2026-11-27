@@ -171,7 +171,8 @@ Output: {
 
 The cancel tool:
 
-- Only works on workflows with status `running`, `waiting_for_event`, or `waiting_for_timer`
+- Only works on workflows with status `running`, `waiting_for_event`, `waiting_for_timer`, `waiting_for_message` or `recurred`
+- Refuses a workflow that is already running its compensations (`compensating`); they run to the end
 - Automatically executes SAGA compensation transactions to roll back side effects
 - Returns an error for already completed, failed, or cancelled workflows
 

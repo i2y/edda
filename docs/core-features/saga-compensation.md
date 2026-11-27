@@ -63,6 +63,14 @@ When a workflow fails (raises an exception), Edda automatically:
 3. Executes their compensation functions in reverse order
 4. Marks the workflow as failed with compensation completed
 
+### Cancellation
+
+`running`, `waiting_*` and `recurred` instances can be cancelled, and cancelling runs the compensations. An instance that is already running its compensations (`compensating`) cannot be cancelled: `engine.cancel_workflow()` returns `False` (`POST /cancel/{instance_id}` answers that the workflow cannot be cancelled) and the compensations run to the end.
+
+### Aborted Runs
+
+A run that loses its lock (`LockLostError`), is shut down, or hits a database error inside a kernel primitive (`RunAbortedError`) is aborted. This is not a workflow failure, so no compensation runs. The instance stays `running` and a later run replays it. `RunAbortedError` derives from `BaseException`; do not catch either error in a workflow.
+
 ### Execution Order
 
 Compensation functions always execute in **reverse order** of activity execution:

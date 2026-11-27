@@ -76,6 +76,8 @@ async def wait_event(
 - `timeout_seconds`: Optional timeout in seconds
 - `model`: Optional Pydantic model for automatic data validation
 
+Timers and timeouts never fire before their deadline. SQLite and MySQL store whole seconds, so a deadline with a fraction is rounded up to the next second.
+
 #### Returns
 
 `ReceivedEvent` object containing:
@@ -445,7 +447,7 @@ async def filtered_event_workflow(ctx: WorkflowContext, user_id: str):
 
 ### Cancellation
 
-Workflows waiting for events can be cancelled:
+Workflows waiting for events (`waiting_*`) can be cancelled. A workflow that is running its compensations cannot be cancelled; the compensations run to the end:
 
 ```python
 # Via API

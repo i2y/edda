@@ -192,7 +192,7 @@ Edda persists all activity results to the `workflow_history` table:
 **Event Types:**
 
 - **ActivityCompleted**: Successful activity execution
-- **ActivityFailed**: Activity raised an exception (includes error type and message)
+- **ActivityFailed**: Activity gave up (a `TerminalError` or exhausted retries), also when it is transactional (includes error type and message). A replay raises the recorded error and does not run the activity again
 - **EventReceived**: Event received via `wait_event()`
 - **TimerExpired**: Timer expired via `sleep()`
 
@@ -600,6 +600,18 @@ All history recording is transactional:
 - No orphaned history records
 - Deterministic replay guaranteed
 
+### Kernel Primitives Are Recorded Steps
+
+Called from workflow code, the actor primitives (names, monitors, capabilities, tasks, channel reads, `publish()` and `send_to()`) run once and record their outcome in history. A replay returns the record. A primitive with a side effect first proves that the run still holds the lock, applies the effect and records the outcome in one transaction, so a run that lost its lease applies nothing. Inside an activity a primitive runs directly: the activity is the recorded unit.
+
+Only kernel errors that carry a code are recorded as step results: `task_conflict`, `task_not_found`, `actor_name_taken`, `fs_conflict`, `sandboxed`, `channel_forbidden`, `not_owner`, `cursor_not_found` and `invalid_argument`. A replay raises the matching exception again.
+
+### Aborted Runs
+
+Any other error, such as a database error inside a primitive, is not a workflow outcome: the run is aborted with `RunAbortedError`, and every later primitive and activity in that run raises the same error. A lost lock (`LockLostError`) and a worker shutdown end the run the same way. An aborted run is not failed and nothing is compensated: the engine releases the lock, the instance stays `running`, and a later run replays it.
+
+`RunAbortedError` derives from `BaseException`, so a broad `except Exception:` does not swallow it. Do not catch it, or `LockLostError`, in workflow code.
+
 ### Compensating Workflow Recovery
 
 Special handling for workflows that crash during compensation:
@@ -608,6 +620,7 @@ Special handling for workflows that crash during compensation:
 - Only incomplete compensations are re-executed
 - Workflow function is NOT re-executed
 - Ensures compensation transactions complete even after multiple crashes
+- An instance in this state cannot be cancelled; the compensations run to the end
 
 ## Summary
 

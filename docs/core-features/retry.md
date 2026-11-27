@@ -72,6 +72,9 @@ while True:
 - ✅ Failed attempts don't leave partial state in database
 - ✅ Each retry is a fresh attempt with clean transaction
 - ✅ Automatic rollback on failure
+- ✅ A failed attempt's writes, outbox events and post-commit callbacks are discarded before the next attempt starts
+
+On SQLite, an activity that hits a write conflict (`SQLITE_BUSY`) is rolled back and restarted in a new transaction. This restart does not count as a retry attempt (at most 10 restarts).
 
 ## Default Retry Policy
 
@@ -323,6 +326,10 @@ async def order_workflow(ctx: WorkflowContext, order_id: str):
 ## RetryExhaustedError
 
 When all retry attempts fail, `RetryExhaustedError` is raised.
+
+### Recorded Failures
+
+An activity that gives up, either with a `TerminalError` or because its retries are exhausted, is recorded in history as `ActivityFailed`. This is also true for a transactional activity: the failed attempt is rolled back first, then the failure is recorded in its own write. A replay raises the recorded error to the workflow and does not run the activity again.
 
 ### Exception Chaining
 

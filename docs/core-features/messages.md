@@ -30,7 +30,7 @@ async def job_worker(ctx: WorkflowContext, worker_id: str):
     while True:
         job = await receive(ctx, "jobs")
         await execute_job(ctx, job.data, activity_id=f"job:{job.id}")
-        await ctx.recur()
+        await ctx.recur(worker_id=worker_id)
 
 @workflow
 async def notification_service(ctx: WorkflowContext, service_id: str):
@@ -40,7 +40,7 @@ async def notification_service(ctx: WorkflowContext, service_id: str):
     while True:
         msg = await receive(ctx, "notifications")
         await send_notification(ctx, msg.data, activity_id=f"notify:{msg.id}")
-        await ctx.recur()
+        await ctx.recur(service_id=service_id)
 ```
 
 **Modes**:
@@ -120,7 +120,7 @@ async def consumer(ctx: WorkflowContext, id: str):
     while True:
         msg = await receive(ctx, "tasks")
         await process(ctx, msg.data, activity_id=f"process:{msg.id}")
-        await ctx.recur()
+        await ctx.recur(id=id)
 ```
 
 **With timeout**:
@@ -177,35 +177,44 @@ message_id = await publish(
 
 #### `send_to()`
 
-Send a message directly to a specific workflow instance:
+Send a message directly to a specific workflow instance. `send_to(ctx, instance_id, data, channel=...)` delivers to the channel `"{channel}:{instance_id}"`. The receiver subscribes with `mode="direct"` and receives on the plain channel name:
 
 ```python
-from edda import send_to, receive, WorkflowContext
+from edda import send_to, subscribe, receive, WorkflowContext
 
 @workflow
-async def approver(ctx: WorkflowContext, request_id: str):
-    decision = await review(ctx, request_id, activity_id="review:1")
+async def approver(ctx: WorkflowContext, requester_id: str):
+    await subscribe(ctx, "review", mode="direct")
+    request = await receive(ctx, "review")
+
+    decision = await review(ctx, request.data["request_id"], activity_id="review:1")
 
     # Send decision to requester
     await send_to(
         ctx,
-        instance_id=request_id,
+        instance_id=requester_id,
         data={"approved": decision},
+        channel="decision",
     )
 
 @workflow
 async def requester(ctx: WorkflowContext, approver_id: str):
+    await subscribe(ctx, "decision", mode="direct")
+
     # Send request
     await send_to(
         ctx,
         instance_id=approver_id,
-        data={"action": "review", "request_id": ctx.instance_id},
+        data={"request_id": ctx.instance_id},
+        channel="review",
     )
 
     # Wait for response
-    response = await receive(ctx, f"__direct__:{ctx.instance_id}")
+    response = await receive(ctx, "decision")
     return response.data
 ```
+
+A direct channel is private to its receiver. Only the instance whose ID is in the channel name can subscribe to it, receive from it or read it (`read_channel_since`, `read_channel_after`). Any other instance gets `ChannelPermissionError`, whatever the seal state. Sending to it with `send_to()` (or a targeted CloudEvent) is allowed.
 
 ## Detailed API Reference
 
@@ -217,7 +226,7 @@ class ChannelMessage:
     """A message received from a channel."""
     id: str                           # Unique message ID
     channel: str                      # Channel name
-    data: dict[str, Any] | bytes      # Message payload
+    data: Any                         # Message payload as published: any JSON value, or bytes
     metadata: dict[str, Any]          # Optional metadata
     published_at: datetime            # When the message was published
 ```
@@ -256,7 +265,9 @@ async def receive(
 - `timeout_seconds`: Optional timeout in seconds
 - `message_id`: Optional custom ID for deterministic replay
 
-**Returns**: `ChannelMessage` object
+**Returns**: `ChannelMessage` object. `data` is the published value as it was sent: any JSON value (dict, list, str, int, float, bool, `None`) or `bytes`.
+
+`receive()` belongs in workflow code. Called inside an activity it raises `TerminalError`.
 
 ### publish()
 
@@ -264,7 +275,7 @@ async def receive(
 async def publish(
     ctx_or_storage: WorkflowContext | StorageProtocol,
     channel: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     metadata: dict[str, Any] | None = None,
     *,
     target_instance_id: str | None = None,
@@ -275,7 +286,7 @@ async def publish(
 
 - `ctx_or_storage`: Workflow context or storage backend
 - `channel`: Channel name to publish to
-- `data`: Message payload
+- `data`: Message payload (any JSON value or `bytes`)
 - `metadata`: Optional metadata
 - `target_instance_id`: If provided, only deliver to this specific instance (Point-to-Point delivery)
 
@@ -287,7 +298,7 @@ async def publish(
 async def send_to(
     ctx: WorkflowContext,
     instance_id: str,
-    data: dict[str, Any] | bytes,
+    data: Any,
     channel: str = "__direct__",
     metadata: dict[str, Any] | None = None,
 ) -> bool:
@@ -318,18 +329,15 @@ async def requester_workflow(ctx: WorkflowContext, responder_id: str):
         channel="request",
     )
 
-    # Wait for response
-    response = await receive(
-        ctx,
-        channel=f"response:{ctx.instance_id}",
-        timeout_seconds=60,
-    )
+    # Wait for response (direct channel: only this instance can receive it)
+    await subscribe(ctx, "response", mode="direct")
+    response = await receive(ctx, channel="response", timeout_seconds=60)
 
     return response.data
 
 @workflow
 async def responder_workflow(ctx: WorkflowContext):
-    await subscribe(ctx, "request", mode="competing")
+    await subscribe(ctx, "request", mode="direct")
 
     # Wait for requests
     request = await receive(ctx, "request")
@@ -341,7 +349,7 @@ async def responder_workflow(ctx: WorkflowContext):
         ctx,
         instance_id=request.data["request_id"],
         data={"result": result},
-        channel=f"response:{request.data['request_id']}",
+        channel="response",
     )
 ```
 
@@ -356,15 +364,15 @@ async def coordinator_workflow(ctx: WorkflowContext, tasks: list[dict]):
         worker_id = await worker_workflow.start(task={**task, "coordinator_id": ctx.instance_id})
         worker_ids.append(worker_id)
 
-    # Subscribe to results channel
-    await subscribe(ctx, f"result:{ctx.instance_id}", mode="broadcast")
+    # Subscribe to this instance's direct "result" channel
+    await subscribe(ctx, "result", mode="direct")
 
     # Wait for all results
     results = []
     for worker_id in worker_ids:
         msg = await receive(
             ctx,
-            channel=f"result:{ctx.instance_id}",
+            channel="result",
             message_id=f"result:{worker_id}",
         )
         results.append(msg.data)
@@ -383,7 +391,7 @@ async def worker_workflow(ctx: WorkflowContext, task: dict):
         ctx,
         instance_id=coordinator_id,
         data=result,
-        channel=f"result:{coordinator_id}",
+        channel="result",
     )
 ```
 
@@ -404,7 +412,7 @@ async def job_consumer(ctx: WorkflowContext, worker_id: str):
     while True:
         job = await receive(ctx, "jobs")
         await execute_job(ctx, job.data, activity_id=f"job:{job.id}")
-        await ctx.recur()
+        await ctx.recur(worker_id=worker_id)
 ```
 
 ### Broadcast (Pub/Sub) Pattern
@@ -428,7 +436,7 @@ async def event_subscriber(ctx: WorkflowContext, subscriber_id: str):
     while True:
         msg = await receive(ctx, "events.order_created")
         await handle_order_event(ctx, msg.data, activity_id=f"handle:{msg.id}")
-        await ctx.recur()
+        await ctx.recur(subscriber_id=subscriber_id)
 ```
 
 ## Comparison with CloudEvents
@@ -532,7 +540,7 @@ async def temporary_subscriber(ctx: WorkflowContext):
 
 ## Transactional Message Processing
 
-When using channel-based messaging inside activities, both `publish()` and `receive()` participate in the activity's database transaction.
+Called inside an activity, `publish()` and `send_to()` participate in the activity's database transaction. `receive()` belongs in workflow code (see below).
 
 ### Transactional Publish
 
@@ -557,54 +565,73 @@ async def process_order(ctx: WorkflowContext, order_id: str):
 
 This ensures that messages are only sent when the associated business logic succeeds.
 
-### Transactional Receive
+### Receiving and Processing
 
-When `receive()` is called inside an activity, the message claim is part of the transaction:
-
-```python
-@activity  # transactional=True by default
-async def process_job(ctx: WorkflowContext, channel: str):
-    msg = await receive(ctx, channel)  # Claim is part of transaction
-
-    # Process the message...
-    result = await do_work(msg.data)
-
-    return result  # Commit: claim is finalized
-```
-
-**Behavior:**
-
-- If the activity **succeeds**: Message claim is committed, message is processed
-- If the activity **fails**: Message claim is rolled back, message returns to queue
-
-This provides **at-least-once delivery** semantics - if processing fails, the message will be redelivered to another subscriber.
-
-### Recommended Pattern
-
-For reliable message processing, wrap `receive()` calls inside activities:
+Call `receive()` from workflow code, then process the message in an activity:
 
 ```python
 @workflow
 async def job_worker(ctx: WorkflowContext, worker_id: str):
     await subscribe(ctx, "jobs", mode="competing")
 
-    while True:
-        # Process job inside activity for transactional guarantees
-        await process_job(ctx, "jobs", activity_id="process:1")
-        await ctx.recur(worker_id)
+    # Waits durably (no worker is held); the message is recorded in history
+    msg = await receive(ctx, "jobs")
+    await process_job(ctx, msg.data, activity_id=f"process:{msg.id}")
+    await ctx.recur(worker_id=worker_id)
 
 @activity
-async def process_job(ctx: WorkflowContext, channel: str):
-    msg = await receive(ctx, channel)  # Part of activity transaction
+async def process_job(ctx: WorkflowContext, job: dict):
+    await execute_task(job)
 
-    # Do work...
-    await execute_task(msg.data)
+    # Publish completion notification (published after the activity commits)
+    await publish(ctx, "job.completed", {"job_id": job["id"]})
 
-    # Publish completion notification (also transactional)
-    await publish(ctx, "job.completed", {"job_id": msg.id})
-
-    return {"processed": msg.id}
+    return {"processed": True}
 ```
+
+**Behavior:**
+
+- On a competing channel, the claim, the history record and the removal of the message commit in one transaction, so at most one subscriber consumes each message.
+- Once received, the message is part of the workflow's history. After a crash the workflow replays with the same message, and the activity runs again under its retry policy. If processing finally fails, the message does not go back to the queue; handle that in the workflow, for example by publishing it to a dead-letter channel.
+- Do not call `receive()` inside an activity. An activity cannot suspend the workflow, so `receive()` there raises `TerminalError` (no retry). Receive in the workflow and pass the message to the activity.
+
+## Replay Safety and Sealed Channels
+
+Called from workflow code, `publish()` and `send_to()` are recorded steps. They run once, and a replay returns the recorded result instead of publishing again. A run that lost its lock to another worker publishes nothing (`LockLostError`). Inside an activity they run directly, and the activity is what is recorded.
+
+A channel is open until a `channel_pub` or `channel_sub` capability is issued for it. From then on, publishing (or receiving) needs a valid token, passed as `capability_token=`:
+
+```python
+from edda.actors import issue_capability
+
+token, capability_id = await issue_capability(ctx, "channel_pub", "orders")
+await publish(ctx, "orders", {"order_id": "A-1"}, capability_token=token)
+```
+
+The seal also covers the direct channels under that name (`orders:<instance_id>`), so `send_to(..., channel="orders")` needs the token too. A refused publish raises `ChannelPermissionError`; the refusal is recorded, so a replay takes the same branch.
+
+### Capability Rules
+
+- **Expiry does not unseal.** A channel stays sealed while any grant for it exists, expired or not. An expired token is rejected. The expiry sweep deletes an expired grant only while another grant for the same kind and target remains that is unexpired or newer, so the newest grant of a channel is never removed. Only revoking the last grant re-opens the channel.
+- **Expiring capabilities.** `issue_capability(ctx, kind, target, expires_at=...)` issues a capability that expires at the given time.
+- **Ownership.** `revoke_capability(ctx, capability_id)` works only for the instance that issued the capability, and `unregister_name(ctx, name)` only for the instance that holds the name. Any other instance gets `NotOwnerError` (recorded like other step errors). An unknown ID or an unbound name is a no-op.
+- **Capability key.** With `EddaApp(capability_key=...)` (or the `DURAX_CAPABILITY_KEY` environment variable), every new secret is `HMAC-SHA256(key, capability_id)` and the history records only the ID, kind and target, so no token is ever written to history. Without a key the token is stored in history in plain text. Use the same key on every worker, and do not change it while instances that issued capabilities are alive.
+- **CloudEvents.** An event posted to a channel sealed for `channel_pub` needs the token in the `capabilitytoken` extension attribute (see [CloudEvents HTTP Binding](events/cloudevents-http-binding.md)).
+
+### Cursor Reads
+
+`read_channel_since` and `read_channel_after` (both in `edda.tasks`) read a channel without consuming it. A sealed channel needs a `channel_sub` token, as for `receive()`.
+
+```python
+from edda.tasks import read_channel_since, read_channel_after
+
+messages = await read_channel_after(ctx, "orders", 0)           # from the start
+last = messages[-1]
+newer = await read_channel_after(ctx, "orders", last["id"])     # keeps working if `last` is deleted
+since = await read_channel_since(ctx, "orders", last["message_id"])
+```
+
+`read_channel_since` raises `CursorNotFoundError` when no message with that `message_id` is on the channel any more (it no longer returns the whole channel). `read_channel_after` takes the numeric `id` of the last message you read (`0` reads from the start) and does not depend on that message still existing. Returned messages carry both `id` and `message_id`.
 
 ## Performance Considerations
 

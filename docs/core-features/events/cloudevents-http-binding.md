@@ -99,6 +99,38 @@ Content-Type: application/json
 
 - 🚫 **DO NOT retry** - Fix the event structure and resend
 
+### Client Error (403 Forbidden)
+
+An event posted to a channel that is sealed for `channel_pub` must carry a valid capability token in the `capabilitytoken` extension attribute. In binary mode the token goes in the `ce-capabilitytoken` header. The target channel is the event `type`, or `type:{instance_id}` for an event addressed to one instance (`eddainstanceid`).
+
+```bash
+curl -X POST http://localhost:8001/ \
+  -H "Content-Type: application/cloudevents+json" \
+  -d '{
+    "specversion": "1.0",
+    "type": "orders",
+    "source": "order-service",
+    "id": "event-124",
+    "capabilitytoken": "cap:channel_pub:orders:<secret>",
+    "data": {"order_id": "A-1"}
+  }'
+```
+
+Without a valid token Edda publishes nothing and answers:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{
+  "error": "...",
+  "error_type": "Forbidden",
+  "retryable": false
+}
+```
+
+The `capabilitytoken` attribute is not stored with the message. An expired token is rejected, and an expired grant still keeps the channel sealed. See [Replay Safety and Sealed Channels](../messages.md#replay-safety-and-sealed-channels).
+
 ### Server Error (500 Internal Server Error)
 
 When an internal error occurs (**retryable**):
@@ -142,7 +174,7 @@ All error responses include structured information to help clients decide whethe
 - **`error`** (string): Human-readable error message
 - **`error_type`** (string): Python exception class name for debugging
 - **`retryable`** (boolean): Whether the client should retry
-  - `false`: Client error (400) - Fix the request before retrying
+  - `false`: Client error (400, 403) - Fix the request before retrying
   - `true`: Server error (500) - Retry with exponential backoff
 
 ## Client Retry Logic

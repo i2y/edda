@@ -248,6 +248,8 @@ async def order_workflow(ctx: WorkflowContext, order_id: str):
 - Retry metadata (total_attempts, total_duration_ms)
 - All error messages from each attempt
 
+The failure is recorded in history. A replay raises the recorded error and does not run the activity again.
+
 ### Retry Metadata
 
 Retry information is automatically recorded in workflow history:
@@ -447,6 +449,7 @@ async def order_workflow(ctx: WorkflowContext, item1: str, item2: str):
 1. **Reverse Order**: Compensations run in **reverse order** of activity execution
 2. **Already-Executed Only**: Only activities that **completed successfully** are compensated
 3. **Automatic**: No manual trigger required - Edda handles it
+4. **Not Cancellable**: An instance that is running its compensations cannot be cancelled; they run to the end
 
 ### Example: Multi-Step Rollback
 
@@ -574,6 +577,7 @@ app = EddaApp(
 - ✅ **Exclusive Execution**: Only one worker can execute a workflow instance at a time
 - ✅ **Stale Lock Cleanup**: Automatic cleanup of locks from crashed workers (5-minute timeout)
 - ✅ **Automatic Resume**: Crashed workflows resume on any available worker
+- ✅ **Registered Workflows Only**: A worker claims only instances of the workflows it has registered
 
 ### How It Works
 
