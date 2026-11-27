@@ -6,14 +6,13 @@ authors = [
     { name = "Yasushi Itoh", email = "6240399+i2y@users.noreply.github.com" }
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 keywords = ["workflow", "orchestration", "cloudevents", "knative", "event-driven", "microservices", "distributed", "durable-execution"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -153,7 +152,7 @@ exclude_lines = [
 
 [tool.black]
 line-length = 100
-target-version = ["py311", "py312", "py313"]
+target-version = ["py312", "py313", "py314"]
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -171,7 +170,7 @@ extend-exclude = '''
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -189,6 +188,8 @@ ignore = [
     "E501",  # line too long, handled by black
     "B008",  # do not perform function calls in argument defaults
     "C901",  # too complex
+    "UP046", # PEP 695 type parameters (class C[T]): not adopted yet
+    "UP047", # PEP 695 type parameters (def f[T]): not adopted yet
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -196,7 +197,7 @@ ignore = [
 "tests/*" = ["ARG"]  # unused arguments in tests
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
