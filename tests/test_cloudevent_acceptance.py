@@ -196,3 +196,64 @@ async def test_first_run_leaves_a_claimed_instance_to_its_claimant(tmp_path):
         assert instance["locked_by"] == "poll#1"
     finally:
         await storage.close()
+
+
+async def post_request(
+    app: EddaApp, headers: list[tuple[bytes, bytes]], body: bytes
+) -> tuple[int, dict[str, Any]]:
+    """POST a request to the app; returns status and body."""
+    response: dict[str, Any] = {}
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            response["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            response["body"] = json.loads(message["body"])
+
+    scope = {"type": "http", "method": "POST", "path": "/", "query_string": b"", "headers": headers}
+    await app(scope, receive, send)
+    return response["status"], response["body"]
+
+
+REQUIRED = {"specversion": "1.0", "id": "e1", "source": "test", "type": "accepted_order"}
+
+
+@pytest.mark.parametrize("missing", list(REQUIRED))
+async def test_a_structured_event_without_a_required_attribute_is_refused(app, missing):
+    # The SDK would fill in a missing id, and a retried event would look new.
+    event = {name: value for name, value in REQUIRED.items() if name != missing}
+    event["data"] = {"order_id": "o-1"}
+    status, body = await post_request(
+        app, [(b"content-type", b"application/cloudevents+json")], json.dumps(event).encode()
+    )
+    assert status == 400
+    assert body["retryable"] is False
+    assert missing in body["error"]
+    assert await channel_messages(app, "accepted_order") == 0
+    assert await instances(app, "accepted_order") == 0
+
+
+@pytest.mark.parametrize("missing", list(REQUIRED))
+async def test_a_binary_event_without_a_required_attribute_is_refused(app, missing):
+    headers = [(b"content-type", b"application/json")] + [
+        (f"ce-{name}".encode(), value.encode())
+        for name, value in REQUIRED.items()
+        if name != missing
+    ]
+    status, body = await post_request(app, headers, b'{"order_id": "o-1"}')
+    assert status == 400
+    assert body["retryable"] is False
+    assert await channel_messages(app, "accepted_order") == 0
+
+
+async def test_a_binary_event_is_accepted(app):
+    headers = [(b"content-type", b"application/json")] + [
+        (f"ce-{name}".encode(), value.encode()) for name, value in REQUIRED.items()
+    ]
+    status, _ = await post_request(app, headers, b'{"order_id": "o-1"}')
+    assert status == 202
+    assert await channel_messages(app, "accepted_order") == 1
+    assert await instances(app, "accepted_order") == 1

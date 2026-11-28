@@ -57,6 +57,8 @@ async def order_workflow(ctx: WorkflowContext, order_id: str):
 3. Workflow starts with `data` as parameters
 4. Workflow instance ID is returned
 
+An event with the `eddainstanceid` extension attribute is for that instance only: it starts no workflow.
+
 **Security note:** Only use `event_handler=True` for workflows you want publicly accessible via CloudEvents.
 
 ## The `@activity` Decorator

@@ -24,7 +24,7 @@ curl -X POST http://localhost:8001/ \
   -d '{"amount": 99.99}'
 ```
 
-Both modes are fully supported by Edda's CloudEvents implementation.
+Both modes are fully supported by Edda's CloudEvents implementation. A request that carries the `ce-*` attribute headers is read in binary mode; the body of any other request is read as a structured event, whatever its `Content-Type`.
 
 ## HTTP Response Status Codes
 
@@ -34,7 +34,7 @@ Edda returns appropriate HTTP status codes according to the CloudEvents specific
 
 Edda answers 202 once the event is stored: it is published to its channel, and each workflow registered for its type with `@workflow(event_handler=True)` has a new instance. From then on the event is kept even if the process stops: a running worker resumes a first run or a delivery that did not finish. Handlers registered with `@app.on_event()` run after the response, and are not run again.
 
-The channel is the event's `type`. An event with the `eddainstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `wait_event` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](wait-event.md#sending-to-one-instance)).
+The channel is the event's `type`. An event with the `eddainstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `wait_event` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](wait-event.md#sending-to-one-instance)). Such an event starts no workflow and runs no `on_event` handler of its type.
 
 ```bash
 curl -X POST http://localhost:8001/ \
@@ -61,7 +61,7 @@ Content-Type: application/json
 **When returned:**
 
 - ✅ The event was parsed and stored
-- ✅ Its workflows and `on_event` handlers run, and the workflows waiting for it (`wait_event`) are woken, after the response
+- ✅ Its workflows and `on_event` handlers (none for an event with `eddainstanceid`) run, and the workflows waiting for it (`wait_event`) are woken, after the response
 - ✅ Final processing outcome is not yet known
 
 ### Client Error (400 Bad Request)
@@ -85,15 +85,15 @@ HTTP/1.1 400 Bad Request
 Content-Type: application/json
 
 {
-  "error": "Failed to find specversion in HTTP request",
-  "error_type": "GenericException",
+  "error": "Missing required attributes: specversion",
+  "error_type": "MissingRequiredFields",
   "retryable": false
 }
 ```
 
 **When returned:**
 
-- ❌ Missing required CloudEvents fields (`specversion`, `type`, `source`, `id`)
+- ❌ Missing or empty required CloudEvents attributes (`specversion`, `type`, `source`, `id`), in either content mode. Edda does not make up an `id` for an event without one: a retried event would get a new one, and the workflows could not tell it from a new event
 - ❌ Invalid JSON format
 - ❌ CloudEvents validation errors
 

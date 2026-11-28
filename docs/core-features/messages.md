@@ -82,7 +82,7 @@ await subscribe(ctx, "notifications", mode="direct")
 msg = await receive(ctx, "notifications")
 ```
 
-A direct channel is the instance's mailbox: it keeps what is sent to it. A subscription to it starts at the first message sent to the instance, so the messages sent before the instance subscribed are not lost.
+A direct channel is the instance's mailbox: it keeps what is sent to it. A subscription to it starts at the first message sent to the instance that the instance has not received, so the messages sent before the instance subscribed are not lost, and those it received are not delivered again.
 
 A broadcast subscription keeps its place after `unsubscribe()` and after `ctx.recur()`: subscribing to the channel again continues where the subscription stopped, so the messages published in between are received too.
 

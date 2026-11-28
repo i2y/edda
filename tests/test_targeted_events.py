@@ -347,3 +347,97 @@ async def test_a_direct_subscription_gets_earlier_targeted_events(app):
     await post_event(app, "targeted.direct", 3, target=instance_id)
     await post_event(app, "targeted.direct.gate", 0)
     assert await result_of(app, instance_id) == [3]
+
+
+@workflow(event_handler=True)
+async def targeted_handled_order(ctx: WorkflowContext, n: int = 0) -> int:
+    return n
+
+
+async def instances_of(app: EddaApp, workflow_name: str) -> int:
+    async with app.storage.engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM workflow_instances WHERE workflow_name = :name"),
+            {"name": workflow_name},
+        )
+        return int(result.scalar_one())
+
+
+async def test_a_targeted_event_starts_no_handler(app):
+    handled: list[str] = []
+
+    @app.on_event("targeted_handled_order")
+    async def on_order(event: Any) -> None:
+        handled.append(event["id"])
+
+    waiter = await targeted_wait_once.start(event_type="targeted_handled_order")
+    await post_event(app, "targeted_handled_order", 1, target=waiter)
+    assert await result_of(app, waiter) == [1]
+    # The event is for its target only: no workflow or handler of its type runs.
+    assert handled == []
+    assert await instances_of(app, "targeted_handled_order") == 0
+
+    await post_event(app, "targeted_handled_order", 2)
+    assert handled == ["targeted_handled_order-2"]
+    assert await instances_of(app, "targeted_handled_order") == 1
+
+
+async def receive_as_before_the_durable_cursors(
+    storage: Any, instance_id: str, channel: str, message: dict[str, Any]
+) -> None:
+    """Deliver message as versions before the durable cursors did: record it
+    in the history and move the subscription's cursor, and nothing else."""
+    await storage.append_history(
+        instance_id,
+        f"receive_{channel}:1",
+        "ChannelMessageReceived",
+        {
+            "id": message["message_id"],
+            "channel": channel,
+            "data": message["data"],
+            "data_type": "json",
+            "metadata": {},
+            "published_at": "2026-11-01T00:00:00+00:00",
+        },
+    )
+    async with storage.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE channel_subscriptions SET cursor_message_id = :m "
+                "WHERE instance_id = :i AND channel = :c"
+            ),
+            {"m": message["id"], "i": instance_id, "c": channel},
+        )
+        await conn.execute(
+            text("DELETE FROM channel_delivery_cursors WHERE instance_id = :i"),
+            {"i": instance_id},
+        )
+
+
+@pytest.mark.parametrize("ended_by", ["recur", "unsubscribe"])
+async def test_a_mailbox_position_kept_only_in_the_subscription_survives(
+    sqlite_storage, create_test_instance, ended_by
+):
+    # An instance that an earlier version ran kept its mailbox position only
+    # in the subscription. Once a recur (which archives the history) or an
+    # unsubscribe deletes it, the next subscription starts after the messages
+    # that the history records as received.
+    instance_id = await create_test_instance(f"mailbox-{ended_by}", "wf", {})
+    mailbox = f"orders:{instance_id}"
+    await sqlite_storage.subscribe_to_channel(instance_id, mailbox, "broadcast")
+    for n in (1, 2):
+        await sqlite_storage.publish_to_channel(mailbox, {"n": n}, {})
+    first, _ = await sqlite_storage.get_pending_channel_messages(instance_id, mailbox)
+    await receive_as_before_the_durable_cursors(sqlite_storage, instance_id, mailbox, first)
+
+    if ended_by == "recur":
+        lock_id = f"mailbox-{ended_by}#1"
+        assert await sqlite_storage.try_acquire_lock(instance_id, lock_id)
+        await sqlite_storage.reset_instance_for_recur(instance_id, {}, lock_id)
+        await sqlite_storage.release_lock(instance_id, lock_id)
+    else:
+        await sqlite_storage.unsubscribe_from_channel(instance_id, mailbox)
+    await sqlite_storage.publish_to_channel(mailbox, {"n": 3}, {})
+
+    await sqlite_storage.subscribe_to_channel(instance_id, mailbox, "broadcast")
+    assert await pending_data(sqlite_storage, instance_id, mailbox) == [{"n": 2}, {"n": 3}]

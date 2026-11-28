@@ -572,6 +572,19 @@ def _is_own_direct_channel(instance_id: str, channel: str) -> bool:
     )
 
 
+def _received_message_id(event_data: str | None) -> str | None:
+    """The message ID that a ChannelMessageReceived history entry records,
+    or None for an entry without one (a binary payload stored before 0.17)."""
+    if not event_data:
+        return None
+    try:
+        entry = json.loads(event_data)
+    except ValueError:
+        return None
+    message_id = entry.get("id") if isinstance(entry, dict) else None
+    return message_id if isinstance(message_id, str) else None
+
+
 class ChannelDeliveryCursor(Base):
     """Channel delivery cursors (broadcast mode: track who read what)."""
 
@@ -4121,14 +4134,14 @@ class SQLAlchemyStorage:
             # the subscriber only sees messages published after it subscribed,
             # except on its own direct channel: a direct channel is a mailbox
             # (SEMANTICS §3), and the messages sent to it before the
-            # subscription are delivered too.
+            # subscription are delivered too, but not those it received.
             cursor_message_id: int | None = None
             if mode == "broadcast":
                 durable = await self._durable_cursor(session, instance_id, channel)
                 if durable is not None:
                     start = durable
                 elif _is_own_direct_channel(instance_id, channel):
-                    start = 0
+                    start = await self._mailbox_start(session, instance_id, channel)
                 else:
                     max_result = await session.execute(
                         select(func.max(ChannelMessage.id)).where(ChannelMessage.channel == channel)
@@ -4676,6 +4689,38 @@ class SQLAlchemyStorage:
             )
             await self._save_durable_cursor(session, instance_id, channel, message_id)
             await self._commit_if_not_in_transaction(session)
+
+    async def _mailbox_start(self, session: AsyncSession, instance_id: str, channel: str) -> int:
+        """Where a subscription to instance_id's own direct channel starts when
+        it has no durable cursor: after the last of the channel's messages
+        that the instance's history, archived iterations included, records as
+        received; at the start of the channel when there is none. Earlier
+        versions kept the position only in the subscription, which a recur or
+        an unsubscribe deletes: without this, an instance that they ran would
+        receive those messages again when it subscribes again."""
+        on_channel = await session.execute(
+            select(ChannelMessage.message_id, ChannelMessage.id).where(
+                ChannelMessage.channel == channel
+            )
+        )
+        row_ids: dict[str, int] = dict(on_channel.tuples().all())
+        if not row_ids:
+            return 0
+        start = 0
+        for table in (WorkflowHistory, WorkflowHistoryArchive):
+            received = await session.execute(
+                select(table.event_data).where(
+                    and_(
+                        table.instance_id == instance_id,
+                        table.event_type == "ChannelMessageReceived",
+                    )
+                )
+            )
+            for (event_data,) in received:
+                message_id = _received_message_id(event_data)
+                if message_id in row_ids:
+                    start = max(start, row_ids[message_id])
+        return start
 
     async def _durable_cursor(
         self, session: AsyncSession, instance_id: str, channel: str

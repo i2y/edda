@@ -19,7 +19,9 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from cloudevents.exceptions import GenericException as CloudEventsException
+from cloudevents.exceptions import MissingRequiredFields
 from cloudevents.http import from_http
+from cloudevents.sdk.converters import is_binary
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -89,6 +91,39 @@ class _WorkflowEventHandler:
             **self._inputs(event)
         )
         return created
+
+
+# The attributes that every CloudEvent has (SEMANTICS §3c).
+_REQUIRED_CLOUDEVENT_ATTRIBUTES = ("specversion", "id", "source", "type")
+
+
+def _require_cloudevent_attributes(headers: dict[str, str], body: bytes) -> None:
+    """Refuse an incoming event that lacks a required attribute or leaves it
+    empty (SEMANTICS §3c). from_http would fill in a missing id itself, and a
+    retried event would then look like a new one.
+
+    A request with a ce-specversion header (and no CloudEvents Content-Type)
+    is in binary mode, its attributes in ce-* headers; any other request is
+    in structured mode, the body is the event.
+
+    Raises:
+        MissingRequiredFields: If the event lacks a required attribute
+    """
+    lowered = {name.lower(): value for name, value in headers.items()}
+    structured = lowered.get("content-type", "").startswith("application/cloudevents")
+    if is_binary(lowered) or ("ce-specversion" in lowered and not structured):
+        values = {name: lowered.get(f"ce-{name}") for name in _REQUIRED_CLOUDEVENT_ATTRIBUTES}
+    else:
+        try:
+            event = json.loads(body) if body else None
+        except ValueError:
+            return  # from_http refuses a body that is not an event
+        if not isinstance(event, dict):
+            return
+        values = {name: event.get(name) for name in _REQUIRED_CLOUDEVENT_ATTRIBUTES}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise MissingRequiredFields(f"Missing required attributes: {', '.join(missing)}")
 
 
 class EddaApp:
@@ -826,7 +861,8 @@ class EddaApp:
         self, event_type: str, proto_type: type[Any] | None = None
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """
-        Decorator to register an event handler.
+        Decorator to register an event handler. It runs for each event of its
+        type that is not targeted at one instance (``eddainstanceid``).
 
         Example:
             >>> @app.on_event("order.created")
@@ -861,11 +897,13 @@ class EddaApp:
         The event is stored before this returns (SEMANTICS §3c): it is published
         to its channel (its type, or ``{type}:{instance}`` for an event
         targeted at one instance with the ``eddainstanceid`` extension, so
-        that no other instance receives it), and each workflow registered for its type with
-        ``@workflow(event_handler=True)`` gets a new instance. The rest runs in
-        background tasks that shutdown() waits for: the first runs of those
-        instances, the handlers registered with on_event, and the delivery of
-        the event to the workflows waiting for it. A first run or a delivery
+        that no other instance receives it), and each workflow registered for
+        its type with ``@workflow(event_handler=True)`` gets a new instance.
+        The rest runs in background tasks that shutdown() waits for: the first
+        runs of those instances, the handlers registered with on_event, and
+        the delivery of the event to the workflows waiting for it. A targeted
+        event is for its target only: it starts no workflow and runs no
+        handler of its type. A first run or a delivery
         that a crash or a shutdown cuts short is not lost: a worker's poll
         resumes the instance, and the sweep that requeues waits with pending
         messages delivers the event. An on_event handler is not run again.
@@ -891,9 +929,11 @@ class EddaApp:
         await self._enforce_cloudevent_seal(event)
 
         # Store the event, and an instance of each workflow that handles it.
+        # A targeted event starts no workflow and runs no handler of its type.
         stored = await self._store_event_message(event)
+        handlers = [] if stored.target_instance_id else self.event_handlers.get(event_type, [])
         work: list[Callable[[], Coroutine[Any, Any, None]]] = []
-        for handler in self.event_handlers.get(event_type, []):
+        for handler in handlers:
             if isinstance(handler, _WorkflowEventHandler):
                 _instance_id, first_run = await handler.create(event)
                 work.append(functools.partial(self._run_first_run, first_run, event_type))
@@ -1788,6 +1828,7 @@ class EddaApp:
             headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope.get("headers", [])}
 
             # Create CloudEvent from HTTP request
+            _require_cloudevent_attributes(headers, body)
             event = from_http(headers, body)
 
             # Store the event; its handlers and deliveries run in background tasks
