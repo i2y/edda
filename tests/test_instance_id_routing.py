@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+from cloudevents.http import CloudEvent
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda import workflow
@@ -317,27 +318,21 @@ class TestInstanceIdRouting:
             input_data={"order_id": "ORDER-001"},
         )
 
-        # Create mock CloudEvent with all metadata
-        mock_event = MagicMock()
-        mock_event.__getitem__ = lambda self, key: {
-            "type": "payment.completed",
-            "source": "payment-gateway",
-            "id": "event-005",
-        }.get(key)
-        mock_event.get = lambda key, default=None: {
-            "time": "2025-01-01T12:00:00Z",
-            "datacontenttype": "application/json",
-            "subject": "order/ORDER-001",
-        }.get(key, default)
-        mock_event.get_data = lambda: {"amount": 100, "transaction_id": "TXN-005"}
-        mock_event.get_attributes = lambda: {
-            "type": "payment.completed",
-            "source": "payment-gateway",
-            "id": "event-005",
-            "specversion": "1.0",
-            "eddainstanceid": instance_id,
-            "customext": "custom-value",  # Custom extension
-        }
+        # A CloudEvent with all metadata, as the endpoint reads it
+        event = CloudEvent(
+            {
+                "type": "payment.completed",
+                "source": "payment-gateway",
+                "id": "event-005",
+                "specversion": "1.0",
+                "time": "2025-01-01T12:00:00Z",
+                "datacontenttype": "application/json",
+                "subject": "order/ORDER-001",
+                "eddainstanceid": instance_id,
+                "customext": "custom-value",  # Custom extension
+            },
+            {"amount": 100, "transaction_id": "TXN-005"},
+        )
 
         # Create EddaApp and call the delivery method directly
         app = EddaApp.__new__(EddaApp)
@@ -345,7 +340,7 @@ class TestInstanceIdRouting:
         app.worker_id = "test-worker"
 
         # Deliver event
-        await app._deliver_event_to_waiting_workflows(mock_event)
+        await app._deliver_event_to_waiting_workflows(event)
 
         # Verify message was delivered with metadata
         history = await sqlite_storage_routing.get_history(instance_id)

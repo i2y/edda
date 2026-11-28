@@ -82,12 +82,17 @@ Timers and timeouts never fire before their deadline. SQLite and MySQL store who
 
 `ReceivedEvent` object containing:
 
-- `data`: Event data (dict or Pydantic model if specified)
+- `data`: Event data: its JSON value (a dict, a list, a string, ...), or the Pydantic model if specified and the data is an object
 - `type`: CloudEvents type
 - `source`: Event source
 - `subject`: Optional event subject
-- `time`: Event timestamp
+- `time`: Event timestamp, if the event has one
 - `id`: Event ID
+- `specversion`: CloudEvents version
+- `datacontenttype`, `dataschema`: Optional media type and schema of the data
+- `extensions`: The extension attributes (for example `eddainstanceid`)
+
+The attributes are those of an event that the CloudEvents endpoint of Edda, Romancy or Shikibu stored (see [How the Event Is Stored](cloudevents-http-binding.md#how-the-event-is-stored)). A message that workflow code published on the channel has none: `data` is its data, `type` the type waited for and `id` the message's id.
 
 #### Example with Pydantic
 

@@ -96,32 +96,47 @@ class _WorkflowEventHandler:
 # The attributes that every CloudEvent has (SEMANTICS §3c).
 _REQUIRED_CLOUDEVENT_ATTRIBUTES = ("specversion", "id", "source", "type")
 
+# The context attributes that the CloudEvents spec defines, which a stored
+# event keeps under ce_{name} (SEMANTICS §3c); the others are its extensions.
+_CLOUDEVENT_CONTEXT_ATTRIBUTES = (
+    *_REQUIRED_CLOUDEVENT_ATTRIBUTES,
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "subject",
+)
 
-def _require_cloudevent_attributes(headers: dict[str, str], body: bytes) -> None:
-    """Refuse an incoming event that lacks a required attribute or leaves it
-    empty (SEMANTICS §3c). from_http would fill in a missing id itself, and a
-    retried event would then look like a new one.
+
+def _sent_cloudevent_attributes(headers: dict[str, str], body: bytes) -> dict[str, Any] | None:
+    """The attributes of an incoming event as the request carries them, or
+    None for a request that holds no event (from_http refuses it).
 
     A request with a ce-specversion header (and no CloudEvents Content-Type)
     is in binary mode, its attributes in ce-* headers; any other request is
     in structured mode, the body is the event.
-
-    Raises:
-        MissingRequiredFields: If the event lacks a required attribute
     """
     lowered = {name.lower(): value for name, value in headers.items()}
     structured = lowered.get("content-type", "").startswith("application/cloudevents")
     if is_binary(lowered) or ("ce-specversion" in lowered and not structured):
-        values = {name: lowered.get(f"ce-{name}") for name in _REQUIRED_CLOUDEVENT_ATTRIBUTES}
-    else:
-        try:
-            event = json.loads(body) if body else None
-        except ValueError:
-            return  # from_http refuses a body that is not an event
-        if not isinstance(event, dict):
-            return
-        values = {name: event.get(name) for name in _REQUIRED_CLOUDEVENT_ATTRIBUTES}
-    missing = [name for name, value in values.items() if not value]
+        return {name[3:]: value for name, value in lowered.items() if name.startswith("ce-")}
+    try:
+        event = json.loads(body) if body else None
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _require_cloudevent_attributes(attributes: dict[str, Any] | None) -> None:
+    """Refuse an incoming event that lacks a required attribute or leaves it
+    empty (SEMANTICS §3c). from_http would fill in a missing id itself, and a
+    retried event would then look like a new one.
+
+    Raises:
+        MissingRequiredFields: If the event lacks a required attribute
+    """
+    if attributes is None:
+        return
+    missing = [name for name in _REQUIRED_CLOUDEVENT_ATTRIBUTES if not attributes.get(name)]
     if missing:
         raise MissingRequiredFields(f"Missing required attributes: {', '.join(missing)}")
 
@@ -1062,34 +1077,24 @@ class EddaApp:
         event_type = event["type"]
         event_data = event.get_data()
 
-        # Extract CloudEvents metadata with ce_ prefix
-        # This allows ReceivedEvent to reconstruct CloudEvents attributes
+        # The event is stored as its data, with its attributes in the
+        # metadata under ce_ keys (SEMANTICS §3c), the form that the
+        # endpoints of Romancy and Shikibu store too: wait_event in every
+        # runtime reads them.
+        attributes = event.get_attributes()
         metadata: dict[str, Any] = {
-            "ce_type": event["type"],
-            "ce_source": event["source"],
-            "ce_id": event["id"],
-            "ce_time": event.get("time"),
-            "ce_datacontenttype": event.get("datacontenttype"),
-            "ce_subject": event.get("subject"),
+            f"ce_{name}": attributes[name]
+            for name in _CLOUDEVENT_CONTEXT_ATTRIBUTES
+            if attributes.get(name) is not None
         }
 
-        # Extract extension attributes (any attributes not in the standard set)
-        standard_attrs = {
-            "type",
-            "source",
-            "id",
-            "time",
-            "datacontenttype",
-            "subject",
-            "specversion",
-            "data",
-            "data_base64",
-        }
-        # The capability token was checked on arrival and must not be stored.
+        # Extension attributes: the others. The capability token was checked
+        # on arrival and must not be stored.
         extensions = {
             k: v
-            for k, v in event.get_attributes().items()
-            if k not in standard_attrs and k != "capabilitytoken"
+            for k, v in attributes.items()
+            if k not in _CLOUDEVENT_CONTEXT_ATTRIBUTES
+            and k not in ("data", "data_base64", "capabilitytoken")
         }
         if extensions:
             metadata["ce_extensions"] = extensions
@@ -1828,8 +1833,13 @@ class EddaApp:
             headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope.get("headers", [])}
 
             # Create CloudEvent from HTTP request
-            _require_cloudevent_attributes(headers, body)
+            sent = _sent_cloudevent_attributes(headers, body)
+            _require_cloudevent_attributes(sent)
             event = from_http(headers, body)
+            if sent is not None and "time" not in sent and "time" in event:
+                # from_http stamps an event without a time with the time it
+                # reads it. The stored event keeps the attributes sent.
+                del event["time"]
 
             # Store the event; its handlers and deliveries run in background tasks
             await self.handle_cloudevent(event)

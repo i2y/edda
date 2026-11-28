@@ -1116,14 +1116,17 @@ class ReceivedEvent:
     and CloudEvents metadata (type, source, id, time, etc.).
 
     Attributes:
-        data: The event payload (JSON dict or Pydantic model)
+        data: The event payload: its JSON value (a dict, or the Pydantic model
+            given), or {"_binary": bytes} for data that is not JSON
         type: CloudEvent type (e.g., "payment.completed")
         source: CloudEvent source (e.g., "payment-service")
         id: Unique event identifier
         time: Event timestamp (ISO 8601 format)
         datacontenttype: Content type of the data (typically "application/json")
-        subject: Subject of the event (optional CloudEvents extension)
+        subject: Subject of the event, if it has one
         extensions: Additional CloudEvents extension attributes
+        specversion: CloudEvents version of the event
+        dataschema: Schema of the data, if the event has one
 
     Example:
         >>> # Without Pydantic model
@@ -1156,6 +1159,11 @@ class ReceivedEvent:
     # CloudEvents extension attributes
     extensions: dict[str, Any] = field(default_factory=dict)
 
+    # More CloudEvents standard attributes (after extensions, which callers
+    # may pass by position)
+    specversion: str | None = None
+    dataschema: str | None = None
+
 
 class EventTimeoutError(Exception):
     """
@@ -1187,8 +1195,10 @@ def _convert_channel_message_to_received_event(
     """
     Convert a ChannelMessage to a ReceivedEvent.
 
-    CloudEvents metadata is extracted from the message's metadata field
-    where it was stored with 'ce_' prefix.
+    The endpoints of Edda, Romancy and Shikibu store an event as its data,
+    with its attributes in the metadata under ce_ keys (SEMANTICS §3c). A
+    message without them, such as one published from workflow code, gets the
+    waited type and its message id.
 
     Args:
         msg: ChannelMessage received from receive()
@@ -1203,12 +1213,14 @@ def _convert_channel_message_to_received_event(
     data: dict[str, Any] | Any
     if model is not None and isinstance(msg.data, dict):
         data = from_json_dict(msg.data, model)
-    elif isinstance(msg.data, dict):
-        data = msg.data
-    else:
+    elif isinstance(msg.data, (bytes, bytearray, memoryview)):
         # bytes data - wrap in dict for ReceivedEvent compatibility
         data = {"_binary": msg.data}
+    else:
+        # Any JSON value: an event's data need not be an object.
+        data = msg.data
 
+    extensions = msg.metadata.get("ce_extensions", {})
     return ReceivedEvent(
         data=data,
         type=event_type,
@@ -1217,7 +1229,10 @@ def _convert_channel_message_to_received_event(
         time=msg.metadata.get("ce_time"),
         datacontenttype=msg.metadata.get("ce_datacontenttype"),
         subject=msg.metadata.get("ce_subject"),
-        extensions=msg.metadata.get("ce_extensions", {}),
+        extensions=extensions,
+        specversion=msg.metadata.get("ce_specversion"),
+        # Earlier versions of Edda kept dataschema among the extensions.
+        dataschema=msg.metadata.get("ce_dataschema", extensions.get("dataschema")),
     )
 
 

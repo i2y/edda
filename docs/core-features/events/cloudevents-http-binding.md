@@ -26,6 +26,15 @@ curl -X POST http://localhost:8001/ \
 
 Both modes are fully supported by Edda's CloudEvents implementation. A request that carries the `ce-*` attribute headers is read in binary mode; the body of any other request is read as a structured event, whatever its `Content-Type`.
 
+### How the Event Is Stored
+
+Edda stores the event as one message on its channel, in the form that the endpoints of Romancy and Shikibu store too, so a workflow of any of them receives it:
+
+- The message's data is the event's data. A `receive()` of the channel returns it.
+- The message's metadata holds the event's attributes under `ce_` keys: `ce_specversion`, `ce_id`, `ce_source` and `ce_type`, and those of `ce_time`, `ce_datacontenttype`, `ce_dataschema` and `ce_subject` that the event has. `ce_extensions` holds the extension attributes, except `capabilitytoken`.
+
+`wait_event()` returns the data with these attributes. An event without a `time` is stored without one.
+
 ## HTTP Response Status Codes
 
 Edda returns appropriate HTTP status codes according to the CloudEvents specification:
