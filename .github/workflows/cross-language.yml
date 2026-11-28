@@ -1,0 +1,81 @@
+name: Cross-language
+
+# Channels and supervision between Edda, Romancy (Go) and Shikibu (Ruby), against
+# the main branch of the other two. The daily run catches a change there that
+# breaks these tests while nothing is pushed here.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  cross-language:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Siblings in the workspace: the tests look for ../romancy and ../shikibu
+      - name: Checkout edda
+        uses: actions/checkout@v6
+        with:
+          path: edda
+          submodules: true
+
+      - name: Checkout romancy
+        uses: actions/checkout@v6
+        with:
+          repository: i2y/romancy
+          path: romancy
+
+      - name: Checkout shikibu
+        uses: actions/checkout@v6
+        with:
+          repository: durax-io/shikibu
+          path: shikibu
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: romancy/go.mod
+          cache-dependency-path: romancy/go.sum
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: shikibu
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python (.python-version)
+        working-directory: edda
+        run: uv python install
+
+      - name: Install dependencies
+        working-directory: edda
+        run: uv sync --extra dev
+
+      - name: Run cross-language tests
+        working-directory: edda
+        run: >
+          uv run pytest tests/test_cross_language_channel.py tests/test_cross_language_supervisor.py
+          -v --tb=short --no-cov -rs --junitxml=cross-language.xml
+
+      # The tests skip themselves when Go, Bundler or a repository is missing
+      - name: Fail if any test was skipped
+        working-directory: edda
+        run: |
+          uv run python - <<'EOF'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("cross-language.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          assert skipped == 0, f"{skipped} cross-language tests were skipped"
+          EOF
