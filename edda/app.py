@@ -6,14 +6,16 @@ application for handling CloudEvents and executing workflows.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import math
 import os
 import random
 import time
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from cloudevents.exceptions import GenericException as CloudEventsException
@@ -22,7 +24,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from edda import workflow
-from edda.exceptions import ChannelPermissionError
+from edda.exceptions import AppNotRunningError, ChannelPermissionError
 from edda.hooks import WorkflowHooks
 from edda.locking import (
     auto_resume_stale_workflows_periodically,
@@ -35,6 +37,58 @@ from edda.retry import RetryPolicy
 from edda.storage.sqlalchemy_storage import SQLAlchemyStorage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _StoredEvent:
+    """The channel message of an accepted CloudEvent, for its delivery."""
+
+    channel: str
+    message_id: str
+    data: Any
+    metadata: dict[str, Any]
+    target_instance_id: str | None
+
+
+class _WorkflowEventHandler:
+    """
+    The CloudEvent handler of a workflow registered with
+    ``@workflow(event_handler=True)``.
+
+    It starts the workflow with the event data as keyword arguments, or without
+    arguments when the data is not a dict. The traceparent and tracestate
+    extension attributes (W3C Trace Context), if present, are added to the
+    arguments as ``_trace_context``.
+    """
+
+    def __init__(self, wf: Any) -> None:
+        self.workflow = wf
+
+    def _inputs(self, event: Any) -> dict[str, Any]:
+        data = event.get_data()
+        trace_context: dict[str, str] = {}
+        attrs = event.get_attributes()
+        if "traceparent" in attrs:
+            trace_context["traceparent"] = str(attrs["traceparent"])
+        if "tracestate" in attrs:
+            trace_context["tracestate"] = str(attrs["tracestate"])
+        if not isinstance(data, dict):
+            # Not a dict: no arguments (trace context cannot be injected)
+            return {}
+        if trace_context:
+            return {**data, "_trace_context": trace_context}
+        return data
+
+    async def __call__(self, event: Any) -> None:
+        """Start the workflow and run its first run."""
+        await self.workflow.start(**self._inputs(event))
+
+    async def create(self, event: Any) -> tuple[str, Callable[[], Awaitable[str]]]:
+        """Create the workflow's instance; returns its ID and its first run."""
+        created: tuple[str, Callable[[], Awaitable[str]]] = await self.workflow._create(
+            **self._inputs(event)
+        )
+        return created
 
 
 class EddaApp:
@@ -166,6 +220,13 @@ class EddaApp:
         # Background tasks
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._initialized = False
+
+        # Background work of accepted CloudEvents: deliveries, on_event
+        # handlers and the first runs of the workflows they start. shutdown()
+        # waits for it (the set also keeps the tasks referenced until done).
+        self._event_tasks: set[asyncio.Task[Any]] = set()
+        self._event_shutdown_grace = 30.0
+        self._shutting_down = False
 
         # Wake event for notify-triggered background tasks
         self._resume_wake_event: asyncio.Event | None = None
@@ -469,8 +530,16 @@ class EddaApp:
         """
         Shutdown the application and cleanup resources.
 
-        This should be called when the app is shutting down.
+        This should be called when the app is shutting down. Incoming events
+        are refused from the start (HTTP 503). The background work of the
+        events accepted before gets 30 seconds to finish, and what still runs
+        then is cancelled: an event that was not delivered stays pending on
+        its channel, and an instance whose first run did not finish is resumed
+        by a worker's poll.
         """
+        self._shutting_down = True
+        await self._drain_event_tasks()
+
         # Stop outbox relayer if enabled
         if self.outbox_relayer:
             await self.outbox_relayer.stop()
@@ -494,6 +563,28 @@ class EddaApp:
         await self.storage.close()
 
         self._initialized = False
+        self._shutting_down = False
+
+    async def _drain_event_tasks(self) -> None:
+        """Wait for the background work of accepted events, and cancel what
+        still runs after the grace period."""
+        tasks = {t for t in self._event_tasks if t is not asyncio.current_task()}
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=self._event_shutdown_grace)
+        if not pending:
+            return
+        logger.warning("Cancelling %d event tasks still running at shutdown", len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(pending, timeout=5.0)
+
+    def _track_event_task(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run work of an accepted event in a background task that shutdown()
+        waits for."""
+        task = asyncio.create_task(work)
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
 
     def _start_background_tasks(self) -> None:
         """Start background maintenance tasks.
@@ -717,45 +808,19 @@ class EddaApp:
         """
         Register a default CloudEvent handler for a workflow.
 
-        The default handler extracts the CloudEvent data and passes it
-        as kwargs to workflow.start(). If the CloudEvent contains
-        traceparent/tracestate extension attributes (for distributed tracing),
-        they are automatically injected into _trace_context.
+        The default handler passes the CloudEvent data as kwargs to the
+        workflow. If the CloudEvent contains traceparent/tracestate extension
+        attributes (for distributed tracing), they are automatically injected
+        into _trace_context. The instance is created before the event is
+        acknowledged; its first run continues in the background.
 
         Args:
             event_type: CloudEvent type (same as workflow name)
             wf: Workflow instance to start when event is received
         """
-
-        async def default_handler(event: Any) -> None:
-            """Default handler that starts workflow with CloudEvent data."""
-            # Extract data from CloudEvent
-            data = event.get_data()
-
-            # Extract trace context from CloudEvent extension attributes
-            # (W3C Trace Context: traceparent, tracestate)
-            trace_context: dict[str, str] = {}
-            attrs = event.get_attributes()
-            if "traceparent" in attrs:
-                trace_context["traceparent"] = str(attrs["traceparent"])
-            if "tracestate" in attrs:
-                trace_context["tracestate"] = str(attrs["tracestate"])
-
-            # Start workflow with data as kwargs
-            if isinstance(data, dict):
-                # Inject trace context if present
-                if trace_context:
-                    data = {**data, "_trace_context": trace_context}
-                await wf.start(**data)
-            else:
-                # If data is not a dict, start without arguments
-                # (trace context cannot be injected)
-                await wf.start()
-
-        # Register the handler
         if event_type not in self.event_handlers:
             self.event_handlers[event_type] = []
-        self.event_handlers[event_type].append(default_handler)
+        self.event_handlers[event_type].append(_WorkflowEventHandler(wf))
 
     def on_event(
         self, event_type: str, proto_type: type[Any] | None = None
@@ -793,37 +858,55 @@ class EddaApp:
         """
         Handle incoming CloudEvent.
 
-        This will route the event to registered handlers and deliver events
-        to waiting workflows.
+        The event is stored before this returns (SEMANTICS §3c): it is published
+        to its channel, and each workflow registered for its type with
+        ``@workflow(event_handler=True)`` gets a new instance. The rest runs in
+        background tasks that shutdown() waits for: the first runs of those
+        instances, the handlers registered with on_event, and the delivery of
+        the event to the workflows waiting for it. A first run or a delivery
+        that a crash or a shutdown cuts short is not lost: a worker's poll
+        resumes the instance, and the sweep that requeues waits with pending
+        messages delivers the event. An on_event handler is not run again.
 
-        By default, handlers are executed as background tasks to avoid blocking
-        the HTTP response. Set wait=True for synchronous execution (useful for testing).
+        Set wait=True to run that work before returning (useful for testing).
 
         Args:
             event: CloudEvent instance
-            wait: If True, wait for handlers to complete before returning.
-                  If False (default), execute handlers as background tasks.
+            wait: If True, run the work before returning.
+                  If False (default), run it as background tasks.
+
+        Raises:
+            AppNotRunningError: If the app is not initialized or shuts down
+            ChannelPermissionError: If the event's channel is sealed and the
+                event carries no valid capability token
         """
-        import asyncio
+        if self._shutting_down or not self._initialized:
+            raise AppNotRunningError("app is not running")
 
         event_type = event["type"]
 
         # A sealed channel takes events only with a valid token; nothing runs otherwise.
         await self._enforce_cloudevent_seal(event)
 
-        # Find handlers for this event type
-        handlers = self.event_handlers.get(event_type, [])
+        # Store the event, and an instance of each workflow that handles it.
+        stored = await self._store_event_message(event)
+        work: list[Callable[[], Coroutine[Any, Any, None]]] = []
+        for handler in self.event_handlers.get(event_type, []):
+            if isinstance(handler, _WorkflowEventHandler):
+                _instance_id, first_run = await handler.create(event)
+                work.append(functools.partial(self._run_first_run, first_run, event_type))
+            else:
+                work.append(functools.partial(self._run_handler, handler, event, event_type))
+        work.append(functools.partial(self._wake_event_subscribers_safe, stored))
 
         if wait:
             # Synchronous execution (for tests)
-            for handler in handlers:
-                await self._run_handler(handler, event, event_type)
-            await self._deliver_event_to_waiting_workflows_safe(event)
+            for run in work:
+                await run()
         else:
             # Background execution (for production)
-            for handler in handlers:
-                asyncio.create_task(self._run_handler(handler, event, event_type))
-            asyncio.create_task(self._deliver_event_to_waiting_workflows_safe(event))
+            for run in work:
+                self._track_event_task(run())
 
     async def _enforce_cloudevent_seal(self, event: Any) -> None:
         """Refuse an event whose target channel is sealed for ``channel_pub``
@@ -860,15 +943,30 @@ class EddaApp:
         except Exception as e:
             logger.error("Error handling event %s: %s", event_type, e, exc_info=True)
 
-    async def _deliver_event_to_waiting_workflows_safe(self, event: Any) -> None:
+    async def _run_first_run(
+        self, first_run: Callable[[], Awaitable[str]], event_type: str
+    ) -> None:
         """
-        Deliver event to waiting workflows with error handling.
+        Run the first run of a workflow that an event started, with error handling.
 
         Args:
-            event: CloudEvent instance
+            first_run: The first run, as returned by _WorkflowEventHandler.create
+            event_type: Event type for logging
         """
         try:
-            await self._deliver_event_to_waiting_workflows(event)
+            await first_run()
+        except Exception as e:
+            logger.error("Error handling event %s: %s", event_type, e, exc_info=True)
+
+    async def _wake_event_subscribers_safe(self, stored: _StoredEvent) -> None:
+        """
+        Deliver a stored event to waiting workflows with error handling.
+
+        Args:
+            stored: The event's channel message
+        """
+        try:
+            await self._wake_event_subscribers(stored)
         except Exception as e:
             logger.error("Error delivering event to waiting workflows: %s", e, exc_info=True)
 
@@ -896,14 +994,32 @@ class EddaApp:
         Args:
             event: CloudEvent instance
         """
-        from edda.channels import publish
+        stored = await self._store_event_message(event)
+        await self._wake_event_subscribers(stored)
+
+    async def _store_event_message(self, event: Any) -> _StoredEvent:
+        """
+        Publish a CloudEvent to the channel of its type, as ``publish`` does,
+        without delivering it yet.
+
+        Args:
+            event: CloudEvent instance
+
+        Returns:
+            The stored message, for _wake_event_subscribers
+
+        Raises:
+            ChannelPermissionError: If the channel is sealed and the event
+                carries no valid capability token
+        """
+        from edda.channels import _enforce_channel_capability
 
         event_type = event["type"]
         event_data = event.get_data()
 
         # Extract CloudEvents metadata with ce_ prefix
         # This allows ReceivedEvent to reconstruct CloudEvents attributes
-        metadata = {
+        metadata: dict[str, Any] = {
             "ce_type": event["type"],
             "ce_source": event["source"],
             "ce_id": event["id"],
@@ -932,69 +1048,44 @@ class EddaApp:
         }
         if extensions:
             metadata["ce_extensions"] = extensions
+        metadata["published_at"] = datetime.now(UTC).isoformat()
 
         # Check for eddainstanceid extension attribute for Point-to-Point delivery
         target_instance_id = extensions.get("eddainstanceid")
         capability_token = event.get_attributes().get("capabilitytoken")
 
-        if target_instance_id:
-            # Point-to-Point: Deliver to specific instance only
-            logger.debug(
-                "Point-to-Point: Delivering '%s' to instance %s",
-                event_type,
-                target_instance_id,
-            )
+        # The message is stored on the channel of the event type, also when
+        # its delivery targets one instance, so that channel's seal applies.
+        await _enforce_channel_capability(self.storage, "channel_pub", event_type, capability_token)
+        message_id = await self.storage.publish_to_channel(event_type, event_data, metadata)
+        logger.debug(
+            "Published '%s' to channel (message_id: %s, target: %s)",
+            event_type,
+            message_id,
+            target_instance_id,
+        )
+        return _StoredEvent(event_type, message_id, event_data, metadata, target_instance_id)
 
-            try:
-                await publish(
-                    self.storage,
-                    channel=event_type,
-                    data=event_data,
-                    metadata=metadata,
-                    target_instance_id=target_instance_id,
-                    worker_id=self.worker_id,
-                    capability_token=capability_token,
-                )
-                logger.debug(
-                    "Published '%s' to channel (target: %s)",
-                    event_type,
-                    target_instance_id,
-                )
+    async def _wake_event_subscribers(self, stored: _StoredEvent) -> None:
+        """
+        Deliver a stored event to the workflows waiting on its channel: only
+        to its target when it has one (Point-to-Point), otherwise to all of
+        them (Pub/Sub).
 
-            except Exception as e:
-                logger.error(
-                    "Error delivering to workflow %s: %s",
-                    target_instance_id,
-                    e,
-                    exc_info=True,
-                )
+        Args:
+            stored: The event's channel message
+        """
+        from edda.channels import _wake_waiting_subscribers
 
-        else:
-            # Pub/Sub: Deliver to ALL waiting instances
-            logger.debug("Pub/Sub: Publishing '%s' to channel", event_type)
-
-            try:
-                message_id = await publish(
-                    self.storage,
-                    channel=event_type,
-                    data=event_data,
-                    metadata=metadata,
-                    worker_id=self.worker_id,
-                    capability_token=capability_token,
-                )
-                logger.debug(
-                    "Published '%s' to channel (message_id: %s)",
-                    event_type,
-                    message_id,
-                )
-
-            except Exception as e:
-                logger.error(
-                    "Error publishing to channel '%s': %s",
-                    event_type,
-                    e,
-                    exc_info=True,
-                )
+        await _wake_waiting_subscribers(
+            self.storage,
+            stored.channel,
+            stored.message_id,
+            stored.data,
+            stored.metadata,
+            target_instance_id=stored.target_instance_id,
+            worker_id=self.worker_id,
+        )
 
     async def _check_expired_timers(self) -> None:
         """
@@ -1665,9 +1756,12 @@ class EddaApp:
         Handle CloudEvent HTTP request.
 
         CloudEvents HTTP Binding compliant responses:
-        - 202 Accepted: Event accepted for async processing
+        - 202 Accepted: Event stored; its handlers and deliveries run afterwards
         - 400 Bad Request: CloudEvents parsing/validation error (non-retryable)
-        - 500 Internal Server Error: Internal error (retryable)
+        - 403 Forbidden: Sealed channel without a valid capability token (non-retryable)
+        - 500 Internal Server Error: Internal error, such as an event that
+          could not be stored (retryable)
+        - 503 Service Unavailable: The app is shutting down (retryable)
         """
         # Read request body
         body = b""
@@ -1685,12 +1779,21 @@ class EddaApp:
             # Create CloudEvent from HTTP request
             event = from_http(headers, body)
 
-            # Handle the event (background task execution)
+            # Store the event; its handlers and deliveries run in background tasks
             await self.handle_cloudevent(event)
 
             # Success: 202 Accepted (async processing)
             status = 202
             response_body: dict[str, Any] = {"status": "accepted"}
+
+        except AppNotRunningError as e:
+            # Shutting down: 503 Service Unavailable (retryable)
+            status = 503
+            response_body = {
+                "error": str(e),
+                "error_type": "ServiceUnavailable",
+                "retryable": True,
+            }
 
         except ChannelPermissionError as e:
             # Sealed channel without a valid capability token: 403 Forbidden (non-retryable)

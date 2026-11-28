@@ -7,7 +7,7 @@ and managing workflow instances.
 
 import functools
 import inspect
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar, cast
 
 from edda.context import _current_workflow_context
@@ -145,6 +145,38 @@ class Workflow:
         Raises:
             RuntimeError: If replay engine not initialized
         """
+        engine, request = await self._start_request(lock_timeout_seconds, sandboxed, kwargs)
+        instance_id: str = await engine.start_workflow(**request)
+        return instance_id
+
+    async def _create(
+        self,
+        lock_timeout_seconds: int | None = None,
+        sandboxed: bool = False,
+        **kwargs: Any,
+    ) -> tuple[str, Callable[[], Awaitable[str]]]:
+        """
+        Store a new instance as start() does, without running it.
+
+        Returns the instance ID and the instance's first run, for the caller to
+        run later. Until it runs, a resumption poll may claim the instance and
+        run it; the first run then leaves the instance to that run.
+        """
+        engine, request = await self._start_request(lock_timeout_seconds, sandboxed, kwargs)
+        instance_id: str = await engine.create_workflow_instance(**request)
+
+        async def first_run() -> str:
+            run_id: str = await engine.run_new_workflow(
+                instance_id, self.name, self.func, request["input_data"], claimed_ok=True
+            )
+            return run_id
+
+        return instance_id, first_run
+
+    async def _start_request(
+        self, lock_timeout_seconds: int | None, sandboxed: bool, kwargs: dict[str, Any]
+    ) -> tuple[Any, dict[str, Any]]:
+        """The replay engine and the arguments of a new instance of this workflow."""
         if _replay_engine is None:
             raise RuntimeError(
                 "Replay engine not initialized. "
@@ -164,15 +196,14 @@ class Workflow:
             if parent is not None and parent.get("sandboxed"):
                 raise SandboxedError("sandboxed workflows cannot use the sandboxed spawn option")
 
-        instance_id: str = await _replay_engine.start_workflow(
-            workflow_name=self.name,
-            workflow_func=self.func,
-            input_data=processed_kwargs,
-            lock_timeout_seconds=actual_timeout,
-            sandboxed=sandboxed,
-            parent_instance_id=parent_instance_id,
-        )
-        return instance_id
+        return _replay_engine, {
+            "workflow_name": self.name,
+            "workflow_func": self.func,
+            "input_data": processed_kwargs,
+            "lock_timeout_seconds": actual_timeout,
+            "sandboxed": sandboxed,
+            "parent_instance_id": parent_instance_id,
+        }
 
     async def resume(self, instance_id: str, event: Any = None) -> None:
         """

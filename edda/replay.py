@@ -12,7 +12,7 @@ import inspect
 import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from edda.channels import WaitForChannelMessageException, WaitForTimerException
@@ -21,6 +21,7 @@ from edda.context import WorkflowContext, _current_workflow_context
 from edda.exceptions import RunAbortedError
 from edda.locking import (
     LockLostError,
+    LockNotAcquiredError,
     new_lock_identity,
     run_with_lock_heartbeat,
     workflow_lock,
@@ -197,6 +198,40 @@ class ReplayEngine:
         Returns:
             Instance ID of the started workflow
         """
+        instance_id = await self.create_workflow_instance(
+            workflow_name,
+            workflow_func,
+            input_data,
+            lock_timeout_seconds=lock_timeout_seconds,
+            sandboxed=sandboxed,
+            parent_instance_id=parent_instance_id,
+        )
+        return await self.run_new_workflow(instance_id, workflow_name, workflow_func, input_data)
+
+    async def create_workflow_instance(
+        self,
+        workflow_name: str,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+        lock_timeout_seconds: int | None = None,
+        sandboxed: bool = False,
+        parent_instance_id: str | None = None,
+    ) -> str:
+        """
+        Store a new workflow instance without running it.
+
+        The instance is stored unlocked and running: run_new_workflow runs its
+        first run, and until then a resumption poll may claim and run it.
+
+        Args:
+            workflow_name: Name of the workflow
+            workflow_func: The workflow function
+            input_data: Input parameters for the workflow
+            lock_timeout_seconds: Lock timeout for this workflow (None = global default 300s)
+
+        Returns:
+            Instance ID of the new instance
+        """
         # Generate instance ID
         instance_id = f"{workflow_name}-{uuid.uuid4().hex}"
 
@@ -232,10 +267,41 @@ class ReplayEngine:
             sandboxed=sandboxed,
             parent_instance_id=parent_instance_id,
         )
+        return instance_id
 
+    async def run_new_workflow(
+        self,
+        instance_id: str,
+        workflow_name: str,
+        workflow_func: Callable[..., Any],
+        input_data: dict[str, Any],
+        claimed_ok: bool = False,
+    ) -> str:
+        """
+        Run the first run of an instance stored by create_workflow_instance.
+
+        Args:
+            instance_id: The new instance
+            workflow_name: Name of the workflow
+            workflow_func: The workflow function to execute
+            input_data: Input parameters of the instance
+            claimed_ok: If True, an instance that another run holds (a
+                resumption poll that claimed it first) is left to that run.
+                Otherwise it raises LockNotAcquiredError.
+
+        Returns:
+            The instance ID
+        """
         # Execute the workflow with distributed lock
         lock_id = new_lock_identity(self.worker_id)
-        async with self._run_under_lock(instance_id, lock_id):
+        async with AsyncExitStack() as run_lock:
+            try:
+                await run_lock.enter_async_context(self._run_under_lock(instance_id, lock_id))
+            except LockNotAcquiredError:
+                if not claimed_ok:
+                    raise
+                logger.debug("%s was claimed before its first run; that run continues", instance_id)
+                return instance_id
             # Create context for new execution
             ctx = WorkflowContext(
                 instance_id=instance_id,

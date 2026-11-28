@@ -32,7 +32,7 @@ Edda returns appropriate HTTP status codes according to the CloudEvents specific
 
 ### Success (202 Accepted)
 
-When an event is successfully accepted for asynchronous processing:
+Edda answers 202 once the event is stored: it is published to its channel, and each workflow registered for its type with `@workflow(event_handler=True)` has a new instance. From then on the event is kept even if the process stops: a running worker resumes a first run or a delivery that did not finish. Handlers registered with `@app.on_event()` run after the response, and are not run again.
 
 ```bash
 curl -X POST http://localhost:8001/ \
@@ -56,10 +56,10 @@ Content-Type: application/json
 }
 ```
 
-**When to use:**
+**When returned:**
 
-- ✅ Event was successfully parsed and accepted
-- ✅ Event handler is executing in the background
+- ✅ The event was parsed and stored
+- ✅ Its workflows and `on_event` handlers run, and the workflows waiting for it (`wait_event`) are woken, after the response
 - ✅ Final processing outcome is not yet known
 
 ### Client Error (400 Bad Request)
@@ -149,13 +149,39 @@ Content-Type: application/json
 
 **When returned:**
 
-- ⚠️ Database connection failures
+- ⚠️ The event could not be stored (for example, the database cannot be reached)
 - ⚠️ Internal server errors
 - ⚠️ Unexpected exceptions
 
 **Client action:**
 
 - 🔄 **Retry with exponential backoff**
+
+### Service Unavailable (503 Service Unavailable)
+
+When the app is shutting down (**retryable**). Nothing is published and no workflow starts.
+
+**Response:**
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{
+  "error": "app is not running",
+  "error_type": "ServiceUnavailable",
+  "retryable": true
+}
+```
+
+**Client action:**
+
+- 🔄 **Retry with exponential backoff**: another worker, or this one once it runs again, accepts the event
+
+`shutdown()` waits for the events it accepted before: the first runs of their workflows, their `on_event` handlers and their delivery to waiting workflows get 30 seconds to finish. What still runs then is cancelled, and a running worker resumes a cancelled first run or delivery.
+
+### Delivery Guarantee
+
+Events are delivered at least once: a sender that retries after a 500, a 503 or a lost response can store the same event twice. A workflow that must not handle an event twice deduplicates on an id it receives. A workflow that waits for the event gets its `id` (`ReceivedEvent.id`); a workflow that the event starts (`event_handler=True`) gets only its `data`, so the sender puts an id there.
 
 ## Error Response Structure
 
@@ -175,7 +201,7 @@ All error responses include structured information to help clients decide whethe
 - **`error_type`** (string): Python exception class name for debugging
 - **`retryable`** (boolean): Whether the client should retry
   - `false`: Client error (400, 403) - Fix the request before retrying
-  - `true`: Server error (500) - Retry with exponential backoff
+  - `true`: Server error (500, 503) - Retry with exponential backoff
 
 ## Client Retry Logic
 
@@ -208,7 +234,7 @@ async def send_cloudevent_with_retry(event_data: dict, max_retries: int = 3):
                     print(f"❌ Client error: {error['error']}")
                     raise ValueError(f"Non-retryable error: {error['error']}")
 
-                elif response.status_code == 500:
+                elif response.status_code in (500, 503):
                     # Server error - Retry with exponential backoff
                     error = response.json()
                     if attempt < max_retries - 1:
@@ -244,12 +270,13 @@ Edda complies with the following CloudEvents specifications:
 ✅ **Client Error Responses (Non-Retryable):**
 
 - `400 Bad Request` - Malformed CloudEvent
+- `403 Forbidden` - The event's channel is sealed and the event carries no valid `capabilitytoken`
 - `415 Unsupported Media Type` - (Reserved for future use)
 
 ✅ **Server Error Responses (Retryable):**
 
 - `500 Internal Server Error` - Internal error
-- `503 Service Unavailable` - (Reserved for future use)
+- `503 Service Unavailable` - The app is shutting down
 
 ❌ **Prohibited:**
 
@@ -307,7 +334,7 @@ async def send_event():
         elif response.status_code == 400:
             error = response.json()
             print(f"❌ Client error: {error}")
-        elif response.status_code == 500:
+        elif response.status_code in (500, 503):
             error = response.json()
             print(f"⚠️ Server error (retryable): {error}")
 ```
@@ -329,8 +356,8 @@ if response.status_code != 202:
 ### 2. Implement Retry Logic
 
 ```python
-# ✅ Retry on 500, don't retry on 400
-if response.status_code == 500:
+# ✅ Retry on 500 and 503, don't retry on 400
+if response.status_code in (500, 503):
     error = response.json()
     if error["retryable"]:
         retry_with_backoff()

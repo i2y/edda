@@ -150,12 +150,12 @@ async def workflow_lock(
         None (lock is held during context)
 
     Raises:
-        RuntimeError: If lock cannot be acquired
+        LockNotAcquiredError: If another holder has the lock (a RuntimeError)
     """
     # Try to acquire lock
     acquired = await storage.try_acquire_lock(instance_id, worker_id, timeout_seconds)
     if not acquired:
-        raise RuntimeError(f"Failed to acquire lock for instance {instance_id}")
+        raise LockNotAcquiredError(f"Failed to acquire lock for instance {instance_id}")
 
     refresh_task: asyncio.Task[Any] | None = None
     stop_refresh = asyncio.Event()
@@ -517,8 +517,8 @@ async def auto_resume_stale_workflows_periodically(
                 logger.error("Failed to cleanup stale locks: %s", e, exc_info=True)
 
 
-class LockNotAcquiredError(Exception):
-    """Raised when a lock cannot be acquired."""
+class LockNotAcquiredError(RuntimeError):
+    """Raised when a lock cannot be acquired because another holder has it."""
 
     pass
 

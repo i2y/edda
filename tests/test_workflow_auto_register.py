@@ -6,9 +6,15 @@ workflows are automatically registered as CloudEvent handlers.
 """
 
 import pytest
+from cloudevents.http import CloudEvent
 
 from edda import EddaApp, WorkflowContext, activity, workflow
 from edda.workflow import get_all_workflows
+
+
+async def instances_of(app: EddaApp, workflow_name: str) -> list[dict]:
+    rows = await app.storage.list_instances(workflow_name_filter=workflow_name)
+    return [i for i in rows["instances"] if i["workflow_name"] == workflow_name]
 
 
 class TestSagaGlobalRegistry:
@@ -93,30 +99,14 @@ class TestEddaAppAutoRegistration:
         # Initialize app
         await clean_app.initialize()
 
-        # Create a mock CloudEvent
-        class MockCloudEvent:
-            def __init__(self, data):
-                self._data = data
-
-            def __getitem__(self, key):
-                if key == "type":
-                    return "auto_handler_test"
-                raise KeyError(key)
-
-            def get_attributes(self):
-                return {}
-
-            def get_data(self):
-                return self._data
-
-        event = MockCloudEvent({"value": 21})
+        event = CloudEvent({"type": "auto_handler_test", "source": "test"}, {"value": 21})
 
         # Call the handler (wait=True for synchronous test execution)
         await clean_app.handle_cloudevent(event, wait=True)
 
-        # Verify workflow was started
-        # Note: We can't easily verify the workflow execution here without more complex setup,
-        # but we've verified the handler is registered correctly
+        # The workflow ran with the event data as its arguments
+        [instance] = await instances_of(clean_app, "auto_handler_test")
+        assert instance["status"] == "completed"
 
         await clean_app.shutdown()
 
@@ -144,17 +134,7 @@ class TestEddaAppAutoRegistration:
         assert "precedence_test" in clean_app.event_handlers
         assert len(clean_app.event_handlers["precedence_test"]) == 1
 
-        # Create mock event
-        class MockCloudEvent:
-            def __getitem__(self, key):
-                if key == "type":
-                    return "precedence_test"
-                raise KeyError(key)
-
-            def get_attributes(self):
-                return {}
-
-        event = MockCloudEvent()
+        event = CloudEvent({"type": "precedence_test", "source": "test"}, {"val": 1})
 
         # Call handler (wait=True for synchronous test execution)
         await clean_app.handle_cloudevent(event, wait=True)
@@ -203,22 +183,14 @@ class TestEddaAppAutoRegistration:
 
         await clean_app.initialize()
 
-        # Create mock CloudEvent with non-dict data
-        class MockCloudEvent:
-            def __getitem__(self, key):
-                if key == "type":
-                    return "non_dict_test"
-                raise KeyError(key)
-
-            def get_attributes(self):
-                return {}
-
-            def get_data(self):
-                return "simple string"  # Not a dict
-
-        event = MockCloudEvent()
+        # CloudEvent with non-dict data
+        event = CloudEvent({"type": "non_dict_test", "source": "test"}, "simple string")
 
         # Handler should not crash (wait=True for synchronous test execution)
         await clean_app.handle_cloudevent(event, wait=True)
+
+        # The workflow ran without arguments
+        [instance] = await instances_of(clean_app, "non_dict_test")
+        assert instance["status"] == "completed"
 
         await clean_app.shutdown()

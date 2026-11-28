@@ -108,6 +108,11 @@ class InvalidArgumentError(ValueError):
     """A kernel primitive received an invalid argument."""
 
 
+class AppNotRunningError(Exception):
+    """The app refuses an incoming event: it is not initialized, or it shuts
+    down. The sender sends the event again (HTTP 503)."""
+
+
 class RunAbortedError(BaseException):
     """The current workflow run must stop without a recorded outcome.
 

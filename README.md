@@ -605,9 +605,11 @@ app = EddaApp(
 - Works with CloudEvents-compatible systems (Knative Eventing, CloudEvents SDKs, etc.)
 
 **CloudEvents HTTP Binding compliance**:
-- **202 Accepted**: Event accepted for asynchronous processing (success)
+- **202 Accepted**: Event stored; its workflows and handlers run after the response (success)
 - **400 Bad Request**: CloudEvents parsing/validation error (non-retryable)
-- **500 Internal Server Error**: Internal error (retryable)
+- **403 Forbidden**: The event's channel is sealed and the event carries no valid `capabilitytoken` (non-retryable)
+- **500 Internal Server Error**: Internal error, such as an event that could not be stored (retryable)
+- **503 Service Unavailable**: The app is shutting down (retryable)
 - Error responses include `error_type` and `retryable` flags for client retry logic
 
 ### Event & Timer Waiting
