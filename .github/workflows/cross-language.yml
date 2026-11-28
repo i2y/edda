@@ -1,6 +1,6 @@
 name: Cross-language
 
-# Channels and supervision between Edda, Romancy (Go) and Shikibu (Ruby), against
+# Channels, CloudEvents and supervision between Edda, Romancy (Go) and Shikibu (Ruby), against
 # the main branch of the other two. The daily run catches a change there that
 # breaks these tests while nothing is pushed here.
 on:
@@ -65,7 +65,7 @@ jobs:
         working-directory: edda
         run: >
           uv run pytest tests/test_cross_language_channel.py tests/test_cross_language_supervisor.py
-          -v --tb=short --no-cov -rs --junitxml=cross-language.xml
+          tests/test_cross_language_events.py -v --tb=short --no-cov -rs --junitxml=cross-language.xml
 
       # The tests skip themselves when Go, Bundler or a repository is missing
       - name: Fail if any test was skipped
