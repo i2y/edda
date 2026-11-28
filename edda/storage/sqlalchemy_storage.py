@@ -1465,13 +1465,14 @@ class SQLAlchemyStorage:
         workflow_name: str,
         source_hash: str,
         owner_service: str,
-        input_data: dict[str, Any],
+        input_data: Any,
         lock_timeout_seconds: int | None = None,
         continued_from: str | None = None,
         sandboxed: bool = False,
         parent_instance_id: str | None = None,
+        framework: str = "python",
     ) -> None:
-        """Create a new workflow instance."""
+        """Create a new workflow instance run by ``framework``'s runtime."""
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
             if not sandboxed:
@@ -1497,7 +1498,7 @@ class SQLAlchemyStorage:
                 workflow_name=workflow_name,
                 source_hash=source_hash,
                 owner_service=owner_service,
-                framework="python",
+                framework=framework,
                 input_data=json.dumps(input_data),
                 lock_timeout_seconds=lock_timeout_seconds,
                 continued_from=continued_from,

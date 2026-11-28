@@ -736,7 +736,7 @@ Workflows double as actors of a kernel shared with Romancy and Shikibu (same sch
 - **`edda.tasks`**: `post_task`, `claim_task`, `complete_task`, `fail_task`, `list_tasks`, `wait_task`, `wait_any_task`, `read_channel_since` (raises `CursorNotFoundError` when the cursor message is not on the channel), `read_channel_after` (numeric `id` cursor, `0` = from the start; keeps working after the cursor message is deleted). Returned messages carry `id` and `message_id`
 - **`edda.fs`** (inside activities only): `fs_read`, `fs_write`, `fs_list`, `fs_delete`
 - **`edda.blobs`**: `store_payload`, `load_payload`, `stat_payload`
-- **`edda.supervisor`**: `define_supervisor`, `ChildSpec`, `Strategy`, `RestartMode`
+- **`edda.supervisor`**: `define_supervisor`, `ChildSpec`, `Strategy`, `RestartMode`. A child written for Romancy or Shikibu sets `framework="go"` or `framework="ruby"` on its `ChildSpec`: each runtime runs only the instances of its own framework. Without `input`, a Go child gets `null` and a Python or Ruby child `{}`
 
 ```python
 from edda import workflow, subscribe, receive, WorkflowContext
@@ -759,7 +759,12 @@ sup = define_supervisor(
     strategy=Strategy.ONE_FOR_ONE,
     max_restarts=5,
     within_seconds=60,
-    children=[ChildSpec(name="ingest", workflow="ingest", restart=RestartMode.PERMANENT)],
+    children=[
+        ChildSpec(name="ingest", workflow="ingest", restart=RestartMode.PERMANENT),
+        # A workflow that Romancy runs
+        ChildSpec(name="indexer", workflow="index_repo", framework="go",
+                  input={"repo": "/srv/app"}, restart=RestartMode.TRANSIENT),
+    ],
 )
 # instance_id = await sup.start()
 ```

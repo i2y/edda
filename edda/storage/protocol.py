@@ -191,11 +191,12 @@ class StorageProtocol(Protocol):
         workflow_name: str,
         source_hash: str,
         owner_service: str,
-        input_data: dict[str, Any],
+        input_data: Any,
         lock_timeout_seconds: int | None = None,
         continued_from: str | None = None,
         sandboxed: bool = False,
         parent_instance_id: str | None = None,
+        framework: str = "python",
     ) -> None:
         """
         Create a new workflow instance.
@@ -205,11 +206,15 @@ class StorageProtocol(Protocol):
             workflow_name: Name of the workflow (e.g., "order_saga")
             source_hash: SHA256 hash of the workflow source code
             owner_service: Service that owns this workflow (e.g., "order-service")
-            input_data: Input parameters for the workflow (serializable dict)
+            input_data: Input for the workflow, JSON-serializable (a dict of
+                keyword arguments for a Python or Ruby workflow)
             lock_timeout_seconds: Lock timeout for this workflow (None = use global default 300s)
             continued_from: Optional instance ID this workflow continues from (for recur pattern)
             sandboxed: Whether to start as a sandboxed actor
             parent_instance_id: Optional spawn parent used for sandbox inheritance
+            framework: Runtime that runs the instance: "python" (Edda), "go"
+                (Romancy) or "ruby" (Shikibu). Each runtime runs only the
+                instances of its own framework.
         """
         ...
 

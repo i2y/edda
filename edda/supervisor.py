@@ -22,6 +22,11 @@ Design notes (parity with romancy's supervisor):
   meanwhile is judged by its actual status, and a compensating child is
   left to finish (the next sync sees how it ends).
 - History stays bounded because each loop iteration ends in recur().
+- A child may be a workflow of another runtime (Romancy: framework="go",
+  Shikibu: framework="ruby"). Each runtime runs only the instances of its
+  own framework, so the child row carries the child's framework and an
+  empty source hash: this process cannot know the other runtime's hash,
+  and an empty one matches any version of it.
 
 Usage::
 
@@ -35,6 +40,8 @@ Usage::
         children=[
             ChildSpec(name="worker", workflow="my_worker",
                       input={"x": 1}, restart=RestartMode.TRANSIENT),
+            # A workflow that Romancy runs
+            ChildSpec(name="indexer", workflow="index_repo", framework="go"),
         ],
     )
     instance_id = await sup.start()  # zero/empty input = initial spawn
@@ -46,7 +53,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, cast
 
@@ -73,15 +80,71 @@ class Strategy(IntEnum):
 
 @dataclass
 class ChildSpec:
-    """One supervised child. input is passed verbatim on every (re)start."""
+    """One supervised child. input is passed verbatim on every (re)start.
+
+    framework names the runtime that runs the child's workflow: "python"
+    (Edda, the default), "go" (Romancy) or "ruby" (Shikibu). Without an
+    input, a Go child gets null and a Python or Ruby child an empty dict.
+    """
 
     name: str
     workflow: str
-    input: dict[str, Any] = field(default_factory=dict)
+    input: Any = None
     restart: RestartMode = RestartMode.TRANSIENT
+    framework: str = "python"
 
 
 _DEAD = {"completed", "failed", "cancelled"}
+
+
+async def _child_source_hash(storage: Any, workflow_name: str, framework: str) -> str:
+    """Return the source hash for a spawned child's row.
+
+    Instances are joined to workflow_definitions on (name, hash): the
+    definition row must exist, and a wrong hash makes the child invisible
+    to the resumable sweep.
+    """
+    if framework != "python":
+        # Another runtime runs the child: its hash is unknown here, and an
+        # empty one matches any version that runtime registers.
+        if await storage.get_workflow_definition(workflow_name, "") is None:
+            await storage.upsert_workflow_definition(
+                workflow_name=workflow_name, source_hash="", source_code=""
+            )
+        return ""
+
+    from edda.workflow import _workflow_registry
+
+    wf = _workflow_registry.get(workflow_name)
+    if wf is None:
+        # Not registered in this process (another Edda worker runs it): use
+        # its recorded definition.
+        definition = await storage.get_current_workflow_definition(workflow_name)
+        if definition is None:
+            raise ValueError(f"supervisor child workflow {workflow_name!r} has no definition")
+        return str(definition["source_hash"])
+    # Same definition start() records (placeholder source when the code
+    # cannot be read)
+    try:
+        source_code = inspect.getsource(wf.func)
+    except (OSError, TypeError) as e:
+        source_code = f"# Source code not available\n# Workflow: {workflow_name}\n# Error: {e}"
+    source_hash = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+    await storage.upsert_workflow_definition(
+        workflow_name=workflow_name,
+        source_hash=source_hash,
+        source_code=source_code,
+    )
+    return source_hash
+
+
+def _child_input(spec: dict[str, Any], framework: str) -> Any:
+    """Return the child's input, or its runtime's empty input when it has
+    none: null for Go (the zero value of the input type), {} for Python and
+    Ruby (the input is passed as keyword arguments)."""
+    if spec.get("input") is not None:
+        return spec["input"]
+    return None if framework == "go" else {}
 
 
 def _needs_restart(mode: int, status: str) -> bool:
@@ -206,43 +269,17 @@ def define_supervisor(
                     continue
             gen = c.get("generation", 0) + 1
             new_id = f"{ctx.instance_id}:{c['spec']['name']}:g{gen}"
-            # Resolve the child workflow's source hash — instances are
-            # joined to workflow_definitions on (name, hash), so a wrong
-            # hash makes the child invisible to the resumable sweep.
-            from edda.workflow import _workflow_registry
-
             wf_name = c["spec"]["workflow"]
-            wf = _workflow_registry.get(wf_name)
-            if wf is not None:
-                # Same definition start() records (placeholder source when
-                # the code cannot be read)
-                try:
-                    source_code = inspect.getsource(wf.func)
-                except (OSError, TypeError) as e:
-                    source_code = (
-                        f"# Source code not available\n# Workflow: {wf_name}\n# Error: {e}"
-                    )
-                source_hash = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
-                await storage.upsert_workflow_definition(
-                    workflow_name=wf_name,
-                    source_hash=source_hash,
-                    source_code=source_code,
-                )
-            else:
-                # Not registered in this process (e.g. a child implemented
-                # by another worker or framework): use its recorded
-                # definition.
-                definition = await storage.get_current_workflow_definition(wf_name)
-                if definition is None:
-                    raise ValueError(f"supervisor child workflow {wf_name!r} has no definition")
-                source_hash = definition["source_hash"]
+            # A state recorded before ChildSpec.framework existed has none
+            framework = c["spec"].get("framework") or "python"
             await storage.create_instance(
                 instance_id=new_id,
-                workflow_name=c["spec"]["workflow"],
-                source_hash=source_hash,
+                workflow_name=wf_name,
+                source_hash=await _child_source_hash(storage, wf_name, framework),
                 owner_service="supervisor",
-                input_data=c["spec"]["input"],
+                input_data=_child_input(c["spec"], framework),
                 parent_instance_id=ctx.instance_id,
+                framework=framework,
             )
             if c.get("instance_id"):
                 restarted += 1  # replacement of a spawned child counts
@@ -268,6 +305,7 @@ def define_supervisor(
                             "workflow": c.workflow,
                             "input": c.input,
                             "restart": int(c.restart),
+                            "framework": c.framework,
                         },
                         "instance_id": "",
                         "generation": 0,

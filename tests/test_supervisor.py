@@ -213,9 +213,10 @@ async def test_supervisor_cascade_stops_temporary_siblings(sup_app):
 
 @pytest.mark.multidb
 async def test_supervisor_child_hash_for_unregistered_workflow(sqlite_storage):
-    """A child workflow registered only in another process (or another
-    framework) gets the hash of its stored definition, not "" — an instance
-    must join workflow_definitions to be visible at all."""
+    """A Python child workflow registered only in another process gets the
+    hash of its stored definition, not "" — an instance must join
+    workflow_definitions to be visible at all. (A child of another runtime:
+    test_supervisor_spawns_child_for_its_framework.)"""
     from edda.exceptions import RetryExhaustedError
     from edda.replay import ReplayEngine
     from edda.retry import RetryPolicy
@@ -258,6 +259,71 @@ async def test_supervisor_child_hash_for_unregistered_workflow(sqlite_storage):
         with pytest.raises(RetryExhaustedError) as excinfo:
             await orphan_sup.start()
         assert "sup_never_defined_wf" in str(excinfo.value.__cause__)
+    finally:
+        set_replay_engine(None)
+
+
+@pytest.mark.multidb
+async def test_supervisor_spawns_child_for_its_framework(sqlite_storage):
+    """A child written for Romancy or Shikibu gets its framework, an empty
+    source hash (even when a Python workflow of the same name is registered
+    here) and, without an input, its runtime's empty input. Edda's claim
+    leaves it to that runtime."""
+    from sqlalchemy import text
+
+    from edda.replay import ReplayEngine
+    from edda.retry import RetryPolicy
+    from edda.workflow import set_replay_engine
+
+    set_replay_engine(
+        ReplayEngine(
+            storage=sqlite_storage,
+            service_name="sup-framework",
+            worker_id="w",
+            default_retry_policy=RetryPolicy(max_attempts=1),
+        )
+    )
+    try:
+        sup = define_supervisor(
+            "sup-framework",
+            poll_seconds=3600,
+            children=[
+                ChildSpec(name="py", workflow="sup_child_quick", restart=RestartMode.TEMPORARY),
+                ChildSpec(
+                    name="go",
+                    workflow="sup_child_quick",
+                    framework="go",
+                    restart=RestartMode.TEMPORARY,
+                ),
+                ChildSpec(
+                    name="rb",
+                    workflow="sup_ruby_only_wf",
+                    framework="ruby",
+                    input={"n": 1},
+                    restart=RestartMode.TEMPORARY,
+                ),
+            ],
+        )
+        sup_id = await sup.start()
+
+        want = {"py": ("python", {}), "go": ("go", None), "rb": ("ruby", {"n": 1})}
+        for name, (framework, input_data) in want.items():
+            child_id = f"{sup_id}:{name}:g1"
+            child = await sqlite_storage.get_instance(child_id)
+            assert child is not None, f"{name}: no row joined to its definition"
+            assert child["input_data"] == input_data
+            assert (child["source_hash"] == "") == (framework != "python")
+            async with sqlite_storage.engine.begin() as conn:
+                row = await conn.execute(
+                    text("SELECT framework FROM workflow_instances WHERE instance_id = :id"),
+                    {"id": child_id},
+                )
+                assert row.scalar_one() == framework
+
+        claimed = await sqlite_storage.claim_resumable_workflows(
+            worker_id="w#1", workflow_names=["sup_child_quick", "sup_ruby_only_wf"]
+        )
+        assert [c["instance_id"] for c in claimed] == [f"{sup_id}:py:g1"]
     finally:
         set_replay_engine(None)
 
