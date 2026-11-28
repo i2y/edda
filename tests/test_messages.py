@@ -189,13 +189,17 @@ class TestSendMessage:
         self, sqlite_storage, sender_instance, receiver_instance
     ):
         """Test sending a message to a workflow waiting on a channel."""
+        # A message for one instance is stored on its direct channel, where a
+        # direct subscription (or wait_event) receives it.
+        direct = f"approval:{receiver_instance}"
+
         # First acquire lock for receiver (required by register_channel_receive_and_release_lock)
         await sqlite_storage.try_acquire_lock(receiver_instance, "worker-1")
 
         # Subscribe to channel first
         await sqlite_storage.subscribe_to_channel(
             instance_id=receiver_instance,
-            channel="approval",
+            channel=direct,
             mode="broadcast",
         )
 
@@ -203,7 +207,7 @@ class TestSendMessage:
         await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=receiver_instance,
             worker_id="worker-1",
-            channel="approval",
+            channel=direct,
             activity_id="receive_approval:1",
         )
 
@@ -236,10 +240,10 @@ class TestSendMessage:
 
         event_data = msg_history[0]["event_data"]
         assert event_data["data"] == {"approved": True, "decision": "approved"}
-        assert event_data["channel"] == "approval"
+        assert event_data["channel"] == direct
 
         # Verify subscription was removed
-        waiting = await sqlite_storage.get_channel_subscribers_waiting("approval")
+        waiting = await sqlite_storage.get_channel_subscribers_waiting(direct)
         assert len(waiting) == 0
 
     async def test_send_to_not_delivered_if_no_waiting_workflow(
@@ -276,10 +280,10 @@ class TestSendMessage:
         # First acquire lock for receiver (required by register_channel_receive_and_release_lock)
         await sqlite_storage.try_acquire_lock(receiver_instance, "worker-1")
 
-        # Subscribe to channel first
+        # Subscribe to its direct channel first (where a message for it is stored)
         await sqlite_storage.subscribe_to_channel(
             instance_id=receiver_instance,
-            channel="binary_channel",
+            channel=f"binary_channel:{receiver_instance}",
             mode="broadcast",
         )
 
@@ -287,7 +291,7 @@ class TestSendMessage:
         await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=receiver_instance,
             worker_id="worker-1",
-            channel="binary_channel",
+            channel=f"binary_channel:{receiver_instance}",
             activity_id="receive_binary_channel:1",
         )
 
@@ -329,10 +333,10 @@ class TestSendMessage:
         # First acquire lock for receiver (required by register_channel_receive_and_release_lock)
         await sqlite_storage.try_acquire_lock(receiver_instance, "worker-1")
 
-        # Subscribe to channel first
+        # Subscribe to its direct channel first (where a message for it is stored)
         await sqlite_storage.subscribe_to_channel(
             instance_id=receiver_instance,
-            channel="metadata_channel",
+            channel=f"metadata_channel:{receiver_instance}",
             mode="broadcast",
         )
 
@@ -340,7 +344,7 @@ class TestSendMessage:
         await sqlite_storage.register_channel_receive_and_release_lock(
             instance_id=receiver_instance,
             worker_id="worker-1",
-            channel="metadata_channel",
+            channel=f"metadata_channel:{receiver_instance}",
             activity_id="receive_metadata_channel:1",
         )
 

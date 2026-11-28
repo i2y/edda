@@ -34,6 +34,8 @@ Edda returns appropriate HTTP status codes according to the CloudEvents specific
 
 Edda answers 202 once the event is stored: it is published to its channel, and each workflow registered for its type with `@workflow(event_handler=True)` has a new instance. From then on the event is kept even if the process stops: a running worker resumes a first run or a delivery that did not finish. Handlers registered with `@app.on_event()` run after the response, and are not run again.
 
+The channel is the event's `type`. An event with the `eddainstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `wait_event` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](wait-event.md#sending-to-one-instance)).
+
 ```bash
 curl -X POST http://localhost:8001/ \
   -H "Content-Type: application/cloudevents+json" \

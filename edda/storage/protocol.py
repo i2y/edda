@@ -1154,6 +1154,14 @@ class StorageProtocol(Protocol):
                   - broadcast: All subscribers receive all messages
                   - competing: Each message is received by only one subscriber
 
+        A new broadcast subscription starts at the instance's durable cursor
+        for the channel (channel_delivery_cursors, which outlives the
+        subscription), so a channel subscribed again continues after the
+        last message delivered. Without one it starts after the channel's
+        latest message, except on the instance's own direct channel
+        "{name}:{instance_id}": a direct channel is a mailbox, and the
+        messages sent to it before the subscription are delivered too.
+
         Raises:
             ValueError: If mode is not 'broadcast' or 'competing'
         """
@@ -1210,6 +1218,7 @@ class StorageProtocol(Protocol):
         channel: str,
         activity_id: str | None = None,
         timeout_seconds: float | None = None,
+        also_channels: Sequence[str] = (),
     ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.
@@ -1226,6 +1235,11 @@ class StorageProtocol(Protocol):
             channel: Channel name being waited on
             activity_id: Current activity ID to record
             timeout_seconds: Optional timeout in seconds for the message wait
+            also_channels: Further channels the same receive waits on
+                (wait_event also waits on the instance's own direct channel,
+                where its targeted events are stored). A message pending on
+                any of them keeps the instance running; otherwise the wait is
+                registered on each, its timeout on ``channel`` only.
 
         Returns:
             True if the wait was registered, False if a pending message was
@@ -1354,7 +1368,8 @@ class StorageProtocol(Protocol):
         channel: str,
     ) -> None:
         """
-        Clear the waiting state for a channel subscription.
+        Clear the waiting state for a channel subscription, on every
+        subscription of the instance the same wait is registered on.
 
         Called after a message is delivered to a waiting subscriber.
 

@@ -561,6 +561,17 @@ class ChannelSubscription(Base):
     )
 
 
+def _is_own_direct_channel(instance_id: str, channel: str) -> bool:
+    """True if channel is instance_id's own direct channel "{name}:{instance_id}"
+    (SEMANTICS §3). A direct channel is a mailbox: a subscription to it also
+    receives the messages sent before it."""
+    return (
+        bool(instance_id)
+        and len(channel) > len(instance_id) + 1
+        and channel.endswith(":" + instance_id)
+    )
+
+
 class ChannelDeliveryCursor(Base):
     """Channel delivery cursors (broadcast mode: track who read what)."""
 
@@ -3127,18 +3138,10 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            # Clear waiting state from ChannelSubscription table
+            # Clear waiting state from ChannelSubscription table, on every
+            # subscription the wait is registered on.
             # Don't delete the subscription - just clear the waiting state
-            await session.execute(
-                update(ChannelSubscription)
-                .where(
-                    and_(
-                        ChannelSubscription.instance_id == instance_id,
-                        ChannelSubscription.channel == channel,
-                    )
-                )
-                .values(activity_id=None, timeout_at=None)
-            )
+            await self._end_channel_wait(session, instance_id, channel)
             await self._commit_if_not_in_transaction(session)
 
     async def deliver_message(
@@ -3254,17 +3257,9 @@ class SQLAlchemyStorage:
                 )
                 session.add(history_entry)
 
-                # Clear waiting state from subscription (don't delete)
-                await session.execute(
-                    update(ChannelSubscription)
-                    .where(
-                        and_(
-                            ChannelSubscription.instance_id == instance_id,
-                            ChannelSubscription.channel == channel,
-                        )
-                    )
-                    .values(activity_id=None, timeout_at=None)
-                )
+                # Clear waiting state from subscription (don't delete), on
+                # every subscription the wait is registered on
+                await self._end_channel_wait(session, instance_id, channel)
 
                 # Update status to 'running' (ready for resumption)
                 await session.execute(
@@ -4119,15 +4114,30 @@ class SQLAlchemyStorage:
                     await self._commit_if_not_in_transaction(session)
                 return
 
-            # For broadcast mode, set cursor to current max message id
-            # So subscriber only sees messages published after subscription
-            cursor_message_id = None
+            # A new broadcast subscription starts at the instance's durable
+            # cursor for the channel: it outlives the subscription (a recur
+            # deletes the subscriptions, SEMANTICS §5), so a channel subscribed
+            # again continues after the last message delivered. Without one,
+            # the subscriber only sees messages published after it subscribed,
+            # except on its own direct channel: a direct channel is a mailbox
+            # (SEMANTICS §3), and the messages sent to it before the
+            # subscription are delivered too.
+            cursor_message_id: int | None = None
             if mode == "broadcast":
-                result = await session.execute(
-                    select(func.max(ChannelMessage.id)).where(ChannelMessage.channel == channel)
-                )
-                max_id = result.scalar()
-                cursor_message_id = max_id if max_id is not None else 0
+                durable = await self._durable_cursor(session, instance_id, channel)
+                if durable is not None:
+                    start = durable
+                elif _is_own_direct_channel(instance_id, channel):
+                    start = 0
+                else:
+                    max_result = await session.execute(
+                        select(func.max(ChannelMessage.id)).where(ChannelMessage.channel == channel)
+                    )
+                    max_id = max_result.scalar()
+                    start = max_id if max_id is not None else 0
+                if durable is None:
+                    await self._save_durable_cursor(session, instance_id, channel, start)
+                cursor_message_id = start
 
             # Create subscription
             subscription = ChannelSubscription(
@@ -4228,6 +4238,7 @@ class SQLAlchemyStorage:
         channel: str,
         activity_id: str | None = None,
         timeout_seconds: float | None = None,
+        also_channels: Sequence[str] = (),
     ) -> bool:
         """
         Atomically register that workflow is waiting for channel message and release lock.
@@ -4243,6 +4254,11 @@ class SQLAlchemyStorage:
             channel: Channel name being waited on
             activity_id: Current activity ID to record
             timeout_seconds: Optional timeout in seconds for the message wait
+            also_channels: Further channels the same receive waits on
+                (wait_event also waits on the instance's own direct channel,
+                where its targeted events are stored). A message pending on
+                any of them keeps the instance running; the wait is
+                registered on each, its timeout on ``channel`` only.
 
         Returns:
             True if the wait was registered, False if a pending message was
@@ -4257,26 +4273,32 @@ class SQLAlchemyStorage:
         async with self.engine.begin() as conn:
             session = AsyncSession(bind=conn, expire_on_commit=False)
 
-            # Verify subscription exists
-            sub_result = await session.execute(
-                select(ChannelSubscription).where(
-                    and_(
-                        ChannelSubscription.instance_id == instance_id,
-                        ChannelSubscription.channel == channel,
+            # Verify the subscriptions exist
+            subscriptions: list[ChannelSubscription] = []
+            for wait_channel in dict.fromkeys([channel, *also_channels]):
+                sub_result = await session.execute(
+                    select(ChannelSubscription).where(
+                        and_(
+                            ChannelSubscription.instance_id == instance_id,
+                            ChannelSubscription.channel == wait_channel,
+                        )
                     )
                 )
-            )
-            subscription: ChannelSubscription | None = sub_result.scalar_one_or_none()
-
-            if subscription is None:
-                raise ValueError(f"Instance {instance_id} is not subscribed to channel {channel}")
+                found: ChannelSubscription | None = sub_result.scalar_one_or_none()
+                if found is None:
+                    raise ValueError(
+                        f"Instance {instance_id} is not subscribed to channel {wait_channel}"
+                    )
+                subscriptions.append(found)
 
             # Re-check pending inside the tx. A publish committed between the
             # caller check and this point must not leave the workflow
             # sleeping on a message nobody will deliver again.
-            pending_check = await self._has_pending_channel_message(
-                session, instance_id, channel, subscription
-            )
+            pending_check = False
+            for sub in subscriptions:
+                if await self._has_pending_channel_message(session, instance_id, sub.channel, sub):
+                    pending_check = True
+                    break
 
             # Fenced suspend + release first: only the lock holder of a live
             # instance may register the wait. With a pending message, only
@@ -4313,13 +4335,14 @@ class SQLAlchemyStorage:
                 await session.commit()
                 return False
 
-            # Only now mark the subscription as waiting
-            subscription.activity_id = activity_id
-            # Calculate timeout_at if timeout_seconds is provided
-            if timeout_seconds is not None:
-                subscription.timeout_at = current_time + timedelta(seconds=timeout_seconds)
-            else:
-                subscription.timeout_at = None
+            # Only now mark the subscriptions as waiting. The timeout is kept
+            # on the first channel only, so it fires once.
+            for i, sub in enumerate(subscriptions):
+                sub.activity_id = activity_id
+                if timeout_seconds is not None and i == 0:
+                    sub.timeout_at = current_time + timedelta(seconds=timeout_seconds)
+                else:
+                    sub.timeout_at = None
 
             await session.commit()
             return True
@@ -4337,7 +4360,7 @@ class SQLAlchemyStorage:
         and the wait registration are atomic.
         """
         if subscription.mode == "broadcast":
-            cursor = subscription.cursor_message_id or 0
+            cursor = await self._broadcast_cursor(session, subscription)
             result = await session.execute(
                 select(ChannelMessage.id)
                 .where(
@@ -4473,8 +4496,9 @@ class SQLAlchemyStorage:
                 return []
 
             if subscription.mode == "broadcast":
-                # Get messages after cursor
-                cursor = subscription.cursor_message_id or 0
+                # Get messages after cursor, in id order: the cursor is an id,
+                # and two messages can share a published_at second.
+                cursor = await self._broadcast_cursor(session, subscription)
                 msg_result = await session.execute(
                     select(ChannelMessage)
                     .where(
@@ -4483,7 +4507,7 @@ class SQLAlchemyStorage:
                             ChannelMessage.id > cursor,
                         )
                     )
-                    .order_by(ChannelMessage.published_at.asc())
+                    .order_by(ChannelMessage.id.asc())
                 )
             else:  # competing
                 # Hidden only when a *different live* instance holds a fresh
@@ -4508,7 +4532,7 @@ class SQLAlchemyStorage:
                             ChannelMessage.message_id.not_in(hidden_claims),
                         )
                     )
-                    .order_by(ChannelMessage.published_at.asc())
+                    .order_by(ChannelMessage.id.asc())
                 )
 
             messages = msg_result.scalars().all()
@@ -4650,7 +4674,66 @@ class SQLAlchemyStorage:
                 )
                 .values(cursor_message_id=message_id)
             )
+            await self._save_durable_cursor(session, instance_id, channel, message_id)
             await self._commit_if_not_in_transaction(session)
+
+    async def _durable_cursor(
+        self, session: AsyncSession, instance_id: str, channel: str
+    ) -> int | None:
+        """The durable broadcast cursor of instance_id on channel (the last
+        message delivered to it), or None when there is none."""
+        result = await session.execute(
+            select(ChannelDeliveryCursor.last_delivered_id).where(
+                and_(
+                    ChannelDeliveryCursor.instance_id == instance_id,
+                    ChannelDeliveryCursor.channel == channel,
+                )
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _save_durable_cursor(
+        self, session: AsyncSession, instance_id: str, channel: str, message_id: int
+    ) -> None:
+        """Record message_id as the last message delivered to instance_id on a
+        broadcast channel, in channel_delivery_cursors. The subscription's
+        cursor_message_id moves with it; the durable cursor outlives the
+        subscription (recur, unsubscribe), and the other ports read and
+        advance it for the instances they deliver to. Only the instance's
+        lock holder moves its cursors, so the read and the write do not race."""
+        now = datetime.now(UTC)
+        if await self._durable_cursor(session, instance_id, channel) is None:
+            session.add(
+                ChannelDeliveryCursor(
+                    channel=channel,
+                    instance_id=instance_id,
+                    last_delivered_id=message_id,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            return
+        await session.execute(
+            update(ChannelDeliveryCursor)
+            .where(
+                and_(
+                    ChannelDeliveryCursor.instance_id == instance_id,
+                    ChannelDeliveryCursor.channel == channel,
+                )
+            )
+            .values(last_delivered_id=message_id, updated_at=now)
+        )
+
+    async def _broadcast_cursor(
+        self, session: AsyncSession, subscription: ChannelSubscription
+    ) -> int:
+        """The cursor of a broadcast subscription: the later of its own and
+        the durable one, which another port advances when it delivers to
+        the instance."""
+        durable = await self._durable_cursor(
+            session, subscription.instance_id, subscription.channel
+        )
+        return max(subscription.cursor_message_id or 0, durable or 0)
 
     async def get_channel_subscribers_waiting(
         self,
@@ -4692,7 +4775,9 @@ class SQLAlchemyStorage:
         channel: str,
     ) -> None:
         """
-        Clear the waiting state for a channel subscription.
+        Clear the waiting state for a channel subscription, on every
+        subscription the wait is registered on (wait_event waits on the event
+        type and the instance's direct channel).
 
         Args:
             instance_id: Workflow instance ID
@@ -4700,17 +4785,31 @@ class SQLAlchemyStorage:
         """
         session = self._get_session_for_operation()
         async with self._session_scope(session) as session:
-            await session.execute(
-                update(ChannelSubscription)
-                .where(
-                    and_(
-                        ChannelSubscription.instance_id == instance_id,
-                        ChannelSubscription.channel == channel,
-                    )
-                )
-                .values(activity_id=None)
-            )
+            await self._end_channel_wait(session, instance_id, channel)
             await self._commit_if_not_in_transaction(session)
+
+    async def _end_channel_wait(
+        self, session: AsyncSession, instance_id: str, channel: str
+    ) -> None:
+        """Clear the wait registered on an instance's subscription to channel,
+        on every subscription of the instance that carries the same wait."""
+        result = await session.execute(
+            select(ChannelSubscription.activity_id).where(
+                and_(
+                    ChannelSubscription.instance_id == instance_id,
+                    ChannelSubscription.channel == channel,
+                )
+            )
+        )
+        activity_id = result.scalar_one_or_none()
+        same_wait = ChannelSubscription.channel == channel
+        if activity_id:
+            same_wait = or_(same_wait, ChannelSubscription.activity_id == activity_id)
+        await session.execute(
+            update(ChannelSubscription)
+            .where(and_(ChannelSubscription.instance_id == instance_id, same_wait))
+            .values(activity_id=None, timeout_at=None)
+        )
 
     async def deliver_channel_message(
         self,
@@ -4843,6 +4942,9 @@ class SQLAlchemyStorage:
                         msg_row = result.one_or_none()
                         if msg_row:
                             subscription.cursor_message_id = msg_row[0]
+                            await self._save_durable_cursor(
+                                session, instance_id, channel, msg_row[0]
+                            )
                     else:  # competing
                         # Claim and delete the message
                         claim = ChannelMessageClaim(
@@ -4856,8 +4958,20 @@ class SQLAlchemyStorage:
                             delete(ChannelMessage).where(ChannelMessage.message_id == message_id)
                         )
 
-                    # Clear waiting state
+                    # Clear waiting state, on every subscription the wait is
+                    # registered on (wait_event waits on two channels)
                     subscription.activity_id = None
+                    subscription.timeout_at = None
+                    await session.execute(
+                        update(ChannelSubscription)
+                        .where(
+                            and_(
+                                ChannelSubscription.instance_id == instance_id,
+                                ChannelSubscription.activity_id == activity_id,
+                            )
+                        )
+                        .values(activity_id=None, timeout_at=None)
+                    )
 
                     await session.commit()
 

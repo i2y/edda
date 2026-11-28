@@ -82,6 +82,10 @@ await subscribe(ctx, "notifications", mode="direct")
 msg = await receive(ctx, "notifications")
 ```
 
+A direct channel is the instance's mailbox: it keeps what is sent to it. A subscription to it starts at the first message sent to the instance, so the messages sent before the instance subscribed are not lost.
+
+A broadcast subscription keeps its place after `unsubscribe()` and after `ctx.recur()`: subscribing to the channel again continues where the subscription stopped, so the messages published in between are received too.
+
 #### `unsubscribe()`
 
 Unsubscribe from a channel (optional - workflows auto-unsubscribe on completion):
@@ -288,7 +292,7 @@ async def publish(
 - `channel`: Channel name to publish to
 - `data`: Message payload (any JSON value or `bytes`)
 - `metadata`: Optional metadata
-- `target_instance_id`: If provided, only deliver to this specific instance (Point-to-Point delivery)
+- `target_instance_id`: If provided, the message is for this instance only. It is stored on the instance's direct channel `"{channel}:{target_instance_id}"`, like a `send_to()`, where `wait_event()` or a direct subscription (`mode="direct"`) in that instance receives it. A plain `receive()` on `channel` does not.
 
 **Returns**: Message ID of the published message
 

@@ -302,6 +302,33 @@ async with httpx2.AsyncClient() as client:
     )
 ```
 
+### Sending to One Instance
+
+An event with the `eddainstanceid` extension attribute goes to that instance only:
+
+```bash
+curl -X POST http://localhost:8001/ \
+  -H "Content-Type: application/cloudevents+json" \
+  -d '{
+    "specversion": "1.0",
+    "type": "payment.completed",
+    "source": "payment-service",
+    "id": "evt-002",
+    "eddainstanceid": "<instance ID>",
+    "data": {"payment_id": "PAY-124", "amount": 10.0}
+  }'
+```
+
+The event is stored on the instance's direct channel, `payment.completed:<instance ID>`, so no other instance receives it. In that instance, `wait_event(ctx, "payment.completed")` receives it like the events sent to every waiter of the type:
+
+- An event that arrives before the instance calls `wait_event` waits in the direct channel until it does.
+- When events are pending on both channels, `wait_event` returns the oldest first.
+- The wait ends at the first event on either channel, and its timeout covers both.
+
+From workflow code, `publish(ctx, "payment.completed", data, target_instance_id=...)` stores the message on the same direct channel.
+
+After `subscribe(ctx, "payment.completed", mode="direct")`, `wait_event` and `receive` read only the events sent to this instance. After a broadcast subscription, `receive(ctx, "payment.completed")` reads only the events sent to every waiter.
+
 ### Using send_event()
 
 From within workflows or activities:

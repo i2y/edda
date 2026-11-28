@@ -17,7 +17,6 @@ from edda.exceptions import ChannelPermissionError, InvalidArgumentError, TaskCo
 from edda.locking import LockLostError
 from edda.replay import ReplayEngine
 from edda.storage.sqlalchemy_storage import (
-    ChannelDeliveryCursor,
     WorkflowTimerSubscription,
 )
 
@@ -170,12 +169,8 @@ async def test_recur_reset_is_one_fenced_transaction_and_preserves_delivery_curs
                 activity_id="timer:1",
             )
         )
-        session.add(
-            ChannelDeliveryCursor(
-                channel="phase-a-channel", instance_id=instance_id, last_delivered_id=7
-            )
-        )
         await session.commit()
+    await sqlite_storage.update_delivery_cursor("phase-a-channel", instance_id, 7)
 
     lock_id = "phase-a-lock"
     assert await sqlite_storage.try_acquire_lock(instance_id, lock_id)
@@ -223,6 +218,12 @@ async def test_recur_reset_is_one_fenced_transaction_and_preserves_delivery_curs
     assert timers == 0
     assert subscriptions == 0
     assert cursor == 7
+
+    # The channel subscribed again in the next iteration continues after it.
+    await sqlite_storage.subscribe_to_channel(instance_id, "phase-a-channel", "broadcast")
+    subscription = await sqlite_storage.get_channel_subscription(instance_id, "phase-a-channel")
+    assert subscription is not None
+    assert subscription["cursor_message_id"] == 7
 
 
 async def test_recur_reset_with_a_lost_lock_changes_nothing(sqlite_storage, create_test_instance):

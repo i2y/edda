@@ -401,6 +401,7 @@ class ReplayEngine:
                     channel=exc.channel,
                     activity_id=exc.activity_id,
                     timeout_seconds=exc.timeout_seconds,
+                    also_channels=exc.also_channels,
                 )
 
                 # Status is updated to 'waiting_for_message' atomically
@@ -714,6 +715,7 @@ class ReplayEngine:
                 channel=exc.channel,
                 activity_id=exc.activity_id,
                 timeout_seconds=exc.timeout_seconds,
+                also_channels=exc.also_channels,
             )
 
             # Status is updated to 'waiting_for_message' atomically

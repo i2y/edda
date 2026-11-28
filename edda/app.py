@@ -859,7 +859,9 @@ class EddaApp:
         Handle incoming CloudEvent.
 
         The event is stored before this returns (SEMANTICS §3c): it is published
-        to its channel, and each workflow registered for its type with
+        to its channel (its type, or ``{type}:{instance}`` for an event
+        targeted at one instance with the ``eddainstanceid`` extension, so
+        that no other instance receives it), and each workflow registered for its type with
         ``@workflow(event_handler=True)`` gets a new instance. The rest runs in
         background tasks that shutdown() waits for: the first runs of those
         instances, the handlers registered with on_event, and the delivery of
@@ -977,7 +979,8 @@ class EddaApp:
         This method supports two delivery patterns based on the 'eddainstanceid' extension:
 
         1. **Point-to-Point** (when 'eddainstanceid' is present):
-           Delivers to a specific workflow instance only.
+           Stores the event on that instance's direct channel
+           ``{type}:{instance}`` and delivers it to that instance only.
 
         2. **Pub/Sub** (when 'eddainstanceid' is absent):
            Delivers to ALL workflows waiting for this event type.
@@ -1000,7 +1003,9 @@ class EddaApp:
     async def _store_event_message(self, event: Any) -> _StoredEvent:
         """
         Publish a CloudEvent to the channel of its type, as ``publish`` does,
-        without delivering it yet.
+        without delivering it yet. An event with the ``eddainstanceid``
+        extension is published to that instance's direct channel
+        ``{type}:{instance}`` instead, so no other instance receives it.
 
         Args:
             event: CloudEvent instance
@@ -1054,23 +1059,29 @@ class EddaApp:
         target_instance_id = extensions.get("eddainstanceid")
         capability_token = event.get_attributes().get("capabilitytoken")
 
-        # The message is stored on the channel of the event type, also when
-        # its delivery targets one instance, so that channel's seal applies.
-        await _enforce_channel_capability(self.storage, "channel_pub", event_type, capability_token)
-        message_id = await self.storage.publish_to_channel(event_type, event_data, metadata)
+        # A targeted event is for its target only: it is stored on the
+        # target's direct channel "{type}:{instance}", where wait_event in the
+        # target reads it (SEMANTICS §3c). A seal on the type covers that
+        # channel too.
+        channel = f"{event_type}:{target_instance_id}" if target_instance_id else event_type
+        await _enforce_channel_capability(self.storage, "channel_pub", channel, capability_token)
+        message_id = await self.storage.publish_to_channel(channel, event_data, metadata)
         logger.debug(
-            "Published '%s' to channel (message_id: %s, target: %s)",
+            "Published '%s' to channel %s (message_id: %s)",
             event_type,
+            channel,
             message_id,
-            target_instance_id,
         )
-        return _StoredEvent(event_type, message_id, event_data, metadata, target_instance_id)
+        return _StoredEvent(channel, message_id, event_data, metadata, target_instance_id)
 
     async def _wake_event_subscribers(self, stored: _StoredEvent) -> None:
         """
         Deliver a stored event to the workflows waiting on its channel: only
         to its target when it has one (Point-to-Point), otherwise to all of
-        them (Pub/Sub).
+        them (Pub/Sub). A target that waits on the event type alone (a
+        wait_event that began before targeted events were stored on the
+        direct channel) is returned to running, and its next wait_event
+        reads the event.
 
         Args:
             stored: The event's channel message

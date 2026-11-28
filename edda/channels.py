@@ -36,7 +36,9 @@ Example:
 from __future__ import annotations
 
 import base64
+import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, overload
@@ -44,6 +46,8 @@ from typing import TYPE_CHECKING, Any, overload
 if TYPE_CHECKING:
     from edda.context import WorkflowContext
     from edda.storage.protocol import StorageProtocol
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -117,10 +121,15 @@ class WaitForChannelMessageException(Exception):
         channel: str,
         timeout_seconds: float | None,
         activity_id: str,
+        also_channels: Sequence[str] = (),
     ) -> None:
         self.channel = channel
         self.timeout_seconds = timeout_seconds
         self.activity_id = activity_id
+        # Further channels the same receive waits on: wait_event also waits
+        # on the instance's own direct channel "{type}:{instance_id}", where
+        # the events targeted at the instance are stored.
+        self.also_channels = list(also_channels)
         # Calculate absolute timeout if specified
         self.timeout_at: datetime | None = None
         if timeout_seconds is not None:
@@ -360,6 +369,8 @@ async def receive(
     timeout_seconds: float | None = None,
     message_id: str | None = None,
     capability_token: str | None = None,
+    *,
+    _targeted_events: bool = False,
 ) -> ChannelMessage:
     """
     Receive a message from a channel.
@@ -454,14 +465,33 @@ async def receive(
             await _enforce_direct_privacy(ctx, channel)
         await _enforce_channel_capability(ctx.storage, "channel_sub", channel, capability_token)
 
-        # Consume a pending message. The claim (competing) or the cursor advance
+        # wait_event also reads the instance's own direct channel, where the
+        # CloudEvents targeted at it are stored (SEMANTICS §3c). A direct
+        # channel is a mailbox, so the subscription to it also gets the
+        # events that arrived before it.
+        wait_channels = [actual_channel]
+        if _targeted_events and not ctx._is_direct_subscription(channel):
+            mailbox = f"{channel}:{ctx.instance_id}"
+            if await _get_subscription(ctx, mailbox) is None:
+                await ctx.storage.subscribe_to_channel(ctx.instance_id, mailbox, "broadcast")
+            wait_channels.append(mailbox)
+
+        # Consume a pending message, the oldest first when the receive reads
+        # two channels. The claim (competing) or the cursor advance
         # (broadcast), the history record and the competing delete commit in one
         # transaction that first proves this run still holds the lock: a run
         # that lost its lease consumes nothing (no stale claim hides the message,
         # no cursor skips it), and two consumers never record the same message.
-        pending = await ctx.storage.get_pending_channel_messages(ctx.instance_id, actual_channel)
-        if pending:
-            subscription = await _get_subscription(ctx, actual_channel)
+        sources: list[tuple[str, list[dict[str, Any]]]] = []
+        for wait_channel in wait_channels:
+            waiting_messages = await ctx.storage.get_pending_channel_messages(
+                ctx.instance_id, wait_channel
+            )
+            if waiting_messages:
+                sources.append((wait_channel, waiting_messages))
+        sources.sort(key=lambda source: min(msg["id"] for msg in source[1]))
+        for source_channel, pending in sources:
+            subscription = await _get_subscription(ctx, source_channel)
             competing = bool(subscription and subscription.get("mode") == "competing")
 
             # Competing: a message claimed by another live instance is skipped
@@ -474,7 +504,7 @@ async def receive(
                             continue
                     else:
                         await ctx.storage.update_delivery_cursor(
-                            actual_channel, ctx.instance_id, msg_dict["id"]
+                            source_channel, ctx.instance_id, msg_dict["id"]
                         )
 
                     # Build the message (the payload exactly as published)
@@ -540,6 +570,7 @@ async def receive(
         channel=actual_channel,
         timeout_seconds=timeout_seconds,
         activity_id=activity_id,
+        also_channels=wait_channels[1:],
     )
 
 
@@ -600,9 +631,14 @@ async def publish(
         channel: Channel name to publish to
         data: Message payload: any JSON-serializable value, or bytes
         metadata: Optional metadata
-        target_instance_id: If provided, only deliver to this specific instance
-                           (Point-to-Point delivery). If None, deliver to all
-                           waiting subscribers (Pub/Sub delivery).
+        target_instance_id: If provided, the message is for this instance
+                           only (Point-to-Point delivery): it is stored on the
+                           instance's direct channel "{channel}:{target}",
+                           where wait_event(channel) in that instance, or a
+                           direct subscription (subscribe(channel,
+                           mode="direct")), receives it. Other subscribers of
+                           the channel do not see it. If None, deliver to all
+                           subscribers (Pub/Sub delivery).
         worker_id: Optional worker ID for Lock-First pattern (required for
                    CloudEvents HTTP handler)
 
@@ -680,10 +716,15 @@ async def _publish_and_wake(
     capability_token: str | None,
 ) -> str:
     """Publish a message and wake its waiting subscribers (after commit
-    when called inside a transaction). Returns the message ID."""
+    when called inside a transaction). A message for one instance is stored
+    on that instance's direct channel, so no other subscriber sees it.
+    Returns the message ID."""
     effective_worker_id = worker_id
+    if target_instance_id:
+        channel = f"{channel}:{target_instance_id}"
 
-    # Sealed-channel enforcement (no-op while the channel has no grants)
+    # Sealed-channel enforcement (no-op while the channel has no grants; a
+    # seal on the name covers its direct channels)
     await _enforce_channel_capability(storage, "channel_pub", channel, capability_token)
 
     # Publish to channel
@@ -748,12 +789,13 @@ async def _wake_waiting_subscribers(
         data: Message payload
         metadata: Message metadata
         target_instance_id: If provided, only wake this specific instance
-                           (Point-to-Point delivery)
+                           (Point-to-Point delivery); channel is then its
+                           direct channel "{name}:{target_instance_id}"
         worker_id: Worker ID for Lock-First pattern
     """
     if target_instance_id:
         # Point-to-Point delivery: deliver only to specific instance
-        await storage.deliver_channel_message(
+        delivered = await storage.deliver_channel_message(
             instance_id=target_instance_id,
             channel=channel,
             message_id=message_id,
@@ -761,6 +803,9 @@ async def _wake_waiting_subscribers(
             metadata=metadata,
             worker_id=worker_id,
         )
+        name = channel.removesuffix(f":{target_instance_id}")
+        if delivered is None and name != channel:
+            await _resume_wait_on_name_alone(storage, target_instance_id, name, worker_id)
         return
 
     # Pub/Sub delivery: deliver to all waiting subscribers
@@ -794,6 +839,52 @@ async def _wake_waiting_subscribers(
                 metadata=metadata,
                 worker_id=worker_id,
             )
+
+
+async def _resume_wait_on_name_alone(
+    storage: StorageProtocol, instance_id: str, channel: str, worker_id: str
+) -> None:
+    """Return instance_id to running when it waits on channel alone, after a
+    message for it was stored on its direct channel "{channel}:{instance_id}":
+    a wait_event that began before targeted messages were stored there, whose
+    wait does not cover that channel (or a plain receive of the channel). The
+    next wait_event of the run reads the message there; a wait_event that
+    waits on both channels got it from the delivery."""
+    from edda.locking import new_lock_identity
+
+    mailbox = f"{channel}:{instance_id}"
+
+    async def waiting() -> str | None:
+        sub = await storage.get_channel_subscription(instance_id, channel)
+        if sub is None or not sub.get("activity_id"):
+            return None
+        box = await storage.get_channel_subscription(instance_id, mailbox)
+        if box is not None and box.get("activity_id"):
+            return None
+        return str(sub["activity_id"])
+
+    activity_id = await waiting()
+    if activity_id is None:
+        return
+    lock_id = new_lock_identity(worker_id)
+    if not await storage.try_acquire_lock(instance_id, lock_id):
+        return  # a delivery or a run holds the instance; its next wait_event reads the message
+    try:
+        instance = await storage.get_instance(instance_id)
+        if instance is None or instance["status"] != "waiting_for_message":
+            return
+        if await waiting() != activity_id:
+            return  # the wait ended or changed meanwhile
+        await storage.begin_transaction()
+        try:
+            await storage.remove_message_subscription(instance_id, channel)
+            await storage.update_instance_status(instance_id, "running", lock_id=lock_id)
+            await storage.commit_transaction()
+        except Exception as error:
+            await storage.rollback_transaction()
+            logger.debug("Could not resume %s for its targeted message: %s", instance_id, error)
+    finally:
+        await storage.release_lock(instance_id, lock_id)
 
 
 # =============================================================================
@@ -1161,6 +1252,16 @@ async def wait_event(
         Events are delivered to workflows that are subscribed to the event_type channel.
         Use subscribe(ctx, event_type) before calling wait_event() or let it auto-subscribe.
 
+        wait_event also receives the events targeted at this instance (a
+        CloudEvent with the eddainstanceid extension, or a publish with
+        target_instance_id). They are stored on the instance's own direct
+        channel "{event_type}:{instance_id}", so no other instance sees them.
+        It takes the oldest pending event of the two channels, and its wait
+        ends at the first event on either. A targeted event that arrived
+        before wait_event is not lost: a direct channel keeps its messages
+        until they are received. After subscribe(ctx, event_type,
+        mode="direct"), wait_event receives only the targeted events.
+
     Raises:
         WaitForChannelMessageException: During normal execution to pause the workflow
         EventTimeoutError: If timeout is reached
@@ -1193,12 +1294,14 @@ async def wait_event(
     if subscription is None:
         await subscribe(ctx, event_type, mode="broadcast")
 
-    # Use receive() with event_type as channel
+    # Use receive() with event_type as channel; it also reads the instance's
+    # own direct channel, where its targeted events are stored.
     msg = await receive(
         ctx,
         channel=event_type,
         timeout_seconds=timeout_seconds,
         message_id=event_id,
+        _targeted_events=True,
     )
 
     # Convert ChannelMessage to ReceivedEvent with CloudEvents metadata
