@@ -5,6 +5,7 @@ This module tests the EddaApp ASGI interface with tsuno server integration.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -216,6 +217,22 @@ class TestASGIHTTP:
             await app_with_workflow.shutdown()
 
 
+def _stop_tsuno(process: subprocess.Popen[str]) -> None:
+    """Stop a tsuno server started with start_new_session=True, workers included.
+
+    Signal the whole process group: workers that outlive the parent keep the
+    port, and later runs fail with "Address already in use".
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=10)
+    # End whatever is left of the group.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
 class TestTsunoServerIntegration:
     """Test tsuno server integration."""
 
@@ -261,6 +278,7 @@ application = app
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            start_new_session=True,
         )
 
         try:
@@ -294,13 +312,8 @@ application = app
                         pass
 
         finally:
-            # Stop server
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            # Stop the server and its workers
+            _stop_tsuno(process)
 
             # Cleanup test database
             db_file = test_app_file.parent / "test_tsuno.db"
@@ -372,6 +385,7 @@ application = app
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            start_new_session=True,
         )
 
         try:
@@ -420,13 +434,8 @@ application = app
                         pass
 
         finally:
-            # Stop server
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            # Stop the server and its workers
+            _stop_tsuno(process)
 
             # Cleanup test database
             db_file = test_app_file.parent / "test_tsuno.db"
